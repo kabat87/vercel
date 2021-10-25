@@ -963,10 +963,10 @@
     lodash "^4.17.19"
     to-fast-properties "^2.0.0"
 
-"@ionic-native/core@5.0.0-beta.15":
-  version "5.0.0-beta.15"
-  resolved "https://registry.yarnpkg.com/@ionic-native/core/-/core-5.0.0-beta.15.tgz#12a2cd1aed6561e49964301119f585c803dd64a1"
-  integrity sha512-71Fiy/UlchvjkWpRaZ90E9hrrf+v/x+CCl6JPGg3nLGYqrVtja5xJCU0jVsGQMrYdgfcwK9d1KLC/3GPvOQK1w==
+"@ionic-native/core@5.36.0":
+  version "5.36.0"
+  resolved "https://registry.yarnpkg.com/@ionic-native/core/-/core-5.36.0.tgz#712c40a530b119b0039e8d16cb577899f50541d4"
+  integrity sha512-lOrkktadlKYbYf1LrDyAtsu1JnQ0oCCdkOU7iHQ8oXnNOkMwobFfD2m62F1CoOr0u9LIkpYnZSPjng8lZbmbNw==
   dependencies:
     "@types/cordova" latest
 
