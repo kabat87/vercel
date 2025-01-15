@@ -1,8 +1,8 @@
 import { URL } from 'url';
-import Client from '../client';
+import type Client from '../client';
 import { hostname } from 'os';
 import { getTitleName } from '../pkg-name';
-import { LoginResultSuccess } from './types';
+import type { LoginResultSuccess } from './types';
 
 export default function verify(
   client: Client,
@@ -31,5 +31,5 @@ export default function verify(
     url.searchParams.set('ssoUserId', ssoUserId);
   }
 
-  return client.fetch<LoginResultSuccess>(url.href);
+  return client.fetch<LoginResultSuccess>(url.href, { useCurrentTeam: false });
 }

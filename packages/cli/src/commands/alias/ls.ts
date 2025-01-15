@@ -1,43 +1,52 @@
 import chalk from 'chalk';
 import ms from 'ms';
-import table from 'text-table';
-import Client from '../../util/client';
+import table from '../../util/output/table';
+import type Client from '../../util/client';
 import getAliases from '../../util/alias/get-aliases';
 import getScope from '../../util/get-scope';
+import { getPaginationOpts } from '../../util/get-pagination-opts';
 import stamp from '../../util/output/stamp';
-import strlen from '../../util/strlen';
 import getCommandFlags from '../../util/get-command-flags';
 import { getCommandName } from '../../util/pkg-name';
+import { AliasListTelemetryClient } from '../../util/telemetry/commands/alias/list';
+import output from '../../output-manager';
+import { listSubcommand } from './command';
+import { getFlagsSpecification } from '../../util/get-flags-specification';
+import { parseArguments } from '../../util/get-args';
+import { printError } from '../../util/error';
+import type { Alias } from '@vercel-internals/types';
 
-import { Alias } from '../../types';
+export default async function ls(client: Client, argv: string[]) {
+  let parsedArguments;
 
-interface Options {
-  '--next'?: number;
-}
-
-export default async function ls(
-  client: Client,
-  opts: Options,
-  args: string[]
-) {
-  const { output } = client;
-  const { '--next': nextTimestamp } = opts;
-
-  let contextName = null;
+  const flagsSpecification = getFlagsSpecification(listSubcommand.options);
 
   try {
-    ({ contextName } = await getScope(client));
+    parsedArguments = parseArguments(argv, flagsSpecification);
   } catch (err) {
-    if (err.code === 'NOT_AUTHORIZED' || err.code === 'TEAM_DELETED') {
-      output.error(err.message);
-      return 1;
-    }
-
-    throw err;
+    printError(err);
+    return 1;
   }
 
-  if (typeof nextTimestamp !== undefined && Number.isNaN(nextTimestamp)) {
-    output.error('Please provide a number for flag --next');
+  const { args, flags: opts } = parsedArguments;
+
+  const { contextName } = await getScope(client);
+
+  const telemetryClient = new AliasListTelemetryClient({
+    opts: {
+      store: client.telemetryEventStore,
+    },
+  });
+  let paginationOptions;
+
+  try {
+    paginationOptions = getPaginationOpts(opts);
+    const [next, limit] = paginationOptions;
+
+    telemetryClient.trackCliOptionNext(next);
+    telemetryClient.trackCliOptionLimit(limit);
+  } catch (err: unknown) {
+    output.prettyError(err);
     return 1;
   }
 
@@ -58,12 +67,12 @@ export default async function ls(
   const { aliases, pagination } = await getAliases(
     client,
     undefined,
-    nextTimestamp
+    ...paginationOptions
   );
   output.log(`aliases found under ${chalk.bold(contextName)} ${lsStamp()}`);
-  console.log(printAliasTable(aliases));
+  client.stdout.write(printAliasTable(aliases));
 
-  if (pagination && pagination.count === 20) {
+  if (pagination.count === 20) {
     const flags = getCommandFlags(opts, ['_', '--next']);
     output.log(
       `To display the next page run ${getCommandName(
@@ -83,15 +92,11 @@ function printAliasTable(aliases: Alias[]) {
         // for legacy reasons, we might have situations
         // where the deployment was deleted and the alias
         // not collected appropriately, and we need to handle it
-        a.deployment && a.deployment.url ? a.deployment.url : chalk.gray('–'),
+        a.deployment?.url ? a.deployment.url : chalk.gray('–'),
         a.alias,
         ms(Date.now() - a.createdAt),
       ]),
     ],
-    {
-      align: ['l', 'l', 'r'],
-      hsep: ' '.repeat(4),
-      stringLength: strlen,
-    }
+    { align: ['l', 'l', 'r'], hsep: 4 }
   ).replace(/^/gm, '  ')}\n\n`;
 }

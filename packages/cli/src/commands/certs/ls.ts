@@ -1,42 +1,51 @@
 import chalk from 'chalk';
 import ms from 'ms';
-import table from 'text-table';
-import Client from '../../util/client';
+import table from '../../util/output/table';
+import type Client from '../../util/client';
 import getScope from '../../util/get-scope';
+import { getPaginationOpts } from '../../util/get-pagination-opts';
 import stamp from '../../util/output/stamp';
 import getCerts from '../../util/certs/get-certs';
-import strlen from '../../util/strlen';
-import { Cert } from '../../types';
+import type { Cert } from '@vercel-internals/types';
 import getCommandFlags from '../../util/get-command-flags';
 import { getCommandName } from '../../util/pkg-name';
+import output from '../../output-manager';
+import { CertsLsTelemetryClient } from '../../util/telemetry/commands/certs/ls';
+import { listSubcommand } from './command';
+import { getFlagsSpecification } from '../../util/get-flags-specification';
+import { parseArguments } from '../../util/get-args';
+import { printError } from '../../util/error';
 
-interface Options {
-  '--next'?: number;
-}
+async function ls(client: Client, argv: string[]): Promise<number> {
+  const { telemetryEventStore } = client;
+  const telemetry = new CertsLsTelemetryClient({
+    opts: {
+      store: telemetryEventStore,
+    },
+  });
 
-async function ls(
-  client: Client,
-  opts: Options,
-  args: string[]
-): Promise<number> {
-  const { output } = client;
-  const { '--next': nextTimestamp } = opts;
-  let contextName = null;
-
+  let parsedArgs;
+  const flagsSpecification = getFlagsSpecification(listSubcommand.options);
   try {
-    ({ contextName } = await getScope(client));
+    parsedArgs = parseArguments(argv, flagsSpecification);
   } catch (err) {
-    if (err.code === 'NOT_AUTHORIZED' || err.code === 'TEAM_DELETED') {
-      output.error(err.message);
-      return 1;
-    }
-
-    throw err;
-  }
-  if (typeof nextTimestamp !== 'undefined' && Number.isNaN(nextTimestamp)) {
-    output.error('Please provide a number for flag --next');
+    printError(err);
     return 1;
   }
+  const { args, flags: opts } = parsedArgs;
+
+  telemetry.trackCliOptionLimit(opts['--limit']);
+  telemetry.trackCliOptionNext(opts['--next']);
+
+  let paginationOptions;
+
+  try {
+    paginationOptions = getPaginationOpts(opts);
+  } catch (err: unknown) {
+    output.prettyError(err);
+    return 1;
+  }
+
   const lsStamp = stamp();
 
   if (args.length !== 0) {
@@ -49,10 +58,9 @@ async function ls(
   }
 
   // Get the list of certificates
-  const { certs, pagination } = await getCerts(client, nextTimestamp).catch(
-    err => err
-  );
+  const { certs, pagination } = await getCerts(client, ...paginationOptions);
 
+  const { contextName } = await getScope(client);
   output.log(
     `${
       certs.length > 0 ? 'Certificates' : 'No certificates'
@@ -60,7 +68,7 @@ async function ls(
   );
 
   if (certs.length > 0) {
-    console.log(formatCertsTable(certs));
+    client.stdout.write(formatCertsTable(certs));
   }
 
   if (pagination && pagination.count === 20) {
@@ -78,11 +86,7 @@ async function ls(
 function formatCertsTable(certsList: Cert[]) {
   return `${table(
     [formatCertsTableHead(), ...formatCertsTableBody(certsList)],
-    {
-      align: ['l', 'l', 'r', 'c', 'r'],
-      hsep: ' '.repeat(2),
-      stringLength: strlen,
-    }
+    { align: ['l', 'l', 'r', 'c', 'r'], hsep: 2 }
   ).replace(/^(.*)/gm, '  $1')}\n`;
 }
 

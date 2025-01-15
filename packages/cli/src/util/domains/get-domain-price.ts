@@ -1,6 +1,6 @@
 import { stringify } from 'querystring';
-import { UnsupportedTLD } from '../errors-ts';
-import Client from '../client';
+import { isAPIError, UnsupportedTLD } from '../errors-ts';
+import type Client from '../client';
 
 type Response = {
   price: number;
@@ -15,15 +15,17 @@ export default async function getDomainPrice(
   try {
     const querystr = type ? stringify({ name, type }) : stringify({ name });
     return await client.fetch<Response>(`/v3/domains/price?${querystr}`);
-  } catch (error) {
-    if (error.code === 'unsupported_tld') {
-      return new UnsupportedTLD(name);
+  } catch (err: unknown) {
+    if (isAPIError(err)) {
+      if (err.code === 'unsupported_tld') {
+        return new UnsupportedTLD(name);
+      }
+
+      if (err.status < 500) {
+        return err;
+      }
     }
 
-    if (error.status < 500) {
-      return error;
-    }
-
-    throw error;
+    throw err;
   }
 }
