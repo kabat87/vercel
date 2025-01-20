@@ -1,6 +1,4 @@
-import _pkg from '../../package.json';
-import { PackageJson } from '@vercel/build-utils';
+import { getPackageJSON } from '@vercel-internals/get-package-json';
 
-const pkg: PackageJson & typeof _pkg = _pkg;
-
-export default pkg;
+// eslint-disable-next-line @typescript-eslint/consistent-type-imports
+export default getPackageJSON() as typeof import('../../package.json');

@@ -1,15 +1,26 @@
+// bust cache
 const assert = require('assert');
 const { createHash } = require('crypto');
 const path = require('path');
 const _fetch = require('node-fetch');
-const fetch = require('./fetch-retry.js');
+const fetch = require('./fetch-retry');
 const fileModeSymbol = Symbol('fileMode');
+const { logWithinTest } = require('./log');
+const ms = require('ms');
+
+const IS_CI = !!process.env.CI;
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
-async function nowDeploy(bodies, randomness, uploadNowJson) {
+async function nowDeploy(projectName, bodies, randomness, uploadNowJson, opts) {
   const files = Object.keys(bodies)
     .filter(n =>
-      uploadNowJson ? true : n !== 'vercel.json' && n !== 'now.json'
+      uploadNowJson
+        ? true
+        : n !== 'vercel.json' &&
+          n !== 'now.json' &&
+          !n.includes('node_modules/') &&
+          !n.includes('.git/') &&
+          !n.includes('.next/')
     )
     .map(n => ({
       sha: digestOfFile(bodies[n]),
@@ -20,30 +31,44 @@ async function nowDeploy(bodies, randomness, uploadNowJson) {
         (path.extname(n) === '.sh' ? 0o100755 : 0o100644),
     }));
 
-  const { FORCE_BUILD_IN_REGION, NOW_DEBUG, VERCEL_DEBUG } = process.env;
-  const nowJson = JSON.parse(bodies['vercel.json'] || bodies['now.json']);
+  const {
+    FORCE_BUILD_IN_REGION,
+    VERCEL_DEBUG,
+    VERCEL_CLI_VERSION,
+    VERCEL_FORCE_PYTHON_STREAMING,
+  } = process.env;
+  const nowJson = JSON.parse(
+    bodies['vercel.json'] || bodies['now.json'] || '{}'
+  );
+
+  delete nowJson.probes;
 
   const nowDeployPayload = {
     version: 2,
     public: true,
+    name: projectName,
+    files,
+    meta: {},
+    ...nowJson,
+    projectSettings: {
+      ...nowJson.projectSettings,
+      ...opts.projectSettings,
+    },
     env: { ...nowJson.env, RANDOMNESS_ENV_VAR: randomness },
     build: {
       env: {
         ...(nowJson.build || {}).env,
         RANDOMNESS_BUILD_ENV_VAR: randomness,
         FORCE_BUILD_IN_REGION,
-        NOW_DEBUG,
         VERCEL_DEBUG,
+        VERCEL_CLI_VERSION,
+        VERCEL_FORCE_PYTHON_STREAMING,
+        NEXT_TELEMETRY_DISABLED: '1',
       },
     },
-    name: 'test2020',
-    files,
-    builds: nowJson.builds,
-    routes: nowJson.routes || [],
-    meta: {},
   };
 
-  console.log(`posting ${files.length} files`);
+  logWithinTest(`posting ${files.length} files`);
 
   for (const { file: filename } of files) {
     await filePost(bodies[filename], digestOfFile(bodies[filename]));
@@ -53,28 +78,34 @@ async function nowDeploy(bodies, randomness, uploadNowJson) {
   let deploymentUrl;
 
   {
-    const json = await deploymentPost(nowDeployPayload);
+    const json = await deploymentPost(nowDeployPayload, opts);
     if (json.error && json.error.code === 'missing_files')
       throw new Error('Missing files');
     deploymentId = json.id;
     deploymentUrl = json.url;
   }
 
-  console.log('id', deploymentId);
-  console.log('deploymentUrl', `https://${deploymentUrl}`);
+  logWithinTest('id', deploymentId);
 
   for (let i = 0; i < 750; i += 1) {
     const deployment = await deploymentGet(deploymentId);
     const { readyState } = deployment;
     if (readyState === 'ERROR') {
+      logWithinTest('state is ERROR, throwing');
       const error = new Error(
-        `State of https://${deploymentUrl} is ${readyState}`
+        `State of https://${deploymentUrl} is ERROR: ${deployment.errorMessage}`
       );
       error.deployment = deployment;
       throw error;
     }
     if (readyState === 'READY') {
+      logWithinTest(`State of https://${deploymentUrl} is READY, moving on`);
       break;
+    }
+    if (i % 25 === 0) {
+      logWithinTest(
+        `State of https://${deploymentUrl} is ${readyState}, retry number ${i}`
+      );
     }
     await new Promise(r => setTimeout(r, 1000));
   }
@@ -102,6 +133,7 @@ async function filePost(body, digest) {
     method: 'POST',
     headers,
     body,
+    timeout: ms('30s'),
   });
 
   const json = await resp.json();
@@ -109,14 +141,17 @@ async function filePost(body, digest) {
   if (json.error) {
     const { status, statusText, headers } = resp;
     const { message } = json.error;
-    console.log('Fetch Error', { url, status, statusText, headers, digest });
+    logWithinTest('Fetch Error', { url, status, statusText, headers, digest });
     throw new Error(message);
   }
   return json;
 }
 
-async function deploymentPost(payload) {
-  const url = '/v6/now/deployments?forceNew=1';
+async function deploymentPost(payload, opts = {}) {
+  const url = `/v13/deployments?skipAutoDetectionConfirmation=1${
+    // skipForceNew allows turbo cache to be leveraged
+    !opts.skipForceNew ? `&forceNew=1` : ''
+  }`;
   const resp = await fetchWithAuth(url, {
     method: 'POST',
     body: JSON.stringify(payload),
@@ -127,28 +162,29 @@ async function deploymentPost(payload) {
   if (json.error) {
     const { status, statusText, headers } = resp;
     const { message } = json.error;
-    console.log('Fetch Error', { url, status, statusText, headers });
+    logWithinTest('Fetch Error', { url, status, statusText, headers });
     throw new Error(message);
   }
   return json;
 }
 
 async function deploymentGet(deploymentId) {
-  const url = `/v12/now/deployments/${deploymentId}`;
+  const url = `/v13/deployments/${deploymentId}`;
   const resp = await fetchWithAuth(url);
   const json = await resp.json();
   if (json.error) {
     const { status, statusText, headers } = resp;
     const { message } = json.error;
-    console.log('Fetch Error', { url, status, statusText, headers });
+    logWithinTest('Fetch Error', { url, status, statusText, headers, message });
     throw new Error(message);
   }
   return json;
 }
 
 let token;
-let currentCount = 0;
-const MAX_COUNT = 10;
+let tokenCreated = 0;
+// temporary tokens last for 25 minutes
+const MAX_TOKEN_AGE = 25 * 60 * 1000;
 
 async function fetchWithAuth(url, opts = {}) {
   if (!opts.headers) opts.headers = {};
@@ -157,41 +193,56 @@ async function fetchWithAuth(url, opts = {}) {
     opts.headers.Authorization = `Bearer ${await fetchCachedToken()}`;
   }
 
+  const { VERCEL_TEAM_ID } = process.env;
+
+  if (VERCEL_TEAM_ID) {
+    url += `${url.includes('?') ? '&' : '?'}teamId=${VERCEL_TEAM_ID}`;
+  }
+
   return await fetchApi(url, opts);
 }
 
+/**
+ * @returns { Promise<String> }
+ */
 async function fetchCachedToken() {
-  currentCount += 1;
-  if (!token || currentCount === MAX_COUNT) {
-    currentCount = 0;
-    token = await fetchTokenWithRetry();
+  if (!token || tokenCreated < Date.now() - MAX_TOKEN_AGE) {
+    return fetchTokenWithRetry();
   }
   return token;
 }
 
+/**
+ * @returns { Promise<String> }
+ */
 async function fetchTokenWithRetry(retries = 5) {
   const {
     NOW_TOKEN,
+    TEMP_TOKEN,
     VERCEL_TOKEN,
-    VERCEL_TEAM_TOKEN,
-    VERCEL_REGISTRATION_URL,
+    VERCEL_TEST_TOKEN,
+    VERCEL_TEST_REGISTRATION_URL,
   } = process.env;
-  if (VERCEL_TOKEN || NOW_TOKEN) {
-    console.log('Your personal token will be used to make test deployments.');
-    return VERCEL_TOKEN || NOW_TOKEN;
+  if (VERCEL_TOKEN || NOW_TOKEN || TEMP_TOKEN) {
+    if (!TEMP_TOKEN && !IS_CI) {
+      logWithinTest(
+        'Your personal token will be used to make test deployments.'
+      );
+    }
+    return VERCEL_TOKEN || NOW_TOKEN || TEMP_TOKEN;
   }
-  if (!VERCEL_TEAM_TOKEN || !VERCEL_REGISTRATION_URL) {
+  if (!VERCEL_TEST_TOKEN || !VERCEL_TEST_REGISTRATION_URL) {
     throw new Error(
-      process.env.CI
+      IS_CI
         ? 'Failed to create test deployment. This is expected for 3rd-party Pull Requests. Please run tests locally.'
         : 'Failed to create test deployment. Please set `VERCEL_TOKEN` environment variable and run again.'
     );
   }
   try {
-    const res = await _fetch(VERCEL_REGISTRATION_URL, {
+    const res = await _fetch(VERCEL_TEST_REGISTRATION_URL, {
       method: 'POST',
       headers: {
-        Authorization: `Bearer ${VERCEL_TEAM_TOKEN}`,
+        Authorization: `Bearer ${VERCEL_TEST_TOKEN}`,
       },
     });
     if (!res.ok) {
@@ -208,11 +259,19 @@ async function fetchTokenWithRetry(retries = 5) {
       const text = JSON.stringify(data);
       throw new Error(`Unexpected response from registration: ${text}`);
     }
+
+    // Cache the token to be returned via `fetchCachedToken`
+    token = data.token;
+    tokenCreated = Date.now();
+
     return data.token;
   } catch (error) {
-    console.log(`Failed to fetch token. Retries remaining: ${retries}`);
+    logWithinTest(
+      `Failed to fetch token. Retries remaining: ${retries}`,
+      error.message
+    );
     if (retries === 0) {
-      console.log(error);
+      logWithinTest(error);
       throw error;
     }
     await sleep(500);
@@ -221,19 +280,25 @@ async function fetchTokenWithRetry(retries = 5) {
 }
 
 async function fetchApi(url, opts = {}) {
-  const apiHost = process.env.API_HOST || 'api.vercel.com';
-  const urlWithHost = `https://${apiHost}${url}`;
   const { method = 'GET', body } = opts;
+  const apiHost = process.env.API_HOST || 'api.vercel.com';
+  const urlWithHost = url.startsWith('https://')
+    ? url
+    : `https://${apiHost}${url}`;
 
   if (process.env.VERBOSE) {
-    console.log('fetch', method, url);
-    if (body) console.log(encodeURIComponent(body).slice(0, 80));
+    logWithinTest('fetch', method, url);
+    if (body) logWithinTest(encodeURIComponent(body).slice(0, 80));
   }
 
   if (!opts.headers) opts.headers = {};
 
   if (!opts.headers.Accept) {
     opts.headers.Accept = 'application/json';
+  }
+
+  if (typeof opts.timeout === 'undefined') {
+    opts.timeout = ms('30s');
   }
 
   opts.headers['x-now-trace-priority'] = '1';
@@ -245,7 +310,7 @@ module.exports = {
   fetchApi,
   fetchWithAuth,
   nowDeploy,
-  fetchTokenWithRetry,
   fetchCachedToken,
+  fetchTokenWithRetry,
   fileModeSymbol,
 };

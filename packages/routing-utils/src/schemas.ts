@@ -95,6 +95,9 @@ export const routesSchema = {
               maxLength: 32,
             },
           },
+          caseSensitive: {
+            type: 'boolean',
+          },
           important: {
             type: 'boolean',
           },
@@ -108,6 +111,9 @@ export const routesSchema = {
             type: 'boolean',
           },
           check: {
+            type: 'boolean',
+          },
+          isInternal: {
             type: 'boolean',
           },
           status: {
@@ -150,7 +156,16 @@ export const routesSchema = {
               },
             },
           },
+          middleware: { type: 'number' },
+          middlewarePath: { type: 'string' },
+          middlewareRawSrc: {
+            type: 'array',
+            items: {
+              type: 'string',
+            },
+          },
           has: hasSchema,
+          missing: hasSchema,
         },
       },
       {
@@ -191,6 +206,14 @@ export const rewritesSchema = {
         maxLength: 4096,
       },
       has: hasSchema,
+      missing: hasSchema,
+      statusCode: {
+        description:
+          'An optional integer to override the status code of the response.',
+        type: 'integer',
+        minimum: 100,
+        maximum: 999,
+      },
     },
   },
 } as const;
@@ -223,12 +246,15 @@ export const redirectsSchema = {
         type: 'boolean',
       },
       statusCode: {
+        description:
+          'An optional integer to define the status code of the redirect.',
         private: true,
         type: 'integer',
         minimum: 100,
         maximum: 999,
       },
       has: hasSchema,
+      missing: hasSchema,
     },
   },
 } as const;
@@ -270,6 +296,7 @@ export const headersSchema = {
         },
       },
       has: hasSchema,
+      missing: hasSchema,
     },
   },
 } as const;
