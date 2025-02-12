@@ -3,30 +3,29 @@
 import ms from 'ms';
 import bytes from 'bytes';
 import { delimiter, dirname, join } from 'path';
-import { fork, ChildProcess } from 'child_process';
-import { createFunction } from '@zeit/fun';
+import { fork, type ChildProcess } from 'child_process';
+import { createFunction } from '@vercel/fun';
 import {
-  Builder,
-  BuildOptions,
-  Env,
-  File,
+  type Builder,
+  type BuildOptions,
+  type Env,
+  type File,
   Lambda,
   FileBlob,
   FileFsRef,
-  isOfficialRuntime,
+  normalizePath,
 } from '@vercel/build-utils';
+import { isStaticRuntime } from '@vercel/fs-detectors';
 import plural from 'pluralize';
 import minimatch from 'minimatch';
 
-import { Output } from '../output';
 import highlight from '../output/highlight';
 import { treeKill } from '../tree-kill';
 import { relative } from '../path-helpers';
 import { LambdaSizeExceededError } from '../errors-ts';
 
-import DevServer from './server';
-import { getBuilder } from './builder-cache';
-import {
+import type DevServer from './server';
+import type {
   VercelConfig,
   BuildMatch,
   BuildResult,
@@ -35,10 +34,13 @@ import {
   BuildResultV3,
   BuilderOutputs,
   EnvConfigs,
+  BuiltLambda,
 } from './types';
 import { normalizeRoutes } from '@vercel/routing-utils';
 import getUpdateCommand from '../get-update-command';
 import { getTitleName } from '../pkg-name';
+import { importBuilders } from '../build/import-builders';
+import output from '../../output-manager';
 
 interface BuildMessage {
   type: string;
@@ -53,15 +55,14 @@ interface BuildMessageResult extends BuildMessage {
 async function createBuildProcess(
   match: BuildMatch,
   envConfigs: EnvConfigs,
-  workPath: string,
-  output: Output
+  workPath: string
 ): Promise<ChildProcess> {
   output.debug(`Creating build process for "${match.entrypoint}"`);
 
   const builderWorkerPath = join(__dirname, 'builder-worker.js');
 
   // Ensure that `node` is in the builder's `PATH`
-  let PATH = `${dirname(process.execPath)}${delimiter}${process.env.PATH}`;
+  const PATH = `${dirname(process.execPath)}${delimiter}${process.env.PATH}`;
 
   const env: Env = {
     ...process.env,
@@ -76,7 +77,7 @@ async function createBuildProcess(
   });
   match.buildProcess = buildProcess;
 
-  buildProcess.on('exit', (code, signal) => {
+  buildProcess.on('close', (code, signal) => {
     output.debug(
       `Build process for "${match.entrypoint}" exited with ${signal || code}`
     );
@@ -85,8 +86,12 @@ async function createBuildProcess(
 
   return new Promise((resolve, reject) => {
     // The first message that the builder process sends is the `ready` event
-    buildProcess.once('message', ({ type }) => {
-      if (type !== 'ready') {
+    buildProcess.once('message', data => {
+      if (
+        data !== null &&
+        typeof data === 'object' &&
+        (data as { type: string }).type !== 'ready'
+      ) {
         reject(new Error('Did not get "ready" event from builder'));
       } else {
         resolve(buildProcess);
@@ -106,19 +111,19 @@ export async function executeBuild(
   filesRemoved?: string[]
 ): Promise<void> {
   const {
-    builderWithPkg: { runInProcess, requirePath, builder, package: pkg },
+    builderWithPkg: { path: requirePath, builder, pkg },
   } = match;
-  const { entrypoint } = match;
+  const { entrypoint, use } = match;
+  const isStatic = isStaticRuntime(use);
   const { envConfigs, cwd: workPath, devCacheDir } = devServer;
-  const debug = devServer.output.isDebugEnabled();
+  const debug = output.isDebugEnabled();
 
   const startTime = Date.now();
-  const showBuildTimestamp =
-    !isOfficialRuntime('static', match.use) && (!isInitialBuild || debug);
+  const showBuildTimestamp = !isStatic && (!isInitialBuild || debug);
 
   if (showBuildTimestamp) {
-    devServer.output.log(`Building ${match.use}:${entrypoint}`);
-    devServer.output.debug(
+    output.log(`Building ${use}:${entrypoint}`);
+    output.debug(
       `Using \`${pkg.name}${pkg.version ? `@${pkg.version}` : ''}\``
     );
   }
@@ -128,19 +133,15 @@ export async function executeBuild(
   let result: BuildResult;
 
   let { buildProcess } = match;
-  if (!runInProcess && !buildProcess) {
-    buildProcess = await createBuildProcess(
-      match,
-      envConfigs,
-      workPath,
-      devServer.output
-    );
+  if (!isStatic && !buildProcess) {
+    buildProcess = await createBuildProcess(match, envConfigs, workPath);
   }
 
   const buildOptions: BuildOptions = {
     files,
     entrypoint,
     workPath,
+    repoRootPath: workPath,
     config,
     meta: {
       isDev: true,
@@ -155,7 +156,7 @@ export async function executeBuild(
     },
   };
 
-  let buildResultOrOutputs: BuilderOutputs | BuildResult | BuildResultV3;
+  let buildResultOrOutputs;
   if (buildProcess) {
     buildProcess.send({
       type: 'build',
@@ -184,10 +185,10 @@ export async function executeBuild(
         reject(err);
       }
       function cleanup() {
-        buildProcess!.removeListener('exit', onExit);
+        buildProcess!.removeListener('close', onExit);
         buildProcess!.removeListener('message', onMessage);
       }
-      buildProcess!.on('exit', onExit);
+      buildProcess!.on('close', onExit);
       buildProcess!.on('message', onMessage);
     });
   } else {
@@ -195,16 +196,12 @@ export async function executeBuild(
   }
 
   // Sort out build result to builder v2 shape
-  if (!builder.version || builder.version === 1) {
+  if (!builder.version || (builder as any).version === 1) {
     // `BuilderOutputs` map was returned (Now Builder v1 behavior)
     result = {
       output: buildResultOrOutputs as BuilderOutputs,
       routes: [],
       watch: [],
-      distPath:
-        typeof buildResultOrOutputs.distPath === 'string'
-          ? buildResultOrOutputs.distPath
-          : undefined,
     };
   } else if (builder.version === 2) {
     result = buildResultOrOutputs as BuildResult;
@@ -217,13 +214,13 @@ export async function executeBuild(
 
     if (output.maxDuration) {
       throw new Error(
-        'The result of "builder.build()" must not contain `memory`'
+        'The result of "builder.build()" must not contain `maxDuration`'
       );
     }
 
     if (output.memory) {
       throw new Error(
-        'The result of "builder.build()" must not contain `maxDuration`'
+        'The result of "builder.build()" must not contain `memory`'
       );
     }
 
@@ -250,7 +247,7 @@ export async function executeBuild(
   } else {
     throw new Error(
       `${getTitleName()} CLI does not support builder version ${
-        builder.version
+        (builder as any).version
       }.\nPlease run \`${await getUpdateCommand()}\` to update to the latest CLI.`
     );
   }
@@ -263,11 +260,13 @@ export async function executeBuild(
     result.routes = normalized.routes || [];
   }
 
-  const { output } = result;
+  const { output: buildOutput } = result;
   const { cleanUrls } = vercelConfig;
 
   // Mimic fmeta-util and perform file renaming
-  Object.entries(output).forEach(([path, value]) => {
+  for (const [originalPath, value] of Object.entries(buildOutput)) {
+    let path = normalizePath(originalPath);
+
     if (cleanUrls && path.endsWith('.html')) {
       path = path.slice(0, -5);
 
@@ -281,31 +280,31 @@ export async function executeBuild(
       path = extensionless;
     }
 
-    output[path] = value;
-  });
+    buildOutput[path] = value;
+  }
 
   // Convert the JSON-ified output map back into their corresponding `File`
   // subclass type instances.
-  for (const name of Object.keys(output)) {
-    const obj = output[name] as File;
-    let lambda: Lambda;
+  for (const name of Object.keys(buildOutput)) {
+    const obj = buildOutput[name] as File | Lambda;
+    let lambda: BuiltLambda;
     let fileRef: FileFsRef;
     let fileBlob: FileBlob;
     switch (obj.type) {
       case 'FileFsRef':
         fileRef = Object.assign(Object.create(FileFsRef.prototype), obj);
-        output[name] = fileRef;
+        buildOutput[name] = fileRef;
         break;
       case 'FileBlob':
         fileBlob = Object.assign(Object.create(FileBlob.prototype), obj);
         fileBlob.data = Buffer.from((obj as any).data.data);
-        output[name] = fileBlob;
+        buildOutput[name] = fileBlob;
         break;
       case 'Lambda':
-        lambda = Object.assign(Object.create(Lambda.prototype), obj) as Lambda;
+        lambda = Object.assign(Object.create(Lambda.prototype), obj);
         // Convert the JSON-ified Buffer object back into an actual Buffer
         lambda.zipBuffer = Buffer.from((obj as any).zipBuffer.data);
-        output[name] = lambda;
+        buildOutput[name] = lambda;
         break;
       default:
         throw new Error(`Unknown file type: ${obj.type}`);
@@ -332,7 +331,10 @@ export async function executeBuild(
   // Enforce the lambda zip size soft watermark
   const maxLambdaBytes = bytes('50mb');
   for (const asset of Object.values(result.output)) {
-    if (asset.type === 'Lambda') {
+    if (
+      asset.type === 'Lambda' &&
+      !(typeof asset.runtime === 'string' && asset.runtime.startsWith('python'))
+    ) {
       const size = asset.zipBuffer.length;
       if (size > maxLambdaBytes) {
         throw new LambdaSizeExceededError(size, maxLambdaBytes);
@@ -353,11 +355,13 @@ export async function executeBuild(
           await oldAsset.fn.destroy();
         }
 
+        const ZipFile = asset.zipBuffer || (await asset.createZip());
+
         asset.fn = await createFunction({
-          Code: { ZipFile: asset.zipBuffer },
+          Code: { ZipFile },
           Handler: asset.handler,
           Runtime: asset.runtime,
-          MemorySize: asset.memory || 3008,
+          MemorySize: asset.memory || 3009,
           Environment: {
             Variables: {
               ...vercelConfig.env,
@@ -377,16 +381,13 @@ export async function executeBuild(
 
   if (showBuildTimestamp) {
     const endTime = Date.now();
-    devServer.output.log(
-      `Built ${match.use}:${entrypoint} [${ms(endTime - startTime)}]`
-    );
+    output.log(`Built ${use}:${entrypoint} [${ms(endTime - startTime)}]`);
   }
 }
 
 export async function getBuildMatches(
   vercelConfig: VercelConfig,
   cwd: string,
-  output: Output,
   devServer: DevServer,
   fileList: string[]
 ): Promise<BuildMatch[]> {
@@ -400,8 +401,11 @@ export async function getBuildMatches(
 
   const noMatches: Builder[] = [];
   const builds = vercelConfig.builds || [{ src: '**', use: '@vercel/static' }];
+  const builderSpecs = new Set(builds.map(b => b.use).filter(Boolean));
+  const buildersWithPkgs = await importBuilders(builderSpecs, cwd);
 
   for (const buildConfig of builds) {
+    // eslint-disable-next-line prefer-const
     let { src = '**', use, config = {} } = buildConfig;
 
     if (!use) {
@@ -414,10 +418,6 @@ export async function getBuildMatches(
       // of Vercel deployments.
       src = src.substring(1);
     }
-
-    // We need to escape brackets since `glob` will
-    // try to find a group otherwise
-    src = src.replace(/(\[|\])/g, '[$1]');
 
     // lambda function files are trimmed of their file extension
     const mapToEntrypoint = new Map<string, string>();
@@ -438,6 +438,8 @@ export async function getBuildMatches(
     for (const file of files) {
       src = relative(cwd, file);
 
+      const entrypoint = mapToEntrypoint.get(src) || src;
+
       // Remove the output directory prefix
       if (config.zeroConfig && config.outputDirectory) {
         const outputMatch = config.outputDirectory + '/';
@@ -446,11 +448,15 @@ export async function getBuildMatches(
         }
       }
 
-      const builderWithPkg = await getBuilder(use, output);
+      const builderWithPkg = buildersWithPkgs.get(use);
+      if (!builderWithPkg) {
+        throw new Error(`Failed to load Builder "${use}"`);
+      }
+
       matches.push({
         ...buildConfig,
         src,
-        entrypoint: mapToEntrypoint.get(src) || src,
+        entrypoint,
         builderWithPkg,
         buildOutput: {},
         buildResults: new Map(),
@@ -477,21 +483,18 @@ export async function getBuildMatches(
   return matches;
 }
 
-export async function shutdownBuilder(
-  match: BuildMatch,
-  { debug }: Output
-): Promise<void> {
+export async function shutdownBuilder(match: BuildMatch): Promise<void> {
   const ops: Promise<void>[] = [];
 
   if (match.buildProcess) {
     const { pid } = match.buildProcess;
-    debug(`Killing builder sub-process with PID ${pid}`);
+    output.debug(`Killing builder sub-process with PID ${pid}`);
     const killPromise = treeKill(pid)
       .then(() => {
-        debug(`Killed builder with PID ${pid}`);
+        output.debug(`Killed builder with PID ${pid}`);
       })
       .catch((err: Error) => {
-        debug(`Failed to kill builder with PID ${pid}: ${err}`);
+        output.debug(`Failed to kill builder with PID ${pid}: ${err}`);
       });
     ops.push(killPromise);
     delete match.buildProcess;
@@ -500,7 +503,7 @@ export async function shutdownBuilder(
   if (match.buildOutput) {
     for (const asset of Object.values(match.buildOutput)) {
       if (asset.type === 'Lambda' && asset.fn) {
-        debug(`Shutting down Lambda function`);
+        output.debug(`Shutting down Lambda function`);
         ops.push(asset.fn.destroy());
       }
     }

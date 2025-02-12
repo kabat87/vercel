@@ -1,31 +1,23 @@
 import { basename } from 'path';
-import { VercelConfig } from '@vercel/client';
+import type { VercelConfig } from '@vercel/client';
 
 export interface GetProjectNameOptions {
-  argv: { '--name'?: string };
+  nameParam?: string;
   nowConfig?: VercelConfig;
-  isFile?: boolean;
   paths?: string[];
 }
 
 export default function getProjectName({
-  argv,
+  nameParam,
   nowConfig = {},
-  isFile = false,
   paths = [],
 }: GetProjectNameOptions) {
-  const nameCli = argv['--name'];
-
-  if (nameCli) {
-    return nameCli;
+  if (nameParam) {
+    return nameParam;
   }
 
   if (nowConfig.name) {
     return nowConfig.name;
-  }
-
-  if (isFile || paths.length > 1) {
-    return 'files';
   }
 
   // Otherwise, use the name of the directory

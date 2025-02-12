@@ -1,10 +1,10 @@
-import Client from './client';
-import { User } from '../types';
+import type Client from './client';
+import type { User } from '@vercel-internals/types';
 import { APIError, InvalidToken, MissingUser } from './errors-ts';
 
 export default async function getUser(client: Client) {
   try {
-    const res = await client.fetch<{ user: User }>('/www/user', {
+    const res = await client.fetch<{ user: User }>('/v2/user', {
       useCurrentTeam: false,
     });
 

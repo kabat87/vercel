@@ -1,18 +1,15 @@
-import psl from 'psl';
+import { parse } from 'tldts';
 import { NowError } from '../now-error';
-import { Domain } from '../../types';
-import { Output } from '../output';
+import type { Domain } from '@vercel-internals/types';
 import * as ERRORS from '../errors-ts';
 import addDomain from './add-domain';
-import Client from '../client';
+import type Client from '../client';
 import maybeGetDomainByName from './maybe-get-domain-by-name';
 import purchaseDomainIfAvailable from './purchase-domain-if-available';
-import verifyDomain from './verify-domain';
 import extractDomain from '../alias/extract-domain';
-import isWildcardAlias from '../alias/is-wildcard-alias';
+import output from '../../output-manager';
 
 export default async function setupDomain(
-  output: Output,
   client: Client,
   alias: string,
   contextName: string
@@ -27,36 +24,6 @@ export default async function setupDomain(
   if (info) {
     const { name: domain } = info;
     output.debug(`Domain ${domain} found for the given context`);
-    if (!info.verified || (!info.nsVerifiedAt && isWildcardAlias(alias))) {
-      output.debug(
-        `Domain ${domain} is not verified, trying to perform a verification`
-      );
-      const verificationResult = await verifyDomain(
-        client,
-        domain,
-        contextName
-      );
-      if (verificationResult instanceof ERRORS.DomainVerificationFailed) {
-        output.debug(`Domain ${domain} verification failed`);
-        return verificationResult;
-      }
-      if (!verificationResult.nsVerifiedAt && isWildcardAlias(alias)) {
-        return new ERRORS.DomainNsNotVerifiedForWildcard({
-          domain,
-          nsVerification: {
-            intendedNameservers: verificationResult.intendedNameservers,
-            nameservers: verificationResult.nameservers,
-          },
-        });
-      }
-
-      output.debug(`Domain ${domain} successfuly verified`);
-      return maybeGetDomainByName(client, contextName, domain) as Promise<
-        Domain
-      >;
-    }
-
-    output.debug(`Domain ${domain} is already verified`);
     return info;
   }
 
@@ -64,7 +31,6 @@ export default async function setupDomain(
     `The domain ${aliasDomain} was not found, trying to purchase it`
   );
   const purchased = await purchaseDomainIfAvailable(
-    output,
     client,
     aliasDomain,
     contextName
@@ -77,10 +43,7 @@ export default async function setupDomain(
     output.debug(
       `Domain ${aliasDomain} is not available to be purchased. Trying to add it`
     );
-    const parsedDomain = psl.parse(aliasDomain);
-    if (parsedDomain.error) {
-      return new ERRORS.InvalidDomain(alias, parsedDomain.error.message);
-    }
+    const parsedDomain = parse(aliasDomain);
     if (!parsedDomain.domain) {
       return new ERRORS.InvalidDomain(alias);
     }
@@ -92,51 +55,19 @@ export default async function setupDomain(
       return addResult;
     }
 
-    if (!addResult.verified) {
-      const verificationResult = await verifyDomain(
-        client,
-        domain,
-        contextName
-      );
-      if (verificationResult instanceof ERRORS.DomainVerificationFailed) {
-        output.debug(`Domain ${domain} was added but it couldn't be verified`);
-        return verificationResult;
-      }
-
-      output.debug(`Domain ${domain} successfuly added and manually verified`);
-      return verificationResult;
-    }
-
     output.debug(
-      `Domain ${domain} successfuly added and automatically verified`
+      `Domain ${domain} successfully added and automatically verified`
     );
     return addResult;
   }
 
-  output.debug(`The domain ${aliasDomain} was successfuly purchased`);
+  output.debug(`The domain ${aliasDomain} was successfully purchased`);
   const purchasedDomain = (await maybeGetDomainByName(
     client,
     contextName,
     aliasDomain
   )) as Domain;
   const { name: domain } = purchasedDomain;
-  if (!purchasedDomain.verified) {
-    const verificationResult = await verifyDomain(client, domain, contextName);
-    if (verificationResult instanceof ERRORS.DomainVerificationFailed) {
-      output.debug(
-        `Domain ${domain} was purchased but verification is still pending`
-      );
-      return new ERRORS.DomainVerificationFailed({
-        domain: verificationResult.meta.domain,
-        nsVerification: verificationResult.meta.nsVerification,
-        txtVerification: verificationResult.meta.txtVerification,
-        purchased: true,
-      });
-    }
-
-    output.debug(`Domain ${domain} was purchased and it was manually verified`);
-    return maybeGetDomainByName(client, contextName, domain) as Promise<Domain>;
-  }
 
   output.debug(
     `Domain ${domain} was purchased and it is automatically verified`

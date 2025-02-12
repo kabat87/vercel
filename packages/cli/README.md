@@ -6,15 +6,11 @@
   <p align="center">Develop. Preview. Ship.</p>
 </p>
 
-[![Join the community on GitHub Discussions](https://badgen.net/badge/join%20the%20discussion/on%20github/black?icon=github)](https://github.com/vercel/vercel/discussions)
+[Join the Vercel Community](https://vercel.community/)
 
 ## Usage
 
-Vercel is a platform for **static sites and frontend frameworks**, built to integrate with your headless content, commerce, or database.
-
-We provide a **frictionless developer experience** to take care of the hard things: deploy instantly, scale automatically, and serve personalized content around the globe.
-
-We make it easy for frontend teams to **develop, preview, and ship** delightful user experiences, where performance is the default.
+Vercel's frontend cloud gives developers frameworks, workflows, and infrastructure to build a faster, more personalized web.
 
 To install the latest version of Vercel CLI, run this command:
 
@@ -34,7 +30,7 @@ Finally, [connect your Git repository to Vercel](https://vercel.com/docs/git) an
 
 ## Documentation
 
-For details on how to use Vercel CLI, check out our [documentation](https://vercel.com/docs).
+For details on how to use Vercel CLI, check out our [documentation](https://vercel.com/docs/cli).
 
 ## Local Development
 
@@ -43,8 +39,8 @@ To develop Vercel CLI, first check out the source code, install dependencies, an
 ```bash
 git clone https://github.com/vercel/vercel.git
 cd vercel
-yarn
-yarn build
+pnpm install
+pnpm build
 ```
 
 At this point you can make modifications to the CLI source code and test them out locally. The CLI source code is located in the `packages/cli` directory.
@@ -53,13 +49,15 @@ At this point you can make modifications to the CLI source code and test them ou
 cd packages/cli
 ```
 
-From within the `packages/cli` directory, you can use the `ts-eager` command line tool to quickly excute Vercel CLI from its TypeScript source code directly (without having to manually compile first). For example:
+### `pnpm vercel <cli-commands...>`
+
+From within the `packages/cli` directory, you can use the "vercel" script to quickly execute Vercel CLI from its TypeScript source code directly (without having to manually compile first). For example:
 
 ```bash
-npx ts-eager src
-npx ts-eager src login
-npx ts-eager src switch --debug
-npx ts-eager src dev
+pnpm vercel deploy
+pnpm vercel whoami
+pnpm vercel login
+pnpm vercel switch --debug
 ```
 
 When you are satisfied with your changes, make a commit and create a pull request!

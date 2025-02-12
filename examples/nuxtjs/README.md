@@ -1,19 +1,48 @@
-# Nuxt.js Example
+# Nuxt Example
 
-This directory is a brief example of a [Nuxt.js](https://nuxtjs.org) app that can be deployed with Vercel and zero configuration.
-
-## Deploy Your Own
-
-Deploy your own Nuxt.js project with Vercel.
+Deploy your [Nuxt](https://nuxt.com) project to Vercel with zero configuration.
 
 [![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https://github.com/vercel/vercel/tree/main/examples/nuxtjs&template=nuxtjs)
 
-_Live Example: https://nuxtjs.now-examples.vercel.app/_
+_Live Example: https://nuxtjs-template.vercel.app_
 
-### How We Created This Example
+Look at the [Nuxt 3 documentation](https://v3.nuxtjs.org) to learn more.
 
-To get started with Nuxt.js deployed with Vercel, you can use the [Create-Nuxt-App CLI](https://www.npmjs.com/package/create-nuxt-app) to initialize the project:
+## Setup
 
-```shell
-$ npx create-nuxt-app my-app
+Make sure to install the dependencies:
+
+```bash
+# yarn
+yarn
+
+# npm
+npm install
+
+# pnpm
+pnpm install --shamefully-hoist
 ```
+
+## Development Server
+
+Start the development server on http://localhost:3000
+
+```bash
+npm run dev
+```
+
+## Production
+
+Build the application for production:
+
+```bash
+npm run build
+```
+
+Locally preview production build:
+
+```bash
+npm run preview
+```
+
+Checkout the [deployment documentation](https://nuxt.com/docs/getting-started/deployment#presets) for more information.

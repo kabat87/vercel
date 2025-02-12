@@ -1,14 +1,14 @@
-import inquirer from 'inquirer';
-import Client from '../client';
+import type Client from '../client';
 import error from '../output/error';
 import listInput from '../input/list';
 import { getCommandName } from '../pkg-name';
-import { LoginResult, SAMLError } from './types';
+import type { LoginResult, SAMLError } from './types';
 import doSamlLogin from './saml';
 import doEmailLogin from './email';
 import doGithubLogin from './github';
 import doGitlabLogin from './gitlab';
 import doBitbucketLogin from './bitbucket';
+import output from '../../output-manager';
 
 export default async function prompt(
   client: Client,
@@ -32,7 +32,7 @@ export default async function prompt(
     choices.pop();
   }
 
-  const choice = await listInput({
+  const choice = await listInput(client, {
     message: 'Log in to Vercel',
     choices,
   });
@@ -44,29 +44,28 @@ export default async function prompt(
   } else if (choice === 'bitbucket') {
     result = await doBitbucketLogin(client, outOfBand, ssoUserId);
   } else if (choice === 'email') {
-    const email = await readInput('Enter your email address:');
+    const email = await readInput(client, 'Enter your email address:');
     result = await doEmailLogin(client, email, ssoUserId);
   } else if (choice === 'saml') {
-    const slug = error?.teamId || (await readInput('Enter your Team slug:'));
+    const slug =
+      error?.teamId || (await readInput(client, 'Enter your Team slug:'));
     result = await doSamlLogin(client, slug, outOfBand, ssoUserId);
   }
 
   return result;
 }
 
-export async function readInput(message: string): Promise<string> {
+export async function readInput(
+  client: Client,
+  message: string
+): Promise<string> {
   let input;
 
   while (!input) {
     try {
-      const { val } = await inquirer.prompt({
-        type: 'input',
-        name: 'val',
-        message,
-      });
-      input = val;
-    } catch (err) {
-      console.log(); // \n
+      input = await client.input.text({ message });
+    } catch (err: any) {
+      output.print('\n'); // \n
 
       if (err.isTtyError) {
         throw new Error(

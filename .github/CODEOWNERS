@@ -1,27 +1,21 @@
 # Documentation
 # https://help.github.com/en/articles/about-code-owners
 
-*                                        @TooTallNate
-/.github/workflows                       @AndyBitz @styfle
-/packages/frameworks                     @AndyBitz
-/packages/cli/src/commands/dev       @TooTallNate @styfle @AndyBitz
-/packages/cli/src/util/dev           @TooTallNate @styfle @AndyBitz
-/packages/cli/src/commands/domains   @javivelasco @mglagola @anatrajkovska
-/packages/cli/src/commands/certs     @javivelasco @mglagola @anatrajkovska
-/packages/cli/src/commands/env       @styfle @lucleray
-/packages/client                     @rdev @styfle @TooTallNate
-/packages/build-utils                @styfle @AndyBitz @TooTallNate
-/packages/node                       @styfle @TooTallNate @lucleray
-/packages/node-bridge                @styfle @TooTallNate @lucleray
-/packages/next                       @Timer @ijjk
-/packages/go                         @styfle @TooTallNate
-/packages/python                     @styfle @TooTallNate
-/packages/ruby                       @styfle @coetry @TooTallNate
-/packages/static-build               @styfle @AndyBitz
-/packages/routing-utils              @styfle @dav-is @ijjk
-/examples                                @mcsdevv @timothyis
-/examples/create-react-app               @Timer
-/examples/nextjs                         @timneutkens @Timer
-/examples/hugo                           @mcsdevv @timothyis @styfle
-/examples/jekyll                         @mcsdevv @timothyis @styfle
-/examples/zola                           @mcsdevv @timothyis @styfle
+# Restricted Paths
+*                                        @TooTallNate @EndangeredMassa @trek @onsclom @jeffsee55 @erikareads
+/.github/workflows                       @TooTallNate @EndangeredMassa @trek @onsclom @jeffsee55 @erikareads @ijjk
+/packages/fs-detectors                   @TooTallNate @EndangeredMassa @trek @onsclom @jeffsee55 @erikareads @agadzik @chloetedder
+/packages/next                           @timneutkens @ijjk @ztanner @huozhi
+/packages/routing-utils                  @TooTallNate @EndangeredMassa @trek @onsclom @jeffsee55 @erikareads @ijjk
+/packages/static-build                   @TooTallNate @EndangeredMassa @trek @onsclom @jeffsee55 @erikareads
+/packages/edge                           @vercel/compute
+/packages/functions                      @vercel/compute
+/packages/firewall                       @cramforce @sueplex
+/examples                                @TooTallNate @EndangeredMassa @trek @onsclom @jeffsee55 @erikareads @leerob
+/examples/create-react-app               @TooTallNate @EndangeredMassa @trek @onsclom @jeffsee55 @erikareads @Timer
+/examples/nextjs                         @ijjk @ztanner @huozhi
+/packages/node                           @TooTallNate @EndangeredMassa @trek @onsclom @jeffsee55 @erikareads @Kikobeats
+/packages/related-projects               @TooTallNate @EndangeredMassa @trek @onsclom @jeffsee55 @erikareads @Kikobeats @tknickman @mknichel
+
+# Unrestricted Paths
+.changeset/

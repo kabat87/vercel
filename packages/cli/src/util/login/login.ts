@@ -1,6 +1,7 @@
-import Client from '../client';
-import { InvalidEmail, AccountNotFound } from '../errors-ts';
-import { LoginData } from './types';
+import type Client from '../client';
+import { InvalidEmail, AccountNotFound, isAPIError } from '../errors-ts';
+import { errorToString } from '@vercel/error-utils';
+import type { LoginData } from './types';
 
 export default async function login(
   client: Client,
@@ -11,18 +12,20 @@ export default async function login(
       method: 'POST',
       body: { email },
     });
-  } catch (err) {
-    if (err.code === 'not_exists') {
-      throw new AccountNotFound(
-        email,
-        `Please sign up: https://vercel.com/signup`
-      );
+  } catch (err: unknown) {
+    if (isAPIError(err)) {
+      if (err.code === 'not_exists') {
+        throw new AccountNotFound(
+          email,
+          `Please sign up: https://vercel.com/signup`
+        );
+      }
+
+      if (err.code === 'invalid_email') {
+        throw new InvalidEmail(email, err.message);
+      }
     }
 
-    if (err.code === 'invalid_email') {
-      throw new InvalidEmail(email, err.message);
-    }
-
-    throw new Error(`Unexpected error: ${err.message}`);
+    throw new Error(`Unexpected error: ${errorToString(err)}`);
   }
 }
