@@ -16,14 +16,8 @@ export const isDirectory = (path: string): boolean => {
 
 // Returns in which directory the config should be present
 const getGlobalPathConfig = (): string => {
-  let customPath: string | undefined;
-
-  try {
-    const argv = getArgs(process.argv.slice(2), {});
-    customPath = argv['--global-config'];
-  } catch (_error) {
-    // args are optional so consume error
-  }
+  const argv = getArgs(process.argv.slice(2), {}, { permissive: true });
+  const customPath = argv['--global-config'];
 
   const vercelDirectories = XDGAppPaths('com.vercel.cli').dataDirs();
 
@@ -34,7 +28,7 @@ const getGlobalPathConfig = (): string => {
   ];
 
   // The customPath flag is the preferred location,
-  // followed by the the vercel directory,
+  // followed by the vercel directory,
   // followed by the now directory.
   // If none of those exist, use the vercel directory.
   return (

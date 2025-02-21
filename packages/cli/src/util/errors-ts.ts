@@ -1,10 +1,11 @@
 import bytes from 'bytes';
-import { Response } from 'node-fetch';
+import type { Response } from 'node-fetch';
 import { NowBuildError } from '@vercel/build-utils';
 import { NowError } from './now-error';
 import code from './output/code';
 import { getCommandName } from './pkg-name';
 import chalk from 'chalk';
+import { isError } from '@vercel/error-utils';
 
 /**
  * This error is thrown when there is an API error with a payload. The error
@@ -45,6 +46,10 @@ export class APIError extends Error {
   }
 }
 
+export function isAPIError(v: unknown): v is APIError {
+  return isError(v) && 'status' in v;
+}
+
 /**
  * When you're fetching information for the current team but the client can't
  * retrieve information. This means that the team was probably deleted or the
@@ -54,7 +59,7 @@ export class TeamDeleted extends NowError<'TEAM_DELETED', {}> {
   constructor() {
     super({
       code: 'TEAM_DELETED',
-      message: `Your team was deleted. You can switch to a different one using ${getCommandName(
+      message: `Your team was deleted or you were removed from the team. You can switch to a different one using ${getCommandName(
         `switch`
       )}.`,
       meta: {},
@@ -147,9 +152,7 @@ export class SourceNotFound extends NowError<'SOURCE_NOT_FOUND', {}> {
     super({
       code: 'SOURCE_NOT_FOUND',
       meta: {},
-      message: `Not able to purchase. Please add a payment method using ${getCommandName(
-        `billing add`
-      )}.`,
+      message: `Not able to purchase. Please add a payment method using the dashboard.`,
     });
   }
 }
@@ -259,31 +262,6 @@ export type TXTVerificationError = {
   verificationRecord: string;
   values: string[];
 };
-
-/**
- * This error is returned when the domain is not verified by nameservers for wildcard alias.
- */
-export class DomainNsNotVerifiedForWildcard extends NowError<
-  'DOMAIN_NS_NOT_VERIFIED_FOR_WILDCARD',
-  {
-    domain: string;
-    nsVerification: NSVerificationError;
-  }
-> {
-  constructor({
-    domain,
-    nsVerification,
-  }: {
-    domain: string;
-    nsVerification: NSVerificationError;
-  }) {
-    super({
-      code: 'DOMAIN_NS_NOT_VERIFIED_FOR_WILDCARD',
-      meta: { domain, nsVerification },
-      message: `The domain ${domain} is not verified by nameservers for wildcard alias.`,
-    });
-  }
-}
 
 /**
  * Used when a domain is validated because we tried to add it to an account
@@ -448,7 +426,7 @@ export class UserAborted extends NowError<'USER_ABORTED', {}> {
     super({
       code: 'USER_ABORTED',
       meta: {},
-      message: `The user aborted the operation.`,
+      message: `The user canceled the operation.`,
     });
   }
 }
@@ -593,7 +571,7 @@ export class DeploymentNotFound extends NowError<
     super({
       code: 'DEPLOYMENT_NOT_FOUND',
       meta: { id, context },
-      message: `Can't find the deployment ${id} under the context ${context}`,
+      message: `Can't find the deployment "${id}" under the context "${context}"`,
     });
   }
 }
@@ -690,13 +668,14 @@ export class CertMissing extends NowError<'ALIAS_IN_USE', { domain: string }> {
 
 export class CantParseJSONFile extends NowError<
   'CANT_PARSE_JSON_FILE',
-  { file: string }
+  { file: string; parseErrorLocation: string }
 > {
-  constructor(file: string) {
+  constructor(file: string, parseErrorLocation: string) {
+    const message = `Can't parse json file ${file}: ${parseErrorLocation}`;
     super({
       code: 'CANT_PARSE_JSON_FILE',
-      meta: { file },
-      message: `Can't parse json file`,
+      meta: { file, parseErrorLocation },
+      message,
     });
   }
 }
@@ -1098,6 +1077,50 @@ export class BuildError extends NowError<'BUILD_ERROR', {}> {
       code: 'BUILD_ERROR',
       meta,
       message,
+    });
+  }
+}
+
+interface SchemaValidationFailedMeta {
+  message: string;
+  keyword: string;
+  dataPath: string;
+  params: object;
+}
+
+export class SchemaValidationFailed extends NowError<
+  'SCHEMA_VALIDATION_FAILED',
+  SchemaValidationFailedMeta
+> {
+  constructor(
+    message: string,
+    keyword: string,
+    dataPath: string,
+    params: object
+  ) {
+    super({
+      code: 'SCHEMA_VALIDATION_FAILED',
+      meta: { message, keyword, dataPath, params },
+      message: `Schema verification failed`,
+    });
+  }
+}
+
+interface InvalidLocalConfigMeta {
+  value: string[];
+}
+
+export class InvalidLocalConfig extends NowError<
+  'INVALID_LOCAL_CONFIG',
+  InvalidLocalConfigMeta
+> {
+  constructor(value: string[]) {
+    super({
+      code: 'INVALID_LOCAL_CONFIG',
+      meta: { value },
+      message: `Invalid local config parameter [${value
+        .map(localConfig => `"${localConfig}"`)
+        .join(', ')}]. A string was expected.`,
     });
   }
 }

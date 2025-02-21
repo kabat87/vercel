@@ -1,13 +1,15 @@
 import chalk from 'chalk';
-import Client from '../client';
-import { ProjectAliasTarget } from '../../types';
+import type Client from '../client';
+import type { ProjectAliasTarget } from '@vercel-internals/types';
+import { isAPIError } from '../errors-ts';
+import output from '../../output-manager';
 
 export async function removeDomainFromProject(
   client: Client,
   projectNameOrId: string,
   domain: string
 ) {
-  client.output.spinner(
+  output.spinner(
     `Removing domain ${domain} from project ${chalk.bold(projectNameOrId)}`
   );
   try {
@@ -21,8 +23,8 @@ export async function removeDomainFromProject(
     );
 
     return response;
-  } catch (err) {
-    if (err.status < 500) {
+  } catch (err: unknown) {
+    if (isAPIError(err) && err.status < 500) {
       return err;
     }
 

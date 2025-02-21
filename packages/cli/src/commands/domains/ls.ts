@@ -2,46 +2,55 @@ import ms from 'ms';
 import chalk from 'chalk';
 import plural from 'pluralize';
 
-import Client from '../../util/client';
+import type Client from '../../util/client';
 import getDomains from '../../util/domains/get-domains';
 import getScope from '../../util/get-scope';
 import stamp from '../../util/output/stamp';
 import formatTable from '../../util/format-table';
 import { formatDateWithoutTime } from '../../util/format-date';
-import { Domain } from '../../types';
+import type { Domain } from '@vercel-internals/types';
 import getCommandFlags from '../../util/get-command-flags';
+import { getPaginationOpts } from '../../util/get-pagination-opts';
 import { getCommandName } from '../../util/pkg-name';
 import isDomainExternal from '../../util/domains/is-domain-external';
 import { getDomainRegistrar } from '../../util/domains/get-domain-registrar';
+import output from '../../output-manager';
+import { DomainsLsTelemetryClient } from '../../util/telemetry/commands/domains/ls';
+import { listSubcommand } from './command';
+import { parseArguments } from '../../util/get-args';
+import { getFlagsSpecification } from '../../util/get-flags-specification';
+import { printError } from '../../util/error';
 
-type Options = {
-  '--next': number;
-};
+export default async function ls(client: Client, argv: string[]) {
+  const telemetry = new DomainsLsTelemetryClient({
+    opts: {
+      store: client.telemetryEventStore,
+    },
+  });
 
-export default async function ls(
-  client: Client,
-  opts: Partial<Options>,
-  args: string[]
-) {
-  const { output } = client;
-  const { '--next': nextTimestamp } = opts;
-  let contextName = null;
+  let parsedArgs;
+  const flagsSpecification = getFlagsSpecification(listSubcommand.options);
+  try {
+    parsedArgs = parseArguments(argv, flagsSpecification);
+  } catch (error) {
+    printError(error);
+    return 1;
+  }
+  const { args, flags: opts } = parsedArgs;
 
-  if (typeof nextTimestamp !== undefined && Number.isNaN(nextTimestamp)) {
-    output.error('Please provide a number for flag --next');
+  telemetry.trackCliOptionLimit(opts['--limit']);
+  telemetry.trackCliOptionNext(opts['--next']);
+
+  let paginationOptions: (number | undefined)[];
+
+  try {
+    paginationOptions = getPaginationOpts(opts);
+  } catch (err: unknown) {
+    output.prettyError(err);
     return 1;
   }
 
-  try {
-    ({ contextName } = await getScope(client));
-  } catch (err) {
-    if (err.code === 'NOT_AUTHORIZED' || err.code === 'TEAM_DELETED') {
-      output.error(err.message);
-      return 1;
-    }
-
-    throw err;
-  }
+  const { contextName } = await getScope(client);
 
   const lsStamp = stamp();
 
@@ -56,7 +65,10 @@ export default async function ls(
 
   output.spinner(`Fetching Domains under ${chalk.bold(contextName)}`);
 
-  const { domains, pagination } = await getDomains(client, nextTimestamp);
+  const { domains, pagination } = await getDomains(
+    client,
+    ...paginationOptions
+  );
 
   output.log(
     `${plural('Domain', domains.length, true)} found under ${chalk.bold(

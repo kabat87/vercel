@@ -1,27 +1,27 @@
 import { lstatSync } from 'fs-extra';
-
-import { relative, isAbsolute } from 'path';
-import hashes, { mapToObject } from './utils/hashes';
+import { isAbsolute, join, relative, sep } from 'path';
+import { hash, hashes, mapToObject } from './utils/hashes';
 import { upload } from './upload';
-import { buildFileTree, createDebug, parseVercelConfig } from './utils';
+import { buildFileTree, createDebug } from './utils';
 import { DeploymentError } from './errors';
+import { isErrnoException } from '@vercel/error-utils';
 import {
-  NowConfig,
   VercelClientOptions,
   DeploymentOptions,
   DeploymentEventType,
 } from './types';
+import { streamToBufferChunks } from '@vercel/build-utils';
+import tar from 'tar-fs';
+import { createGzip } from 'zlib';
 
 export default function buildCreateDeployment() {
   return async function* createDeployment(
     clientOptions: VercelClientOptions,
-    deploymentOptions: DeploymentOptions = {},
-    nowConfig: NowConfig = {}
+    deploymentOptions: DeploymentOptions = {}
   ): AsyncIterableIterator<{ type: DeploymentEventType; payload: any }> {
     const { path } = clientOptions;
 
     const debug = createDebug(clientOptions.debug);
-    const cwd = process.cwd();
 
     debug('Creating deployment...');
 
@@ -74,34 +74,7 @@ export default function buildCreateDeployment() {
       debug(`Provided 'path' is a single file`);
     }
 
-    let { fileList } = await buildFileTree(
-      path,
-      clientOptions.isDirectory,
-      debug
-    );
-
-    let configPath: string | undefined;
-    if (!nowConfig) {
-      // If the user did not provide a config file, use the one in the root directory.
-      const relativePaths = fileList.map(f => relative(cwd, f));
-      const hasVercelConfig = relativePaths.includes('vercel.json');
-      const hasNowConfig = relativePaths.includes('now.json');
-
-      if (hasVercelConfig) {
-        if (hasNowConfig) {
-          throw new DeploymentError({
-            code: 'conflicting_config',
-            message:
-              'Cannot use both a `vercel.json` and `now.json` file. Please delete the `now.json` file.',
-          });
-        }
-        configPath = 'vercel.json';
-      } else if (hasNowConfig) {
-        configPath = 'now.json';
-      }
-
-      nowConfig = await parseVercelConfig(configPath);
-    }
+    const { fileList } = await buildFileTree(path, clientOptions, debug);
 
     // This is a useful warning because it prevents people
     // from getting confused about a deployment that renders 404.
@@ -113,7 +86,49 @@ export default function buildCreateDeployment() {
       };
     }
 
-    const files = await hashes(fileList);
+    // Populate Files -> FileFsRef mapping
+    const workPath = typeof path === 'string' ? path : path[0];
+
+    let files;
+
+    try {
+      if (clientOptions.archive === 'tgz') {
+        debug('Packing tarball');
+        const tarStream = tar
+          .pack(workPath, {
+            entries: fileList.map(file => relative(workPath, file)),
+          })
+          .pipe(createGzip());
+        const chunkedTarBuffers = await streamToBufferChunks(tarStream);
+        debug(`Packed tarball into ${chunkedTarBuffers.length} chunks`);
+        files = new Map(
+          chunkedTarBuffers.map((chunk, index) => [
+            hash(chunk),
+            {
+              names: [join(workPath, `.vercel/source.tgz.part${index + 1}`)],
+              data: chunk,
+              mode: 0o666,
+            },
+          ])
+        );
+      } else {
+        files = await hashes(fileList);
+      }
+    } catch (err: unknown) {
+      if (
+        clientOptions.prebuilt &&
+        isErrnoException(err) &&
+        err.code === 'ENOENT' &&
+        err.path
+      ) {
+        const errPath = relative(workPath, err.path);
+        err.message = `File does not exist: "${relative(workPath, errPath)}"`;
+        if (errPath.split(sep).includes('node_modules')) {
+          err.message = `Please ensure project dependencies have been installed:\n${err.message}`;
+        }
+      }
+      throw err;
+    }
 
     debug(`Yielding a 'hashes-calculated' event with ${files.size} hashes`);
     yield { type: 'hashes-calculated', payload: mapToObject(files) };

@@ -1,45 +1,46 @@
 import chalk from 'chalk';
 import plural from 'pluralize';
-
-import { User, Team } from '../../types';
 import * as ERRORS from '../../util/errors-ts';
-import Client from '../../util/client';
 import getScope from '../../util/get-scope';
 import moveOutDomain from '../../util/domains/move-out-domain';
 import isRootDomain from '../../util/is-root-domain';
-import textInput from '../../util/input/text';
 import param from '../../util/output/param';
 import getDomainAliases from '../../util/alias/get-domain-aliases';
 import getDomainByName from '../../util/domains/get-domain-by-name';
-import promptBool from '../../util/input/prompt-bool';
 import getTeams from '../../util/teams/get-teams';
 import { getCommandName } from '../../util/pkg-name';
+import output from '../../output-manager';
+import { DomainsMoveTelemetryClient } from '../../util/telemetry/commands/domains/move';
+import { moveSubcommand } from './command';
+import { parseArguments } from '../../util/get-args';
+import { getFlagsSpecification } from '../../util/get-flags-specification';
+import { printError } from '../../util/error';
+import type Client from '../../util/client';
+import type { User, Team } from '@vercel-internals/types';
 
-type Options = {
-  '--yes': boolean;
-};
+export default async function move(client: Client, argv: string[]) {
+  const telemetry = new DomainsMoveTelemetryClient({
+    opts: {
+      store: client.telemetryEventStore,
+    },
+  });
 
-export default async function move(
-  client: Client,
-  opts: Partial<Options>,
-  args: string[]
-) {
-  const { output } = client;
-  let contextName = null;
-  let user = null;
-
+  let parsedArgs;
+  const flagsSpecification = getFlagsSpecification(moveSubcommand.options);
   try {
-    ({ contextName, user } = await getScope(client));
-  } catch (err) {
-    if (err.code === 'NOT_AUTHORIZED' || err.code === 'TEAM_DELETED') {
-      output.error(err.message);
-      return 1;
-    }
-
-    throw err;
+    parsedArgs = parseArguments(argv, flagsSpecification);
+  } catch (error) {
+    printError(error);
+    return 1;
   }
+  const { args, flags: opts } = parsedArgs;
 
-  const { domainName, destination } = await getArgs(args);
+  telemetry.trackCliFlagYes(opts['--yes']);
+  telemetry.trackCliArgumentDomain(args[0]);
+  telemetry.trackCliArgumentDestination(args[1]);
+
+  const { contextName, user } = await getScope(client);
+  const { domainName, destination } = await getArgs(client, args);
   if (!isRootDomain(domainName)) {
     output.error(
       `Invalid domain name "${domainName}". Run ${getCommandName(
@@ -66,6 +67,12 @@ export default async function move(
 
   const teams = await getTeams(client);
   const matchId = await findDestinationMatch(destination, user, teams);
+
+  if (matchId && matchId === user.id && user.version === 'northstar') {
+    output.error(`You may not move your domain to your user account.`);
+    return 1;
+  }
+
   if (!matchId && !opts['--yes']) {
     output.warn(
       `You're not a member of ${param(destination)}. ` +
@@ -74,13 +81,14 @@ export default async function move(
         )} will have 24 hours to accept your move request before it expires.`
     );
     if (
-      !(await promptBool(
+      !(await client.input.confirm(
         `Are you sure you want to move ${param(domainName)} to ${param(
           destination
-        )}?`
+        )}?`,
+        false
       ))
     ) {
-      output.log('Aborted');
+      output.log('Canceled');
       return 0;
     }
   }
@@ -94,11 +102,12 @@ export default async function move(
         )} will be removed. Run ${getCommandName(`alias ls`)} to list them.`
       );
       if (
-        !(await promptBool(
-          `Are you sure you want to move ${param(domainName)}?`
+        !(await client.input.confirm(
+          `Are you sure you want to move ${param(domainName)}?`,
+          false
         ))
       ) {
-        output.log('Aborted');
+        output.log('Canceled');
         return 0;
       }
     }
@@ -169,20 +178,20 @@ export default async function move(
   return 0;
 }
 
-async function getArgs(args: string[]) {
+async function getArgs(client: Client, args: string[]) {
   let [domainName, destination] = args;
 
   if (!domainName) {
-    domainName = await textInput({
-      label: `- Domain name: `,
-      validateValue: isRootDomain,
+    domainName = await client.input.text({
+      message: `- Domain name: `,
+      validate: isRootDomain,
     });
   }
 
   if (!destination) {
-    destination = await textInput({
-      label: `- Destination: `,
-      validateValue: (v: string) => Boolean(v && v.length > 0),
+    destination = await client.input.text({
+      message: `- Destination: `,
+      validate: (v: string) => Boolean(v && v.length > 0),
     });
   }
 
@@ -194,8 +203,8 @@ async function findDestinationMatch(
   user: User,
   teams: Team[]
 ) {
-  if (user.uid === destination || user.username === destination) {
-    return user.uid;
+  if (user.id === destination || user.username === destination) {
+    return user.id;
   }
 
   for (const team of teams) {

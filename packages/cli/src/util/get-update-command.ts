@@ -1,28 +1,7 @@
-import { Stats } from 'fs';
+import { readFile, realpath } from 'fs-extra';
 import { sep, dirname, join, resolve } from 'path';
-import { readJSON, lstat, readlink, readFile, realpath } from 'fs-extra';
-import { isCanary } from './is-canary';
-import { getPkgName } from './pkg-name';
-
-// `npm` tacks a bunch of extra properties on the `package.json` file,
-// so check for one of them to determine yarn vs. npm.
-async function isYarn(): Promise<boolean> {
-  let s: Stats;
-  let binPath = process.argv[1];
-
-  // eslint-disable-next-line no-constant-condition
-  while (true) {
-    s = await lstat(binPath);
-    if (s.isSymbolicLink()) {
-      binPath = resolve(dirname(binPath), await readlink(binPath));
-    } else {
-      break;
-    }
-  }
-  const pkgPath = join(dirname(binPath), '..', 'package.json');
-  const pkg = await readJSON(pkgPath).catch(() => ({}));
-  return !('_id' in pkg);
-}
+import { scanParentDirs } from '@vercel/build-utils';
+import { packageName } from './pkg-name';
 
 async function getConfigPrefix() {
   const paths = [
@@ -56,7 +35,7 @@ async function getConfigPrefix() {
   return null;
 }
 
-async function isGlobal() {
+export async function isGlobal() {
   try {
     // This is true for e.g. nvm, node path will be equal to now path
     if (dirname(process.argv[0]) === dirname(process.argv[1])) {
@@ -71,6 +50,14 @@ async function isGlobal() {
     if (
       installPath.includes(['', 'yarn', 'global', 'node_modules', ''].join(sep))
     ) {
+      return true;
+    }
+
+    if (installPath.includes(['', 'pnpm', 'global', ''].join(sep))) {
+      return true;
+    }
+
+    if (installPath.includes(['', 'fnm', 'node-versions', ''].join(sep))) {
       return true;
     }
 
@@ -93,16 +80,27 @@ async function isGlobal() {
 }
 
 export default async function getUpdateCommand(): Promise<string> {
-  const tag = isCanary() ? 'canary' : 'latest';
-  const pkgAndVersion = `${getPkgName()}@${tag}`;
+  const pkgAndVersion = `${packageName}@latest`;
 
+  const entrypoint = await realpath(process.argv[1]);
+  // eslint-disable-next-line prefer-const
+  let { cliType, lockfilePath } = await scanParentDirs(
+    dirname(dirname(entrypoint))
+  );
+  if (!lockfilePath) {
+    // Global installs for npm do not have a lockfile
+    cliType = 'npm';
+  }
+  const yarn = cliType === 'yarn';
+
+  let install = yarn ? 'add' : 'i';
   if (await isGlobal()) {
-    return (await isYarn())
-      ? `yarn global add ${pkgAndVersion}`
-      : `npm i -g ${pkgAndVersion}`;
+    if (yarn) {
+      install = 'global add';
+    } else {
+      install = 'i -g';
+    }
   }
 
-  return (await isYarn())
-    ? `yarn add ${pkgAndVersion}`
-    : `npm i ${pkgAndVersion}`;
+  return `${cliType} ${install} ${pkgAndVersion}`;
 }

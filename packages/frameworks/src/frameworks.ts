@@ -1,5 +1,5 @@
 import { join } from 'path';
-import { promises } from 'fs';
+import { existsSync, promises } from 'fs';
 
 import { Framework } from './types';
 import { readConfigFile } from './read-config-file';
@@ -18,31 +18,36 @@ const { readdir, readFile, unlink } = promises;
 
 export const frameworks = [
   {
-    name: 'Blitz.js',
+    name: 'Blitz.js (Legacy)',
     slug: 'blitzjs',
-    demo: 'https://blitzjs.examples.vercel.com',
-    logo: 'https://raw.githubusercontent.com/vercel/vercel/main/packages/frameworks/logos/blitz.svg',
+    demo: 'https://blitz-template.vercel.app',
+    logo: 'https://api-frameworks.vercel.sh/framework-logos/blitz.svg',
     tagline: 'Blitz.js: The Fullstack React Framework',
     description:
-      'A brand new Blitz.js app - the result of running `npx blitz new`.',
+      'A brand new Blitz.js app - the result of running `npx blitz@0.45.4 new`.',
     website: 'https://blitzjs.com',
     envPrefix: 'NEXT_PUBLIC_',
     useRuntime: { src: 'package.json', use: '@vercel/next' },
     detectors: {
-      every: [
+      some: [
+        // Intentionally does not detect a package name
+        // https://github.com/vercel/vercel/pull/8432
         {
-          path: 'package.json',
-          matchContent:
-            '"(dev)?(d|D)ependencies":\\s*{[^}]*"blitz":\\s*".+?"[^}]*}',
+          path: 'blitz.config.js',
+        },
+        {
+          path: 'blitz.config.ts',
         },
       ],
     },
     settings: {
       installCommand: {
-        placeholder: '`yarn install` or `npm install`',
+        placeholder:
+          '`yarn install`, `pnpm install`, `npm install`, or `bun install`',
       },
       buildCommand: {
         placeholder: '`npm run build` or `blitz build`',
+        value: 'blitz build',
       },
       devCommand: {
         value: 'blitz start',
@@ -51,15 +56,17 @@ export const frameworks = [
         placeholder: 'Next.js default',
       },
     },
-    devCommand: 'blitz start',
-    buildCommand: 'blitz build',
     getOutputDirName: async () => 'public',
   },
   {
     name: 'Next.js',
     slug: 'nextjs',
-    demo: 'https://nextjs.examples.vercel.com',
-    logo: 'https://raw.githubusercontent.com/vercel/vercel/main/packages/frameworks/logos/next.svg',
+    demo: 'https://nextjs-template.vercel.app',
+    logo: 'https://api-frameworks.vercel.sh/framework-logos/next.svg',
+    darkModeLogo:
+      'https://api-frameworks.vercel.sh/framework-logos/next-dark.svg',
+    screenshot:
+      'https://assets.vercel.com/image/upload/v1701461207/front/import/nextjs.png',
     tagline:
       'Next.js makes you productive with React instantly — whether you want to build static or dynamic sites.',
     description: 'A Next.js app and a Serverless Function API.',
@@ -70,18 +77,18 @@ export const frameworks = [
     detectors: {
       every: [
         {
-          path: 'package.json',
-          matchContent:
-            '"(dev)?(d|D)ependencies":\\s*{[^}]*"next":\\s*".+?"[^}]*}',
+          matchPackage: 'next',
         },
       ],
     },
     settings: {
       installCommand: {
-        placeholder: '`yarn install` or `npm install`',
+        placeholder:
+          '`yarn install`, `pnpm install`, `npm install`, or `bun install`',
       },
       buildCommand: {
         placeholder: '`npm run build` or `next build`',
+        value: 'next build',
       },
       devCommand: {
         value: 'next dev --port $PORT',
@@ -97,38 +104,35 @@ export const frameworks = [
         dependencies: ['next-plugin-sentry', 'next-sentry-source-maps'],
       },
     ],
-    devCommand: 'next dev --port $PORT',
-    buildCommand: 'next build',
     getOutputDirName: async () => 'public',
     cachePattern: '.next/cache/**',
   },
   {
     name: 'Gatsby.js',
     slug: 'gatsby',
-    demo: 'https://gatsby.examples.vercel.com',
-    logo: 'https://raw.githubusercontent.com/vercel/vercel/main/packages/frameworks/logos/gatsby.svg',
+    demo: 'https://gatsby.vercel.app',
+    logo: 'https://api-frameworks.vercel.sh/framework-logos/gatsby.svg',
     tagline:
       'Gatsby helps developers build blazing fast websites and apps with React.',
-    description:
-      'A Gatsby app, using the default starter theme and a Serverless Function API.',
+    description: 'A Gatsby starter app with an API Route.',
     website: 'https://gatsbyjs.org',
-    sort: 2,
+    sort: 5,
     envPrefix: 'GATSBY_',
     detectors: {
       every: [
         {
-          path: 'package.json',
-          matchContent:
-            '"(dev)?(d|D)ependencies":\\s*{[^}]*"gatsby":\\s*".+?"[^}]*}',
+          matchPackage: 'gatsby',
         },
       ],
     },
     settings: {
       installCommand: {
-        placeholder: '`yarn install` or `npm install`',
+        placeholder:
+          '`yarn install`, `pnpm install`, `npm install`, or `bun install`',
       },
       buildCommand: {
         placeholder: '`npm run build` or `gatsby build`',
+        value: 'gatsby build',
       },
       devCommand: {
         value: 'gatsby develop --port $PORT',
@@ -139,8 +143,6 @@ export const frameworks = [
       },
     },
     dependency: 'gatsby',
-    devCommand: 'gatsby develop --port $PORT',
-    buildCommand: 'gatsby build',
     getOutputDirName: async () => 'public',
     defaultRoutes: async (dirPrefix: string) => {
       // This file could be generated by gatsby-plugin-now or gatsby-plugin-zeit-now
@@ -192,30 +194,177 @@ export const frameworks = [
     cachePattern: '{.cache,public}/**',
   },
   {
-    name: 'Hexo',
-    slug: 'hexo',
-    demo: 'https://hexo.examples.vercel.com',
-    logo: 'https://raw.githubusercontent.com/vercel/vercel/main/packages/frameworks/logos/hexo.svg',
-    tagline:
-      'Hexo is a fast, simple & powerful blog framework powered by Node.js.',
-    description: 'A Hexo site, created with the Hexo CLI.',
-    website: 'https://hexo.io',
-    sort: 3,
+    name: 'Remix',
+    slug: 'remix',
+    demo: 'https://remix-run-template.vercel.app',
+    logo: 'https://api-frameworks.vercel.sh/framework-logos/remix-no-shadow.svg',
+    tagline: 'Build Better Websites',
+    description: 'A new Remix app — the result of running `npx create-remix`.',
+    website: 'https://remix.run',
+    sort: 6,
+    supersedes: ['hydrogen', 'vite'],
+    useRuntime: { src: 'package.json', use: '@vercel/remix-builder' },
+    ignoreRuntimes: ['@vercel/node'],
     detectors: {
-      every: [
+      some: [
         {
-          path: 'package.json',
-          matchContent:
-            '"(dev)?(d|D)ependencies":\\s*{[^}]*"hexo":\\s*".+?"[^}]*}',
+          matchPackage: '@remix-run/dev',
+        },
+        {
+          path: 'remix.config.js',
+        },
+        {
+          path: 'remix.config.mjs',
         },
       ],
     },
     settings: {
       installCommand: {
-        placeholder: '`yarn install` or `npm install`',
+        placeholder:
+          '`yarn install`, `pnpm install`, `npm install`, or `bun install`',
+      },
+      buildCommand: {
+        value: 'remix build',
+        placeholder: '`npm run build` or `remix build`',
+      },
+      devCommand: {
+        value: 'remix dev',
+        placeholder: 'remix dev',
+      },
+      outputDirectory: {
+        value: 'public',
+      },
+    },
+    dependency: 'remix',
+    getOutputDirName: async () => 'public',
+  },
+  {
+    name: 'React Router',
+    slug: 'react-router',
+    demo: 'https://react-router-v7-template.vercel.app',
+    logo: 'https://api-frameworks.vercel.sh/framework-logos/react-router.svg',
+    darkModeLogo:
+      'https://api-frameworks.vercel.sh/framework-logos/react-router-dark.svg',
+    tagline: 'Declarative routing for React',
+    description:
+      'A user-obsessed, standards-focused, multi-strategy router you can deploy anywhere.',
+    website: 'https://reactrouter.com',
+    sort: 7,
+    supersedes: ['hydrogen', 'vite'],
+    useRuntime: { src: 'package.json', use: '@vercel/remix-builder' },
+    detectors: {
+      some: [
+        {
+          path: 'vite.config.js',
+          matchContent: '@react-router/dev/vite',
+        },
+        {
+          path: 'vite.config.ts',
+          matchContent: '@react-router/dev/vite',
+        },
+        {
+          path: 'react-router.config.js',
+        },
+        {
+          path: 'react-router.config.ts',
+        },
+      ],
+    },
+    settings: {
+      installCommand: {
+        placeholder:
+          '`yarn install`, `pnpm install`, `npm install`, or `bun install`',
+      },
+      buildCommand: {
+        value: 'react-router build',
+        placeholder: '`npm run build` or `react-router build`',
+      },
+      devCommand: {
+        value: 'react-router dev',
+        placeholder: 'react-router dev',
+      },
+      outputDirectory: {
+        value: 'build',
+      },
+    },
+    dependency: 'react-router',
+    getOutputDirName: async () => 'build',
+  },
+  {
+    name: 'Astro',
+    slug: 'astro',
+    demo: 'https://astro-template.vercel.app',
+    logo: 'https://api-frameworks.vercel.sh/framework-logos/astro.svg',
+    darkModeLogo:
+      'https://api-frameworks.vercel.sh/framework-logos/astro-dark.svg',
+    tagline:
+      'Astro is a new kind of static site builder for the modern web. Powerful developer experience meets lightweight output.',
+    description: 'An Astro site, using the basics starter kit.',
+    website: 'https://astro.build',
+    envPrefix: 'PUBLIC_',
+    detectors: {
+      every: [
+        {
+          matchPackage: 'astro',
+        },
+      ],
+    },
+    settings: {
+      installCommand: {
+        placeholder:
+          '`yarn install`, `pnpm install`, `npm install`, or `bun install`',
+      },
+      buildCommand: {
+        value: 'astro build',
+        placeholder: '`npm run build` or `astro build`',
+      },
+      devCommand: {
+        value: 'astro dev --port $PORT',
+        placeholder: 'astro dev',
+      },
+      outputDirectory: {
+        value: 'dist',
+      },
+    },
+    dependency: 'astro',
+    getOutputDirName: async () => 'dist',
+    defaultRoutes: [
+      {
+        src: '^/assets/(.*)$',
+        headers: { 'cache-control': 'public, max-age=31536000, immutable' },
+        continue: true,
+      },
+      {
+        src: '^/_astro/(.*)$',
+        headers: { 'cache-control': 'public, max-age=31536000, immutable' },
+        continue: true,
+      },
+    ],
+  },
+  {
+    name: 'Hexo',
+    slug: 'hexo',
+    demo: 'https://hexo-template.vercel.app',
+    logo: 'https://api-frameworks.vercel.sh/framework-logos/hexo.svg',
+    tagline:
+      'Hexo is a fast, simple & powerful blog framework powered by Node.js.',
+    description: 'A Hexo site, created with the Hexo CLI.',
+    website: 'https://hexo.io',
+    detectors: {
+      every: [
+        {
+          matchPackage: 'hexo',
+        },
+      ],
+    },
+    settings: {
+      installCommand: {
+        placeholder:
+          '`yarn install`, `pnpm install`, `npm install`, or `bun install`',
       },
       buildCommand: {
         placeholder: '`npm run build` or `hexo generate`',
+        value: 'hexo generate',
       },
       devCommand: {
         value: 'hexo server --port $PORT',
@@ -226,35 +375,32 @@ export const frameworks = [
       },
     },
     dependency: 'hexo',
-    devCommand: 'hexo server --port $PORT',
-    buildCommand: 'hexo generate',
     getOutputDirName: async () => 'public',
   },
   {
     name: 'Eleventy',
     slug: 'eleventy',
-    demo: 'https://eleventy.examples.vercel.com',
-    logo: 'https://raw.githubusercontent.com/vercel/vercel/main/packages/frameworks/logos/eleventy.svg',
+    demo: 'https://eleventy-template.vercel.app',
+    logo: 'https://api-frameworks.vercel.sh/framework-logos/eleventy.svg',
     tagline:
       '11ty is a simpler static site generator written in JavaScript, created to be an alternative to Jekyll.',
     description: 'An Eleventy site, created with npm init.',
     website: 'https://www.11ty.dev',
-    sort: 4,
     detectors: {
       every: [
         {
-          path: 'package.json',
-          matchContent:
-            '"(dev)?(d|D)ependencies":\\s*{[^}]*"@11ty\\/eleventy":\\s*".+?"[^}]*}',
+          matchPackage: '@11ty/eleventy',
         },
       ],
     },
     settings: {
       installCommand: {
-        placeholder: '`yarn install` or `npm install`',
+        placeholder:
+          '`yarn install`, `pnpm install`, `npm install`, or `bun install`',
       },
       buildCommand: {
         placeholder: '`npm run build` or `npx @11ty/eleventy`',
+        value: 'npx @11ty/eleventy',
       },
       devCommand: {
         value: 'npx @11ty/eleventy --serve --watch --port $PORT',
@@ -265,16 +411,14 @@ export const frameworks = [
       },
     },
     dependency: '@11ty/eleventy',
-    devCommand: 'npx @11ty/eleventy --serve --watch --port $PORT',
-    buildCommand: 'npx @11ty/eleventy',
     getOutputDirName: async () => '_site',
     cachePattern: '.cache/**',
   },
   {
-    name: 'Docusaurus 2',
+    name: 'Docusaurus (v2)',
     slug: 'docusaurus-2',
-    demo: 'https://docusaurus-2.examples.vercel.com',
-    logo: 'https://raw.githubusercontent.com/vercel/vercel/main/packages/frameworks/logos/docusaurus.svg',
+    demo: 'https://docusaurus-2-template.vercel.app',
+    logo: 'https://api-frameworks.vercel.sh/framework-logos/docusaurus.svg',
     tagline:
       'Docusaurus makes it easy to maintain Open Source documentation websites.',
     description:
@@ -283,18 +427,18 @@ export const frameworks = [
     detectors: {
       some: [
         {
-          path: 'package.json',
-          matchContent:
-            '"(dev)?(d|D)ependencies":\\s*{[^}]*"@docusaurus\\/core":\\s*".+?"[^}]*}',
+          matchPackage: '@docusaurus/core',
         },
       ],
     },
     settings: {
       installCommand: {
-        placeholder: '`yarn install` or `npm install`',
+        placeholder:
+          '`yarn install`, `pnpm install`, `npm install`, or `bun install`',
       },
       buildCommand: {
         placeholder: '`npm run build` or `docusaurus build`',
+        value: 'docusaurus build',
       },
       devCommand: {
         value: 'docusaurus start --port $PORT',
@@ -305,8 +449,6 @@ export const frameworks = [
       },
     },
     dependency: '@docusaurus/core',
-    devCommand: 'docusaurus start --port $PORT',
-    buildCommand: 'docusaurus build',
     getOutputDirName: async (dirPrefix: string) => {
       const base = 'build';
       try {
@@ -360,10 +502,10 @@ export const frameworks = [
     ],
   },
   {
-    name: 'Docusaurus 1',
+    name: 'Docusaurus (v1)',
     slug: 'docusaurus',
-    demo: 'https://docusaurus.examples.vercel.com',
-    logo: 'https://raw.githubusercontent.com/vercel/vercel/main/packages/frameworks/logos/docusaurus.svg',
+    demo: 'https://docusaurus-template.vercel.app',
+    logo: 'https://api-frameworks.vercel.sh/framework-logos/docusaurus.svg',
     tagline:
       'Docusaurus makes it easy to maintain Open Source documentation websites.',
     description:
@@ -372,18 +514,18 @@ export const frameworks = [
     detectors: {
       some: [
         {
-          path: 'package.json',
-          matchContent:
-            '"(dev)?(d|D)ependencies":\\s*{[^}]*"docusaurus":\\s*".+?"[^}]*}',
+          matchPackage: 'docusaurus',
         },
       ],
     },
     settings: {
       installCommand: {
-        placeholder: '`yarn install` or `npm install`',
+        placeholder:
+          '`yarn install`, `pnpm install`, `npm install`, or `bun install`',
       },
       buildCommand: {
         placeholder: '`npm run build` or `docusaurus-build`',
+        value: 'docusaurus-build',
       },
       devCommand: {
         value: 'docusaurus-start --port $PORT',
@@ -394,8 +536,6 @@ export const frameworks = [
       },
     },
     dependency: 'docusaurus',
-    devCommand: 'docusaurus-start --port $PORT',
-    buildCommand: 'docusaurus-build',
     getOutputDirName: async (dirPrefix: string) => {
       const base = 'build';
       try {
@@ -415,27 +555,29 @@ export const frameworks = [
   {
     name: 'Preact',
     slug: 'preact',
-    demo: 'https://preact.examples.vercel.com',
-    logo: 'https://raw.githubusercontent.com/vercel/vercel/main/packages/frameworks/logos/preact.svg',
+    demo: 'https://preact-template.vercel.app',
+    logo: 'https://api-frameworks.vercel.sh/framework-logos/preact.svg',
     tagline:
       'Preact is a fast 3kB alternative to React with the same modern API.',
     description: 'A Preact app, created with the Preact CLI.',
     website: 'https://preactjs.com',
     detectors: {
       every: [
+        // Intentionally does not detect "preact" package because that can be
+        // used to power other frameworks.
         {
-          path: 'package.json',
-          matchContent:
-            '"(dev)?(d|D)ependencies":\\s*{[^}]*"preact-cli":\\s*".+?"[^}]*}',
+          matchPackage: 'preact-cli',
         },
       ],
     },
     settings: {
       installCommand: {
-        placeholder: '`yarn install` or `npm install`',
+        placeholder:
+          '`yarn install`, `pnpm install`, `npm install`, or `bun install`',
       },
       buildCommand: {
         placeholder: '`npm run build` or `preact build`',
+        value: 'preact build',
       },
       devCommand: {
         value: 'preact watch --port $PORT',
@@ -446,8 +588,6 @@ export const frameworks = [
       },
     },
     dependency: 'preact-cli',
-    devCommand: 'preact watch --port $PORT',
-    buildCommand: 'preact build',
     getOutputDirName: async () => 'build',
     defaultRoutes: [
       {
@@ -460,10 +600,85 @@ export const frameworks = [
     ],
   },
   {
+    name: 'SolidStart (v1)',
+    slug: 'solidstart-1',
+    demo: 'https://solid-start-template.vercel.app',
+    logo: 'https://api-frameworks.vercel.sh/framework-logos/solid.svg',
+    tagline: 'Simple and performant reactivity for building user interfaces.',
+    description: 'A Solid app, created with SolidStart.',
+    website: 'https://start.solidjs.com',
+    envPrefix: 'VITE_',
+    detectors: {
+      every: [
+        {
+          matchPackage: 'solid-js',
+        },
+        {
+          matchPackage: '@solidjs/start',
+        },
+      ],
+    },
+    settings: {
+      installCommand: {
+        placeholder:
+          '`yarn install`, `pnpm install`, `npm install`, or `bun install`',
+      },
+      buildCommand: {
+        placeholder: '`npm run build` or `vinxi build`',
+        value: 'vinxi build',
+      },
+      devCommand: {
+        value: 'vinxi dev',
+      },
+      outputDirectory: {
+        value: '.output',
+      },
+    },
+    getOutputDirName: async () => '.output',
+  },
+  {
+    name: 'SolidStart (v0)',
+    slug: 'solidstart',
+    demo: 'https://solid-start-template.vercel.app',
+    logo: 'https://api-frameworks.vercel.sh/framework-logos/solid.svg',
+    tagline: 'Simple and performant reactivity for building user interfaces.',
+    description: 'A Solid app, created with SolidStart.',
+    website: 'https://solidjs.com',
+    envPrefix: 'VITE_',
+    sort: 98,
+    detectors: {
+      every: [
+        {
+          matchPackage: 'solid-js',
+        },
+        {
+          matchPackage: 'solid-start',
+        },
+      ],
+    },
+    settings: {
+      installCommand: {
+        placeholder:
+          '`yarn install`, `pnpm install`, `npm install`, or `bun install`',
+      },
+      buildCommand: {
+        placeholder: '`npm run build` or `solid-start build`',
+        value: 'solid-start build',
+      },
+      devCommand: {
+        value: 'solid-start dev',
+      },
+      outputDirectory: {
+        value: '.output',
+      },
+    },
+    getOutputDirName: async () => '.output',
+  },
+  {
     name: 'Dojo',
     slug: 'dojo',
-    demo: 'https://dojo.examples.vercel.com',
-    logo: 'https://raw.githubusercontent.com/vercel/vercel/main/packages/frameworks/logos/dojo.png',
+    demo: 'https://dojo-template.vercel.app',
+    logo: 'https://api-frameworks.vercel.sh/framework-logos/dojo.png',
     tagline: 'Dojo is a modern progressive, TypeScript first framework.',
     description:
       "A Dojo app, created with the Dojo CLI's cli-create-app command.",
@@ -471,9 +686,7 @@ export const frameworks = [
     detectors: {
       some: [
         {
-          path: 'package.json',
-          matchContent:
-            '"(dev)?(d|D)ependencies":\\s*{[^}]*"@dojo\\/framework":\\s*".+?"[^}]*}',
+          matchPackage: '@dojo/framework',
         },
         {
           path: '.dojorc',
@@ -482,10 +695,12 @@ export const frameworks = [
     },
     settings: {
       installCommand: {
-        placeholder: '`yarn install` or `npm install`',
+        placeholder:
+          '`yarn install`, `pnpm install`, `npm install`, or `bun install`',
       },
       buildCommand: {
         placeholder: '`npm run build` or `dojo build`',
+        value: 'dojo build',
       },
       devCommand: {
         value: 'dojo build -m dev -w -s -p $PORT',
@@ -496,8 +711,6 @@ export const frameworks = [
       },
     },
     dependency: '@dojo/cli',
-    devCommand: 'dojo build -m dev -w -s -p $PORT',
-    buildCommand: 'dojo build',
     getOutputDirName: async () => join('output', 'dist'),
     defaultRoutes: [
       {
@@ -513,31 +726,42 @@ export const frameworks = [
         dest: '/index.html',
       },
     ],
+    defaulHeaders: [
+      {
+        source: '/service-worker.js',
+        regex: '/service-worker.js',
+        headers: { 'cache-control': 's-maxage=0' },
+        continue: true,
+      },
+    ],
   },
   {
     name: 'Ember.js',
     slug: 'ember',
-    demo: 'https://ember.examples.vercel.com',
-    logo: 'https://raw.githubusercontent.com/vercel/vercel/main/packages/frameworks/logos/ember.svg',
+    demo: 'https://ember-template.vercel.app',
+    logo: 'https://api-frameworks.vercel.sh/framework-logos/ember.svg',
     tagline:
       'Ember.js helps webapp developers be more productive out of the box.',
     description: 'An Ember app, created with the Ember CLI.',
     website: 'https://emberjs.com/',
     detectors: {
-      every: [
+      some: [
         {
-          path: 'package.json',
-          matchContent:
-            '"(dev)?(d|D)ependencies":\\s*{[^}]*"ember-cli":\\s*".+?"[^}]*}',
+          matchPackage: 'ember-source',
+        },
+        {
+          matchPackage: 'ember-cli',
         },
       ],
     },
     settings: {
       installCommand: {
-        placeholder: '`yarn install` or `npm install`',
+        placeholder:
+          '`yarn install`, `pnpm install`, `npm install`, or `bun install`',
       },
       buildCommand: {
         placeholder: '`npm run build` or `ember build`',
+        value: 'ember build',
       },
       devCommand: {
         value: 'ember serve --port $PORT',
@@ -548,8 +772,6 @@ export const frameworks = [
       },
     },
     dependency: 'ember-cli',
-    devCommand: 'ember serve --port $PORT',
-    buildCommand: 'ember build',
     getOutputDirName: async () => 'dist',
     defaultRoutes: [
       {
@@ -564,8 +786,8 @@ export const frameworks = [
   {
     name: 'Vue.js',
     slug: 'vue',
-    demo: 'https://vue.examples.vercel.com',
-    logo: 'https://raw.githubusercontent.com/vercel/vercel/main/packages/frameworks/logos/vue.svg',
+    demo: 'https://vue-template.vercel.app',
+    logo: 'https://api-frameworks.vercel.sh/framework-logos/vue.svg',
     tagline:
       'Vue.js is a versatile JavaScript framework that is as approachable as it is performant.',
     description: 'A Vue.js app, created with the Vue CLI.',
@@ -574,18 +796,18 @@ export const frameworks = [
     detectors: {
       every: [
         {
-          path: 'package.json',
-          matchContent:
-            '"(dev)?(d|D)ependencies":\\s*{[^}]*"@vue\\/cli-service":\\s*".+?"[^}]*}',
+          matchPackage: '@vue/cli-service',
         },
       ],
     },
     settings: {
       installCommand: {
-        placeholder: '`yarn install` or `npm install`',
+        placeholder:
+          '`yarn install`, `pnpm install`, `npm install`, or `bun install`',
       },
       buildCommand: {
         placeholder: '`npm run build` or `vue-cli-service build`',
+        value: 'vue-cli-service build',
       },
       devCommand: {
         value: 'vue-cli-service serve --port $PORT',
@@ -596,8 +818,6 @@ export const frameworks = [
       },
     },
     dependency: '@vue/cli-service',
-    devCommand: 'vue-cli-service serve --port $PORT',
-    buildCommand: 'vue-cli-service build',
     getOutputDirName: async () => 'dist',
     defaultRoutes: [
       {
@@ -622,26 +842,26 @@ export const frameworks = [
   {
     name: 'Scully',
     slug: 'scully',
-    demo: 'https://scully.examples.vercel.com',
-    logo: 'https://raw.githubusercontent.com/vercel/vercel/main/packages/frameworks/logos/scullyio-logo.png',
+    demo: 'https://scully-template.vercel.app',
+    logo: 'https://api-frameworks.vercel.sh/framework-logos/scullyio-logo.png',
     tagline: 'Scully is a static site generator for Angular.',
     description: 'The Static Site Generator for Angular apps.',
     website: 'https://github.com/scullyio/scully',
     detectors: {
       every: [
         {
-          path: 'package.json',
-          matchContent:
-            '"(dev)?(d|D)ependencies":\\s*{[^}]*"@scullyio\\/init":\\s*".+?"[^}]*}',
+          matchPackage: '@scullyio/init',
         },
       ],
     },
     settings: {
       installCommand: {
-        placeholder: '`yarn install` or `npm install`',
+        placeholder:
+          '`yarn install`, `pnpm install`, `npm install`, or `bun install`',
       },
       buildCommand: {
         placeholder: '`npm run build` or `ng build && scully`',
+        value: 'ng build && scully',
       },
       devCommand: {
         value: 'ng serve --port $PORT',
@@ -652,15 +872,13 @@ export const frameworks = [
       },
     },
     dependency: '@scullyio/init',
-    devCommand: 'ng serve --port $PORT',
-    buildCommand: 'ng build && scully',
     getOutputDirName: async () => 'dist/static',
   },
   {
     name: 'Ionic Angular',
     slug: 'ionic-angular',
-    demo: 'https://ionic-angular.examples.vercel.com',
-    logo: 'https://raw.githubusercontent.com/vercel/vercel/main/packages/frameworks/logos/ionic.svg',
+    demo: 'https://ionic-angular-template.vercel.app',
+    logo: 'https://api-frameworks.vercel.sh/framework-logos/ionic.svg',
     tagline:
       'Ionic Angular allows you to build mobile PWAs with Angular and the Ionic Framework.',
     description: 'An Ionic Angular site, created with the Ionic CLI.',
@@ -668,29 +886,27 @@ export const frameworks = [
     detectors: {
       every: [
         {
-          path: 'package.json',
-          matchContent:
-            '"(dev)?(d|D)ependencies":\\s*{[^}]*"@ionic\\/angular":\\s*".+?"[^}]*}',
+          matchPackage: '@ionic/angular',
         },
       ],
     },
     settings: {
       installCommand: {
-        placeholder: '`yarn install` or `npm install`',
+        placeholder:
+          '`yarn install`, `pnpm install`, `npm install`, or `bun install`',
       },
       buildCommand: {
         placeholder: '`npm run build` or `ng build`',
+        value: 'ng build',
       },
       devCommand: {
-        value: 'ng serve',
+        value: 'ng serve --port $PORT',
       },
       outputDirectory: {
         value: 'www',
       },
     },
     dependency: '@ionic/angular',
-    devCommand: 'ng serve',
-    buildCommand: 'ng build',
     getOutputDirName: async () => 'www',
     defaultRoutes: [
       {
@@ -705,8 +921,8 @@ export const frameworks = [
   {
     name: 'Angular',
     slug: 'angular',
-    demo: 'https://angular.examples.vercel.com',
-    logo: 'https://raw.githubusercontent.com/vercel/vercel/main/packages/frameworks/logos/angular.svg',
+    demo: 'https://angular-template.vercel.app',
+    logo: 'https://api-frameworks.vercel.sh/framework-logos/angular.svg',
     tagline:
       'Angular is a TypeScript-based cross-platform framework from Google.',
     description: 'An Angular app, created with the Angular CLI.',
@@ -714,18 +930,18 @@ export const frameworks = [
     detectors: {
       every: [
         {
-          path: 'package.json',
-          matchContent:
-            '"(dev)?(d|D)ependencies":\\s*{[^}]*"@angular\\/cli":\\s*".+?"[^}]*}',
+          matchPackage: '@angular/cli',
         },
       ],
     },
     settings: {
       installCommand: {
-        placeholder: '`yarn install` or `npm install`',
+        placeholder:
+          '`yarn install`, `pnpm install`, `npm install`, or `bun install`',
       },
       buildCommand: {
         placeholder: '`npm run build` or `ng build`',
+        value: 'ng build',
       },
       devCommand: {
         value: 'ng serve --port $PORT',
@@ -736,8 +952,6 @@ export const frameworks = [
       },
     },
     dependency: '@angular/cli',
-    devCommand: 'ng serve --port $PORT',
-    buildCommand: 'ng build',
     getOutputDirName: async (dirPrefix: string) => {
       const base = 'dist';
       try {
@@ -746,7 +960,11 @@ export const frameworks = [
 
         // If there is only one file in it that is a dir we'll use it as dist dir
         if (content.length === 1 && content[0].isDirectory()) {
-          return join(base, content[0].name);
+          const potentialOutDir = join(base, content[0].name);
+          const potentialOutDirWithBrowser = join(potentialOutDir, 'browser');
+          return existsSync(potentialOutDirWithBrowser)
+            ? potentialOutDirWithBrowser
+            : potentialOutDir;
         }
       } catch (error) {
         console.error(`Error detecting output directory: `, error);
@@ -766,8 +984,8 @@ export const frameworks = [
   {
     name: 'Polymer',
     slug: 'polymer',
-    demo: 'https://polymer.examples.vercel.com',
-    logo: 'https://raw.githubusercontent.com/vercel/vercel/main/packages/frameworks/logos/polymer.svg',
+    demo: 'https://polymer-template.vercel.app',
+    logo: 'https://api-frameworks.vercel.sh/framework-logos/polymer.svg',
     tagline:
       'Polymer is an open-source webapps library from Google, for building using Web Components.',
     description: 'A Polymer app, created with the Polymer CLI.',
@@ -775,18 +993,18 @@ export const frameworks = [
     detectors: {
       every: [
         {
-          path: 'package.json',
-          matchContent:
-            '"(dev)?(d|D)ependencies":\\s*{[^}]*"polymer-cli":\\s*".+?"[^}]*}',
+          matchPackage: 'polymer-cli',
         },
       ],
     },
     settings: {
       installCommand: {
-        placeholder: '`yarn install` or `npm install`',
+        placeholder:
+          '`yarn install`, `pnpm install`, `npm install`, or `bun install`',
       },
       buildCommand: {
         placeholder: '`npm run build` or `polymer build`',
+        value: 'polymer build',
       },
       devCommand: {
         value: 'polymer serve --port $PORT',
@@ -797,8 +1015,6 @@ export const frameworks = [
       },
     },
     dependency: 'polymer-cli',
-    devCommand: 'polymer serve --port $PORT',
-    buildCommand: 'polymer build',
     getOutputDirName: async (dirPrefix: string) => {
       const base = 'build';
       try {
@@ -824,32 +1040,31 @@ export const frameworks = [
   {
     name: 'Svelte',
     slug: 'svelte',
-    demo: 'https://svelte.examples.vercel.com',
-    logo: 'https://raw.githubusercontent.com/vercel/vercel/main/packages/frameworks/logos/svelte.svg',
+    demo: 'https://svelte.vercel.app',
+    logo: 'https://api-frameworks.vercel.sh/framework-logos/svelte.svg',
     tagline:
       'Svelte lets you write high performance reactive apps with significantly less boilerplate.',
     description: 'A basic Svelte app using the default template.',
     website: 'https://svelte.dev',
+    sort: 3,
     detectors: {
       every: [
         {
-          path: 'package.json',
-          matchContent:
-            '"(dev)?(d|D)ependencies":\\s*{[^}]*"svelte":\\s*".+?"[^}]*}',
+          matchPackage: 'svelte',
         },
         {
-          path: 'package.json',
-          matchContent:
-            '"(dev)?(d|D)ependencies":\\s*{[^}]*"sirv-cli":\\s*".+?"[^}]*}',
+          matchPackage: 'sirv-cli',
         },
       ],
     },
     settings: {
       installCommand: {
-        placeholder: '`yarn install` or `npm install`',
+        placeholder:
+          '`yarn install`, `pnpm install`, `npm install`, or `bun install`',
       },
       buildCommand: {
         placeholder: '`npm run build` or `rollup -c`',
+        value: 'rollup -c',
       },
       devCommand: {
         value: 'rollup -c -w',
@@ -859,8 +1074,6 @@ export const frameworks = [
       },
     },
     dependency: 'sirv-cli',
-    devCommand: 'rollup -c -w',
-    buildCommand: 'rollup -c',
     getOutputDirName: async () => 'public',
     defaultRoutes: [
       {
@@ -873,13 +1086,57 @@ export const frameworks = [
     ],
   },
   {
-    name: 'SvelteKit',
+    // TODO: fix detected as "sveltekit-1"
+    name: 'SvelteKit (v0)',
     slug: 'sveltekit',
-    demo: 'https://sveltekit.examples.vercel.com',
-    logo: 'https://raw.githubusercontent.com/vercel/vercel/main/packages/frameworks/logos/svelte.svg',
+    demo: 'https://sveltekit-template.vercel.app',
+    logo: 'https://api-frameworks.vercel.sh/framework-logos/svelte.svg',
+    screenshot:
+      'https://assets.vercel.com/image/upload/v1647366075/front/import/sveltekit.png',
     tagline:
       'SvelteKit is a framework for building web applications of all sizes.',
-    description: 'A SvelteKit app optimized to work for serverless.',
+    description: 'A SvelteKit legacy app optimized Edge-first.',
+    website: 'https://kit.svelte.dev',
+    sort: 99,
+    envPrefix: 'VITE_',
+    detectors: {
+      every: [
+        {
+          path: 'package.json',
+          matchContent:
+            '"(dev)?(d|D)ependencies":\\s*{[^}]*"@sveltejs\\/kit":\\s*"1\\.0\\.0-next\\.(\\d+)"[^}]*}',
+        },
+      ],
+    },
+    settings: {
+      installCommand: {
+        placeholder:
+          '`yarn install`, `pnpm install`, `npm install`, or `bun install`',
+      },
+      buildCommand: {
+        placeholder: '`npm run build` or `svelte-kit build`',
+        value: 'svelte-kit build',
+      },
+      devCommand: {
+        value: 'svelte-kit dev --port $PORT',
+        placeholder: 'svelte-kit dev',
+      },
+      outputDirectory: {
+        value: 'public',
+      },
+    },
+    getOutputDirName: async () => 'public',
+  },
+  {
+    name: 'SvelteKit (v1)',
+    slug: 'sveltekit-1',
+    demo: 'https://sveltekit-1-template.vercel.app',
+    logo: 'https://api-frameworks.vercel.sh/framework-logos/svelte.svg',
+    screenshot:
+      'https://assets.vercel.com/image/upload/v1647366075/front/import/sveltekit.png',
+    tagline:
+      'SvelteKit is a framework for building web applications of all sizes.',
+    description: 'A SvelteKit app optimized Edge-first.',
     website: 'https://kit.svelte.dev',
     detectors: {
       every: [
@@ -892,28 +1149,28 @@ export const frameworks = [
     },
     settings: {
       installCommand: {
-        placeholder: '`yarn install` or `npm install`',
+        placeholder:
+          '`yarn install`, `pnpm install`, `npm install`, or `bun install`',
       },
       buildCommand: {
-        placeholder: '`npm run build` or `svelte-kit build`',
+        placeholder: 'vite build',
+        value: 'vite build',
       },
       devCommand: {
-        value: 'svelte-kit dev --port $PORT',
-        placeholder: 'svelte-kit dev',
+        placeholder: 'vite dev',
+        value: 'vite dev --port $PORT',
       },
       outputDirectory: {
-        placeholder: 'public',
+        value: 'public',
       },
     },
-    devCommand: 'svelte-kit dev --port $PORT',
-    buildCommand: 'svelte-kit build',
     getOutputDirName: async () => 'public',
   },
   {
     name: 'Ionic React',
     slug: 'ionic-react',
-    demo: 'https://ionic-react.examples.vercel.com',
-    logo: 'https://raw.githubusercontent.com/vercel/vercel/main/packages/frameworks/logos/ionic.svg',
+    demo: 'https://ionic-react-template.vercel.app',
+    logo: 'https://api-frameworks.vercel.sh/framework-logos/ionic.svg',
     tagline:
       'Ionic React allows you to build mobile PWAs with React and the Ionic Framework.',
     description: 'An Ionic React site, created with the Ionic CLI.',
@@ -921,18 +1178,18 @@ export const frameworks = [
     detectors: {
       every: [
         {
-          path: 'package.json',
-          matchContent:
-            '"(dev)?(d|D)ependencies":\\s*{[^}]*"@ionic\\/react":\\s*".+?"[^}]*}',
+          matchPackage: '@ionic/react',
         },
       ],
     },
     settings: {
       installCommand: {
-        placeholder: '`yarn install` or `npm install`',
+        placeholder:
+          '`yarn install`, `pnpm install`, `npm install`, or `bun install`',
       },
       buildCommand: {
         placeholder: '`npm run build` or `react-scripts build`',
+        value: 'react-scripts build',
       },
       devCommand: {
         value: 'react-scripts start',
@@ -942,8 +1199,6 @@ export const frameworks = [
       },
     },
     dependency: '@ionic/react',
-    devCommand: 'react-scripts start',
-    buildCommand: 'react-scripts build',
     getOutputDirName: async () => 'build',
     defaultRoutes: [
       {
@@ -974,33 +1229,31 @@ export const frameworks = [
   {
     name: 'Create React App',
     slug: 'create-react-app',
-    demo: 'https://react-functions.examples.vercel.com',
-    logo: 'https://raw.githubusercontent.com/vercel/vercel/main/packages/frameworks/logos/react.svg',
+    demo: 'https://create-react-template.vercel.app',
+    logo: 'https://api-frameworks.vercel.sh/framework-logos/react.svg',
     tagline: 'Create React App allows you to get going with React in no time.',
-    description:
-      'A React app, bootstrapped with create-react-app, and a Serverless Function API.',
+    description: 'A client-side React app created with create-react-app.',
     website: 'https://create-react-app.dev',
+    sort: 4,
     envPrefix: 'REACT_APP_',
     detectors: {
       some: [
         {
-          path: 'package.json',
-          matchContent:
-            '"(dev)?(d|D)ependencies":\\s*{[^}]*"react-scripts":\\s*".+?"[^}]*}',
+          matchPackage: 'react-scripts',
         },
         {
-          path: 'package.json',
-          matchContent:
-            '"(dev)?(d|D)ependencies":\\s*{[^}]*"react-dev-utils":\\s*".+?"[^}]*}',
+          matchPackage: 'react-dev-utils',
         },
       ],
     },
     settings: {
       installCommand: {
-        placeholder: '`yarn install` or `npm install`',
+        placeholder:
+          '`yarn install`, `pnpm install`, `npm install`, or `bun install`',
       },
       buildCommand: {
         placeholder: '`npm run build` or `react-scripts build`',
+        value: 'react-scripts build',
       },
       devCommand: {
         value: 'react-scripts start',
@@ -1010,8 +1263,6 @@ export const frameworks = [
       },
     },
     dependency: 'react-scripts',
-    devCommand: 'react-scripts start',
-    buildCommand: 'react-scripts build',
     getOutputDirName: async () => 'build',
     defaultRoutes: [
       {
@@ -1042,8 +1293,8 @@ export const frameworks = [
   {
     name: 'Gridsome',
     slug: 'gridsome',
-    demo: 'https://gridsome.examples.vercel.com',
-    logo: 'https://raw.githubusercontent.com/vercel/vercel/main/packages/frameworks/logos/gridsome.svg',
+    demo: 'https://gridsome-template.vercel.app',
+    logo: 'https://api-frameworks.vercel.sh/framework-logos/gridsome.svg',
     tagline:
       'Gridsome is a Vue.js-powered framework for building websites & apps that are fast by default.',
     description: 'A Gridsome app, created with the Gridsome CLI.',
@@ -1051,18 +1302,18 @@ export const frameworks = [
     detectors: {
       every: [
         {
-          path: 'package.json',
-          matchContent:
-            '"(dev)?(d|D)ependencies":\\s*{[^}]*"gridsome":\\s*".+?"[^}]*}',
+          matchPackage: 'gridsome',
         },
       ],
     },
     settings: {
       installCommand: {
-        placeholder: '`yarn install` or `npm install`',
+        placeholder:
+          '`yarn install`, `pnpm install`, `npm install`, or `bun install`',
       },
       buildCommand: {
         placeholder: '`npm run build` or `gridsome build`',
+        value: 'gridsome build',
       },
       devCommand: {
         value: 'gridsome develop -p $PORT',
@@ -1073,15 +1324,13 @@ export const frameworks = [
       },
     },
     dependency: 'gridsome',
-    devCommand: 'gridsome develop -p $PORT',
-    buildCommand: 'gridsome build',
     getOutputDirName: async () => 'dist',
   },
   {
     name: 'UmiJS',
     slug: 'umijs',
-    demo: 'https://umijs.examples.vercel.com',
-    logo: 'https://raw.githubusercontent.com/vercel/vercel/main/packages/frameworks/logos/umi.svg',
+    demo: 'https://umijs-template.vercel.app',
+    logo: 'https://api-frameworks.vercel.sh/framework-logos/umi.svg',
     tagline:
       'UmiJS is an extensible enterprise-level React application framework.',
     description: 'An UmiJS app, created using the Umi CLI.',
@@ -1089,18 +1338,18 @@ export const frameworks = [
     detectors: {
       every: [
         {
-          path: 'package.json',
-          matchContent:
-            '"(dev)?(d|D)ependencies":\\s*{[^}]*"umi":\\s*".+?"[^}]*}',
+          matchPackage: 'umi',
         },
       ],
     },
     settings: {
       installCommand: {
-        placeholder: '`yarn install` or `npm install`',
+        placeholder:
+          '`yarn install`, `pnpm install`, `npm install`, or `bun install`',
       },
       buildCommand: {
         placeholder: '`npm run build` or `umi build`',
+        value: 'umi build',
       },
       devCommand: {
         value: 'umi dev --port $PORT',
@@ -1111,8 +1360,6 @@ export const frameworks = [
       },
     },
     dependency: 'umi',
-    devCommand: 'umi dev --port $PORT',
-    buildCommand: 'umi build',
     getOutputDirName: async () => 'dist',
     defaultRoutes: [
       {
@@ -1127,8 +1374,8 @@ export const frameworks = [
   {
     name: 'Sapper',
     slug: 'sapper',
-    demo: 'https://sapper.examples.vercel.com',
-    logo: 'https://raw.githubusercontent.com/vercel/vercel/main/packages/frameworks/logos/svelte.svg',
+    demo: 'https://sapper-template.vercel.app',
+    logo: 'https://api-frameworks.vercel.sh/framework-logos/svelte.svg',
     tagline:
       'Sapper is a framework for building high-performance universal web apps with Svelte.',
     description: 'A Sapper app, using the Sapper template.',
@@ -1136,18 +1383,18 @@ export const frameworks = [
     detectors: {
       every: [
         {
-          path: 'package.json',
-          matchContent:
-            '"(dev)?(d|D)ependencies":\\s*{[^}]*"sapper":\\s*".+?"[^}]*}',
+          matchPackage: 'sapper',
         },
       ],
     },
     settings: {
       installCommand: {
-        placeholder: '`yarn install` or `npm install`',
+        placeholder:
+          '`yarn install`, `pnpm install`, `npm install`, or `bun install`',
       },
       buildCommand: {
         placeholder: '`npm run build` or `sapper export`',
+        value: 'sapper export',
       },
       devCommand: {
         value: 'sapper dev --port $PORT',
@@ -1158,34 +1405,31 @@ export const frameworks = [
       },
     },
     dependency: 'sapper',
-    devCommand: 'sapper dev --port $PORT',
-    buildCommand: 'sapper export',
     getOutputDirName: async () => '__sapper__/export',
   },
   {
     name: 'Saber',
     slug: 'saber',
-    demo: 'https://saber.examples.vercel.com',
-    logo: 'https://raw.githubusercontent.com/vercel/vercel/main/packages/frameworks/logos/saber.svg',
+    logo: 'https://api-frameworks.vercel.sh/framework-logos/saber.svg',
     tagline:
       'Saber is a framework for building static sites in Vue.js that supports data from any source.',
     description: 'A Saber site, created with npm init.',
-    website: 'https://saber.land/',
+    website: 'https://saber.egoist.dev',
     detectors: {
       every: [
         {
-          path: 'package.json',
-          matchContent:
-            '"(dev)?(d|D)ependencies":\\s*{[^}]*"saber":\\s*".+?"[^}]*}',
+          matchPackage: 'saber',
         },
       ],
     },
     settings: {
       installCommand: {
-        placeholder: '`yarn install` or `npm install`',
+        placeholder:
+          '`yarn install`, `pnpm install`, `npm install`, or `bun install`',
       },
       buildCommand: {
         placeholder: '`npm run build` or `saber build`',
+        value: 'saber build',
       },
       devCommand: {
         value: 'saber --port $PORT',
@@ -1196,8 +1440,6 @@ export const frameworks = [
       },
     },
     dependency: 'saber',
-    devCommand: 'saber --port $PORT',
-    buildCommand: 'saber build',
     getOutputDirName: async () => 'public',
     defaultRoutes: [
       {
@@ -1217,8 +1459,8 @@ export const frameworks = [
   {
     name: 'Stencil',
     slug: 'stencil',
-    demo: 'https://stencil.examples.vercel.com',
-    logo: 'https://raw.githubusercontent.com/vercel/vercel/main/packages/frameworks/logos/stencil.svg',
+    demo: 'https://stencil.vercel.app',
+    logo: 'https://api-frameworks.vercel.sh/framework-logos/stencil.svg',
     tagline:
       'Stencil is a powerful toolchain for building Progressive Web Apps and Design Systems.',
     description: 'A Stencil site, created with the Stencil CLI.',
@@ -1226,18 +1468,18 @@ export const frameworks = [
     detectors: {
       every: [
         {
-          path: 'package.json',
-          matchContent:
-            '"(dev)?(d|D)ependencies":\\s*{[^}]*"@stencil\\/core":\\s*".+?"[^}]*}',
+          matchPackage: '@stencil/core',
         },
       ],
     },
     settings: {
       installCommand: {
-        placeholder: '`yarn install` or `npm install`',
+        placeholder:
+          '`yarn install`, `pnpm install`, `npm install`, or `bun install`',
       },
       buildCommand: {
         placeholder: '`npm run build` or `stencil build`',
+        value: 'stencil build',
       },
       devCommand: {
         value: 'stencil build --dev --watch --serve --port $PORT',
@@ -1248,8 +1490,6 @@ export const frameworks = [
       },
     },
     dependency: '@stencil/core',
-    devCommand: 'stencil build --dev --watch --serve --port $PORT',
-    buildCommand: 'stencil build',
     getOutputDirName: async () => 'www',
     defaultRoutes: [
       {
@@ -1279,28 +1519,37 @@ export const frameworks = [
   {
     name: 'Nuxt.js',
     slug: 'nuxtjs',
-    demo: 'https://nuxtjs.examples.vercel.com',
-    logo: 'https://raw.githubusercontent.com/vercel/vercel/main/packages/frameworks/logos/nuxt.svg',
+    demo: 'https://nuxtjs-template.vercel.app',
+    logo: 'https://api-frameworks.vercel.sh/framework-logos/nuxt.svg',
+    screenshot:
+      'https://assets.vercel.com/image/upload/v1647366075/front/import/nuxtjs.png',
     tagline:
       'Nuxt.js is the web comprehensive framework that lets you dream big with Vue.js.',
     description: 'A Nuxt.js app, bootstrapped with create-nuxt-app.',
     website: 'https://nuxtjs.org',
+    sort: 2,
     envPrefix: 'NUXT_ENV_',
     detectors: {
-      every: [
+      some: [
         {
-          path: 'package.json',
-          matchContent:
-            '"(dev)?(d|D)ependencies":\\s*{[^}]*"nuxt3?(-edge)?":\\s*".+?"[^}]*}',
+          matchPackage: 'nuxt',
+        },
+        {
+          matchPackage: 'nuxt3',
+        },
+        {
+          matchPackage: 'nuxt-edge',
         },
       ],
     },
     settings: {
       installCommand: {
-        placeholder: '`yarn install` or `npm install`',
+        placeholder:
+          '`yarn install`, `pnpm install`, `npm install`, or `bun install`',
       },
       buildCommand: {
-        placeholder: '`npm run build` or `nuxt generate`',
+        placeholder: '`npm run build` or `nuxt build`',
+        value: 'nuxt build',
       },
       devCommand: {
         value: 'nuxt',
@@ -1310,8 +1559,6 @@ export const frameworks = [
       },
     },
     dependency: 'nuxt',
-    devCommand: 'nuxt',
-    buildCommand: 'nuxt generate',
     getOutputDirName: async () => 'dist',
     cachePattern: '.nuxt/**',
     defaultRoutes: [
@@ -1337,8 +1584,8 @@ export const frameworks = [
   {
     name: 'RedwoodJS',
     slug: 'redwoodjs',
-    demo: 'https://redwoodjs.examples.vercel.com',
-    logo: 'https://raw.githubusercontent.com/vercel/vercel/main/packages/frameworks/logos/redwoodjs.svg',
+    demo: 'https://redwood-template.vercel.app',
+    logo: 'https://api-frameworks.vercel.sh/framework-logos/redwoodjs.svg',
     tagline: 'RedwoodJS is a full-stack framework for the Jamstack.',
     description: 'A RedwoodJS app, bootstraped with create-redwood-app.',
     website: 'https://redwoodjs.com',
@@ -1348,15 +1595,14 @@ export const frameworks = [
     detectors: {
       every: [
         {
-          path: 'package.json',
-          matchContent:
-            '"(dev)?(d|D)ependencies":\\s*{[^}]*"@redwoodjs\\/core":\\s*".+?"[^}]*}',
+          matchPackage: '@redwoodjs/core',
         },
       ],
     },
     settings: {
       installCommand: {
-        placeholder: '`yarn install` or `npm install`',
+        placeholder:
+          '`yarn install`, `pnpm install`, `npm install`, or `bun install`',
       },
       buildCommand: {
         value: 'yarn rw deploy vercel',
@@ -1369,20 +1615,17 @@ export const frameworks = [
         placeholder: 'RedwoodJS default',
       },
     },
-    devCommand: 'yarn rw dev --fwd="--port=$PORT --open=false',
-    buildCommand: 'yarn rw deploy vercel',
     getOutputDirName: async () => 'public',
   },
   {
     name: 'Hugo',
     slug: 'hugo',
-    demo: 'https://hugo.examples.vercel.com',
-    logo: 'https://raw.githubusercontent.com/vercel/vercel/main/packages/frameworks/logos/hugo.svg',
+    demo: 'https://hugo-template.vercel.app',
+    logo: 'https://api-frameworks.vercel.sh/framework-logos/hugo.svg',
     tagline:
       'Hugo is the world’s fastest framework for building websites, written in Go.',
     description: 'A Hugo site, created with the Hugo CLI.',
     website: 'https://gohugo.io',
-    sort: 5,
     detectors: {
       some: [
         {
@@ -1404,7 +1647,8 @@ export const frameworks = [
         placeholder: 'None',
       },
       buildCommand: {
-        placeholder: '`npm run build` or `hugo -D --gc`',
+        placeholder: '`npm run build` or `hugo --gc`',
+        value: 'hugo --gc',
       },
       devCommand: {
         value: 'hugo server -D -w -p $PORT',
@@ -1414,8 +1658,6 @@ export const frameworks = [
         placeholder: '`public` or `publishDir` from the `config` file',
       },
     },
-    devCommand: 'hugo server -D -w -p $PORT',
-    buildCommand: 'hugo -D --gc',
     getOutputDirName: async (dirPrefix: string): Promise<string> => {
       type HugoConfig = { publishDir?: string };
       const config = await readConfigFile<HugoConfig>(
@@ -1426,13 +1668,13 @@ export const frameworks = [
 
       return (config && config.publishDir) || 'public';
     },
-    defaultVersion: '0.58.2',
+    defaultVersion: '0.58.2', // Must match the build image
   },
   {
     name: 'Jekyll',
     slug: 'jekyll',
-    demo: 'https://jekyll.examples.vercel.com',
-    logo: 'https://raw.githubusercontent.com/vercel/vercel/main/packages/frameworks/logos/jekyll.svg',
+    demo: 'https://jekyll-template.vercel.app',
+    logo: 'https://api-frameworks.vercel.sh/framework-logos/jekyll.svg',
     tagline:
       'Jekyll makes it super easy to transform your plain text into static websites and blogs.',
     description: 'A Jekyll site, created with the Jekyll CLI.',
@@ -1450,6 +1692,7 @@ export const frameworks = [
       },
       buildCommand: {
         placeholder: '`npm run build` or `jekyll build`',
+        value: 'jekyll build',
       },
       devCommand: {
         value: 'bundle exec jekyll serve --watch --port $PORT',
@@ -1459,8 +1702,6 @@ export const frameworks = [
         placeholder: '`_site` or `destination` from `_config.yml`',
       },
     },
-    devCommand: 'bundle exec jekyll serve --watch --port $PORT',
-    buildCommand: 'jekyll build',
     getOutputDirName: async (dirPrefix: string): Promise<string> => {
       type JekyllConfig = { destination?: string };
       const config = await readConfigFile<JekyllConfig>(
@@ -1473,14 +1714,17 @@ export const frameworks = [
   {
     name: 'Brunch',
     slug: 'brunch',
-    demo: 'https://brunch.examples.vercel.com',
-    logo: 'https://raw.githubusercontent.com/vercel/vercel/main/packages/frameworks/logos/brunch.svg',
+    demo: 'https://brunch-template.vercel.app',
+    logo: 'https://api-frameworks.vercel.sh/framework-logos/brunch.svg',
     tagline:
       'Brunch is a fast and simple webapp build tool with seamless incremental compilation for rapid development.',
     description: 'A Brunch app, created with the Brunch CLI.',
     website: 'https://brunch.io/',
     detectors: {
-      every: [
+      some: [
+        {
+          matchPackage: 'brunch',
+        },
         {
           path: 'brunch-config.js',
         },
@@ -1488,10 +1732,12 @@ export const frameworks = [
     },
     settings: {
       installCommand: {
-        placeholder: '`yarn install` or `npm install`',
+        placeholder:
+          '`yarn install`, `pnpm install`, `npm install`, or `bun install`',
       },
       buildCommand: {
         placeholder: '`npm run build` or `brunch build --production`',
+        value: 'brunch build --production',
       },
       devCommand: {
         value: 'brunch watch --server --port $PORT',
@@ -1501,15 +1747,13 @@ export const frameworks = [
         value: 'public',
       },
     },
-    devCommand: 'brunch watch --server --port $PORT',
-    buildCommand: 'brunch build --production',
     getOutputDirName: async () => 'public',
   },
   {
     name: 'Middleman',
     slug: 'middleman',
-    demo: 'https://middleman.examples.vercel.com',
-    logo: 'https://raw.githubusercontent.com/vercel/vercel/main/packages/frameworks/logos/middleman.svg',
+    demo: 'https://middleman-template.vercel.app',
+    logo: 'https://api-frameworks.vercel.sh/framework-logos/middleman.svg',
     tagline:
       'Middleman is a static site generator that uses all the shortcuts and tools in modern web development.',
     description: 'A Middleman app, created with the Middleman CLI.',
@@ -1526,26 +1770,25 @@ export const frameworks = [
         value: 'bundle install',
       },
       buildCommand: {
-        value: '`npm run build` or `bundle exec middleman build`',
+        placeholder: '`npm run build` or `bundle exec middleman build`',
+        value: 'bundle exec middleman build',
       },
       devCommand: {
-        value: 'bundle exec middleman server -p $PORT',
         placeholder: 'bundle exec middleman server',
+        value: 'bundle exec middleman server -p $PORT',
       },
       outputDirectory: {
         value: 'build',
       },
     },
-    devCommand: 'bundle exec middleman server -p $PORT',
-    buildCommand: 'bundle exec middleman build',
     getOutputDirName: async () => 'build',
     cachePattern: '{vendor/bin,vendor/cache,vendor/bundle}/**',
   },
   {
     name: 'Zola',
     slug: 'zola',
-    demo: 'https://zola.examples.vercel.com',
-    logo: 'https://raw.githubusercontent.com/vercel/vercel/main/packages/frameworks/logos/zola.png',
+    demo: 'https://zola-template.vercel.app',
+    logo: 'https://api-frameworks.vercel.sh/framework-logos/zola.png',
     tagline: 'Everything you need to make a static site engine in one binary.',
     description: 'A Zola app, created with the "Getting Started" tutorial.',
     website: 'https://www.getzola.org',
@@ -1565,80 +1808,434 @@ export const frameworks = [
         value: 'zola build',
       },
       devCommand: {
-        value: 'zola serve --port $PORT',
         placeholder: 'zola serve',
+        value: 'zola serve --port $PORT',
       },
       outputDirectory: {
         value: 'public',
       },
     },
-    devCommand: 'zola serve --port $PORT',
-    buildCommand: 'zola build',
     getOutputDirName: async () => 'public',
-    defaultVersion: '0.13.0',
+    defaultVersion: '0.13.0', // Must match the build image
   },
   {
-    name: 'Vite',
-    slug: 'vite',
-    demo: 'https://vite.examples.vercel.com',
-    logo: 'https://raw.githubusercontent.com/vercel/vercel/main/packages/frameworks/logos/vite.svg',
-    tagline:
-      'Vite is a new breed of frontend build tool that significantly improves the frontend development experience.',
-    description: 'A Vue.js app, created with Vite.',
-    website: 'https://vitejs.dev',
-    envPrefix: 'VITE_',
+    name: 'Hydrogen (v1)',
+    slug: 'hydrogen',
+    demo: 'https://hydrogen-template.vercel.app',
+    logo: 'https://api-frameworks.vercel.sh/framework-logos/hydrogen.svg',
+    tagline: 'React framework for headless commerce',
+    description: 'React framework for headless commerce',
+    website: 'https://hydrogen.shopify.dev',
+    supersedes: ['vite'],
+    useRuntime: { src: 'package.json', use: '@vercel/hydrogen' },
+    envPrefix: 'PUBLIC_',
     detectors: {
-      every: [
+      some: [
         {
-          path: 'package.json',
-          matchContent:
-            '"(dev)?(d|D)ependencies":\\s*{[^}]*"vite":\\s*".+?"[^}]*}',
+          matchPackage: '@shopify/hydrogen',
+        },
+        {
+          path: 'hydrogen.config.js',
+        },
+        {
+          path: 'hydrogen.config.ts',
         },
       ],
     },
     settings: {
       installCommand: {
-        placeholder: '`yarn install` or `npm install`',
+        placeholder:
+          '`yarn install`, `pnpm install`, `npm install`, or `bun install`',
+      },
+      buildCommand: {
+        value: 'shopify hydrogen build',
+        placeholder: '`npm run build` or `shopify hydrogen build`',
+      },
+      devCommand: {
+        value: 'shopify hydrogen dev',
+        placeholder: 'shopify hydrogen dev',
+      },
+      outputDirectory: {
+        value: 'dist',
+      },
+    },
+    dependency: '@shopify/hydrogen',
+    getOutputDirName: async () => 'dist',
+  },
+  {
+    name: 'Vite',
+    slug: 'vite',
+    demo: 'https://vite-vue-template.vercel.app',
+    logo: 'https://api-frameworks.vercel.sh/framework-logos/vite.svg',
+    tagline:
+      'Vite is a new breed of frontend build tool that significantly improves the frontend development experience.',
+    description: 'A Vue.js app, created with Vite.',
+    website: 'https://vitejs.dev',
+    supersedes: ['ionic-react'],
+    envPrefix: 'VITE_',
+    detectors: {
+      every: [
+        {
+          matchPackage: 'vite',
+        },
+      ],
+    },
+    settings: {
+      installCommand: {
+        placeholder:
+          '`yarn install`, `pnpm install`, `npm install`, or `bun install`',
       },
       buildCommand: {
         placeholder: '`npm run build` or `vite build`',
+        value: 'vite build',
       },
       devCommand: {
         placeholder: 'vite',
+        value: 'vite --port $PORT',
       },
       outputDirectory: {
         value: 'dist',
       },
     },
     dependency: 'vite',
-    devCommand: 'vite',
-    buildCommand: 'vite build',
     getOutputDirName: async () => 'dist',
+  },
+  {
+    name: 'VitePress',
+    slug: 'vitepress',
+    demo: 'https://vitepress-starter-template.vercel.app',
+    logo: 'https://api-frameworks.vercel.sh/framework-logos/vite.svg',
+    tagline: "VitePress is VuePress' little brother, built on top of Vite.",
+    description: 'VuePress on top of Vite',
+    website: 'https://vitepress.vuejs.org/',
+    detectors: {
+      every: [
+        {
+          matchPackage: 'vitepress',
+        },
+      ],
+    },
+    settings: {
+      installCommand: {
+        placeholder:
+          '`yarn install`, `pnpm install`, `npm install`, or `bun install`',
+      },
+      buildCommand: {
+        placeholder: '`npm run build` or `vitepress build docs`',
+        value: 'vitepress build docs',
+      },
+      devCommand: {
+        value: 'vitepress dev docs --port $PORT',
+      },
+      outputDirectory: {
+        value: 'docs/.vitepress/dist',
+      },
+    },
+    getOutputDirName: async () => 'docs/.vitepress/dist',
+  },
+  {
+    name: 'VuePress',
+    slug: 'vuepress',
+    demo: 'https://vuepress-starter-template.vercel.app',
+    logo: 'https://api-frameworks.vercel.sh/framework-logos/vuepress.png',
+    tagline: 'Vue-powered Static Site Generator',
+    description: 'Vue-powered Static Site Generator',
+    website: 'https://vuepress.vuejs.org/',
+    detectors: {
+      every: [
+        {
+          matchPackage: 'vuepress',
+        },
+      ],
+    },
+    settings: {
+      installCommand: {
+        placeholder:
+          '`yarn install`, `pnpm install`, `npm install`, or `bun install`',
+      },
+      buildCommand: {
+        placeholder: '`npm run build` or `vuepress build src`',
+        value: 'vuepress build src',
+      },
+      devCommand: {
+        value: 'vuepress dev src --port $PORT',
+      },
+      outputDirectory: {
+        value: 'src/.vuepress/dist',
+      },
+    },
+    getOutputDirName: async () => 'src/.vuepress/dist',
+  },
+  {
+    name: 'Parcel',
+    slug: 'parcel',
+    demo: 'https://parcel-template.vercel.app',
+    logo: 'https://api-frameworks.vercel.sh/framework-logos/parcel.png',
+    tagline:
+      'Parcel is a zero configuration build tool for the web that scales to projects of any size and complexity.',
+    description: 'A vanilla web app built with Parcel.',
+    website: 'https://parceljs.org',
+    detectors: {
+      every: [
+        {
+          matchPackage: 'parcel',
+        },
+      ],
+    },
+    settings: {
+      installCommand: {
+        placeholder:
+          '`yarn install`, `pnpm install`, `npm install`, or `bun install`',
+      },
+      buildCommand: {
+        placeholder: '`npm run build` or `parcel build`',
+        value: 'parcel build',
+      },
+      devCommand: {
+        placeholder: 'parcel',
+        value: 'parcel',
+      },
+      outputDirectory: {
+        value: 'dist',
+      },
+    },
+    dependency: 'parcel',
+    getOutputDirName: async () => 'dist',
+    defaultRoutes: [
+      {
+        src: '^/[^./]+\\.[0-9a-f]{8}\\.(css|js|png|jpg|webp|avif|svg)$',
+        headers: { 'cache-control': 's-maxage=31536000, immutable' },
+        continue: true,
+      },
+      {
+        handle: 'filesystem',
+      },
+    ],
+  },
+  {
+    name: 'FastHTML (Experimental)',
+    slug: 'fasthtml',
+    demo: 'https://fasthtml-template.vercel.app',
+    logo: 'https://api-frameworks.vercel.sh/framework-logos/fasthtml.png',
+    darkModeLogo:
+      'https://api-frameworks.vercel.sh/framework-logos/fasthtml-dark.png',
+    tagline: 'The fastest way to create an HTML app',
+    description:
+      'A library for writing fast and scalable Starlette-powered web applications',
+    website: 'https://fastht.ml',
+    useRuntime: { src: 'main.py', use: '@vercel/python' },
+    detectors: {
+      every: [
+        {
+          path: 'requirements.txt',
+          matchContent: 'python-fasthtml',
+        },
+      ],
+    },
+    settings: {
+      installCommand: {
+        placeholder: '`pip install`',
+      },
+      buildCommand: {
+        placeholder: 'None',
+        value: null,
+      },
+      devCommand: {
+        value: 'uvicorn main:app --reload',
+      },
+      outputDirectory: {
+        value: 'N/A',
+      },
+    },
+    getOutputDirName: async () => '',
+    defaultRoutes: [
+      {
+        handle: 'filesystem',
+      },
+      {
+        src: '/(.*)',
+        dest: '/main',
+      },
+    ],
+  },
+  {
+    name: 'Sanity (v3)',
+    slug: 'sanity-v3',
+    demo: 'https://sanity-studio-template.vercel.app',
+    logo: 'https://api-frameworks.vercel.sh/framework-logos/sanity.svg',
+    tagline: 'The structured content platform.',
+    description: 'A Sanity Studio',
+    website: 'https://www.sanity.io',
+    envPrefix: 'SANITY_STUDIO_',
+    detectors: {
+      some: [
+        {
+          path: 'sanity.json',
+        },
+        {
+          path: 'sanity.config.js',
+        },
+        {
+          path: 'sanity.config.jsx',
+        },
+        {
+          path: 'sanity.config.ts',
+        },
+        {
+          path: 'sanity.config.tsx',
+        },
+      ],
+      every: [
+        {
+          path: 'package.json',
+          matchContent:
+            '"(dev)?(d|D)ependencies":\\s*{[^}]*"sanity":\\s*"\\^?3\\..*"[^}]*}',
+        },
+      ],
+    },
+    settings: {
+      installCommand: {
+        placeholder:
+          '`yarn install`, `pnpm install`, `npm install`, or `bun install`',
+      },
+      buildCommand: {
+        placeholder: '`npm run build` or `sanity build`',
+        value: 'sanity build',
+      },
+      devCommand: {
+        value: 'sanity dev --port $PORT',
+      },
+      outputDirectory: {
+        value: 'dist',
+      },
+    },
+    getOutputDirName: async () => 'dist',
+    defaultRoutes: [
+      {
+        handle: 'filesystem',
+      },
+      {
+        src: '/(.*)',
+        dest: '/index.html',
+      },
+    ],
+  },
+  {
+    name: 'Sanity',
+    slug: 'sanity',
+    demo: 'https://sanity-studio-template.vercel.app',
+    logo: 'https://api-frameworks.vercel.sh/framework-logos/sanity.svg',
+    tagline: 'The structured content platform.',
+    description: 'A Sanity Studio',
+    website: 'https://www.sanity.io',
+    envPrefix: 'SANITY_STUDIO_',
+    detectors: {
+      some: [
+        {
+          path: 'sanity.json',
+        },
+        {
+          path: 'sanity.config.js',
+        },
+        {
+          path: 'sanity.config.jsx',
+        },
+        {
+          path: 'sanity.config.ts',
+        },
+        {
+          path: 'sanity.config.tsx',
+        },
+      ],
+    },
+    settings: {
+      installCommand: {
+        placeholder:
+          '`yarn install`, `pnpm install`, `npm install`, or `bun install`',
+      },
+      buildCommand: {
+        placeholder: '`npm run build` or `sanity build`',
+        value: 'sanity build',
+      },
+      devCommand: {
+        value: 'sanity start --port $PORT',
+      },
+      outputDirectory: {
+        value: 'dist',
+      },
+    },
+    dependency: '@sanity/cli',
+    getOutputDirName: async () => 'dist',
+    defaultRoutes: [
+      {
+        handle: 'filesystem',
+      },
+      {
+        src: '/(.*)',
+        dest: '/index.html',
+      },
+    ],
+  },
+  {
+    name: 'Storybook',
+    slug: 'storybook',
+    logo: 'https://api-frameworks.vercel.sh/framework-logos/storybook.svg',
+    tagline: 'Frontend workshop for UI development',
+    description:
+      'Storybook is a frontend workshop for building UI components and pages in isolation.',
+    website: 'https://storybook.js.org',
+    ignoreRuntimes: ['@vercel/next', '@vercel/node'],
+    disableRootMiddleware: true,
+    detectors: {
+      every: [
+        {
+          matchPackage: 'storybook',
+        },
+      ],
+    },
+    settings: {
+      installCommand: {
+        placeholder:
+          '`yarn install`, `pnpm install`, `npm install`, or `bun install`',
+      },
+      buildCommand: {
+        value: 'storybook build',
+        ignorePackageJsonScript: true,
+      },
+      devCommand: {
+        value: `storybook dev -p $PORT`,
+      },
+      outputDirectory: {
+        value: 'storybook-static',
+      },
+    },
+    getOutputDirName: async () => 'storybook-static',
   },
   {
     name: 'Other',
     slug: null,
-    logo: 'https://raw.githubusercontent.com/vercel/vercel/main/packages/frameworks/logos/other.svg',
-    description: 'No framework or a unoptimized framework.',
+    logo: 'https://api-frameworks.vercel.sh/framework-logos/other.svg',
+    description: 'No framework or an unoptimized framework.',
     settings: {
       installCommand: {
-        placeholder: '`yarn install` or `npm install`',
+        placeholder:
+          '`yarn install`, `pnpm install`, `npm install`, or `bun install`',
       },
       buildCommand: {
         placeholder: '`npm run vercel-build` or `npm run build`',
+        value: null,
       },
       devCommand: {
         placeholder: 'None',
+        value: null,
       },
       outputDirectory: {
         placeholder: '`public` if it exists, or `.`',
       },
     },
-    devCommand: null,
-    buildCommand: null,
     getOutputDirName: async () => 'public',
   },
 ] as const;
 
-const def = frameworks as readonly Framework[];
-export default def;
+export const frameworkList = frameworks as readonly Framework[];
+export default frameworkList;

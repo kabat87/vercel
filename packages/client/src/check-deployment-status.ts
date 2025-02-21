@@ -1,6 +1,6 @@
 import sleep from 'sleep-promise';
-import ms from 'ms';
 import { fetch, getApiDeploymentsUrl } from './utils';
+import { getPollingDelay } from './utils/get-polling-delay';
 import {
   isDone,
   isReady,
@@ -31,10 +31,7 @@ export async function* checkDeploymentStatus(
 
   let deploymentState = deployment;
 
-  const apiDeployments = getApiDeploymentsUrl({
-    builds: deployment.builds,
-    functions: deployment.functions,
-  });
+  const apiDeployments = getApiDeploymentsUrl();
 
   // If the deployment is ready, we don't want any of this to run
   if (isDone(deploymentState) && isAliasAssigned(deploymentState)) {
@@ -47,6 +44,7 @@ export async function* checkDeploymentStatus(
   // Build polling
   debug('Waiting for builds and the deployment to complete...');
   const finishedEvents = new Set();
+  const startTime = Date.now();
 
   while (true) {
     // Deployment polling
@@ -55,7 +53,7 @@ export async function* checkDeploymentStatus(
         teamId ? `?teamId=${teamId}` : ''
       }`,
       token,
-      { apiUrl, userAgent }
+      { apiUrl, userAgent, agent: clientOptions.agent }
     );
     const deploymentUpdate = await deploymentData.json();
 
@@ -88,6 +86,50 @@ export async function* checkDeploymentStatus(
       yield { type: 'ready', payload: deploymentUpdate };
     }
 
+    if (deploymentUpdate.checksState !== undefined) {
+      if (
+        deploymentUpdate.checksState === 'completed' &&
+        !finishedEvents.has('checks-completed')
+      ) {
+        finishedEvents.add('checks-completed');
+
+        if (deploymentUpdate.checksConclusion === 'succeeded') {
+          yield {
+            type: 'checks-conclusion-succeeded',
+            payload: deploymentUpdate,
+          };
+        } else if (deploymentUpdate.checksConclusion === 'failed') {
+          yield { type: 'checks-conclusion-failed', payload: deploymentUpdate };
+        } else if (deploymentUpdate.checksConclusion === 'skipped') {
+          yield {
+            type: 'checks-conclusion-skipped',
+            payload: deploymentUpdate,
+          };
+        } else if (deploymentUpdate.checksConclusion === 'canceled') {
+          yield {
+            type: 'checks-conclusion-canceled',
+            payload: deploymentUpdate,
+          };
+        }
+      }
+
+      if (
+        deploymentUpdate.checksState === 'registered' &&
+        !finishedEvents.has('checks-registered')
+      ) {
+        finishedEvents.add('checks-registered');
+        yield { type: 'checks-registered', payload: deploymentUpdate };
+      }
+
+      if (
+        deploymentUpdate.checksState === 'running' &&
+        !finishedEvents.has('checks-running')
+      ) {
+        finishedEvents.add('checks-running');
+        yield { type: 'checks-running', payload: deploymentUpdate };
+      }
+    }
+
     if (isAliasAssigned(deploymentUpdate)) {
       debug('Deployment alias assigned');
       return yield { type: 'alias-assigned', payload: deploymentUpdate };
@@ -111,6 +153,8 @@ export async function* checkDeploymentStatus(
       };
     }
 
-    await sleep(ms('1.5s'));
+    const elapsed = Date.now() - startTime;
+    const duration = getPollingDelay(elapsed);
+    await sleep(duration);
   }
 }

@@ -6,33 +6,29 @@ import {
   DNSInvalidType,
 } from '../../util/errors-ts';
 import addDNSRecord from '../../util/dns/add-dns-record';
-import Client from '../../util/client';
+import type Client from '../../util/client';
 import getScope from '../../util/get-scope';
 import parseAddDNSRecordArgs from '../../util/dns/parse-add-dns-record-args';
 import stamp from '../../util/output/stamp';
 import getDNSData from '../../util/dns/get-dns-data';
 import { getCommandName } from '../../util/pkg-name';
+import output from '../../output-manager';
+import { DnsAddTelemetryClient } from '../../util/telemetry/commands/dns/add';
+import { addSubcommand } from './command';
+import { parseArguments } from '../../util/get-args';
+import { getFlagsSpecification } from '../../util/get-flags-specification';
+import { printError } from '../../util/error';
 
-type Options = {};
-
-export default async function add(
-  client: Client,
-  opts: Options,
-  args: string[]
-) {
-  const { output } = client;
-  let contextName = null;
-
+export default async function add(client: Client, argv: string[]) {
+  let parsedArgs;
+  const flagsSpecification = getFlagsSpecification(addSubcommand.options);
   try {
-    ({ contextName } = await getScope(client));
+    parsedArgs = parseArguments(argv, flagsSpecification, { permissive: true });
   } catch (err) {
-    if (err.code === 'NOT_AUTHORIZED' || err.code === 'TEAM_DELETED') {
-      output.error(err.message);
-      return 1;
-    }
-
-    throw err;
+    printError(err);
+    return 1;
   }
+  const { args } = parsedArgs;
 
   const parsedParams = parseAddDNSRecordArgs(args);
   if (!parsedParams) {
@@ -46,11 +42,26 @@ export default async function add(
 
   const addStamp = stamp();
   const { domain, data: argData } = parsedParams;
-  const data = await getDNSData(output, argData);
+  const valueArgs = args.slice(3); // domain, name, type, ...valueArgs
+
+  const telemetryClient = new DnsAddTelemetryClient({
+    opts: {
+      store: client.telemetryEventStore,
+    },
+  });
+
+  telemetryClient.trackCliArgumentDomain(domain);
+  telemetryClient.trackCliArgumentName(parsedParams.data?.name);
+  telemetryClient.trackCliArgumentType(parsedParams.data?.type);
+  telemetryClient.trackCliArgumentValues(valueArgs);
+
+  const data = await getDNSData(client, argData);
   if (!data) {
-    output.log(`Aborted`);
+    output.log(`Canceled`);
     return 1;
   }
+
+  const { contextName } = await getScope(client);
 
   const record = await addDNSRecord(client, domain, data);
   if (record instanceof DomainNotFound) {
@@ -96,12 +107,10 @@ export default async function add(
     return 1;
   }
 
-  console.log(
-    `${chalk.cyan('> Success!')} DNS record for domain ${chalk.bold(
-      domain
-    )} ${chalk.gray(`(${record.uid})`)} created under ${chalk.bold(
-      contextName
-    )} ${chalk.gray(addStamp())}`
+  output.success(
+    `DNS record for domain ${chalk.bold(domain)} ${chalk.gray(
+      `(${record.uid})`
+    )} created under ${chalk.bold(contextName)} ${chalk.gray(addStamp())}`
   );
 
   return 0;

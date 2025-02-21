@@ -1,16 +1,25 @@
-import { Route } from '@vercel/routing-utils';
+import { Rewrite, Route } from '@vercel/routing-utils';
 
 export interface FrameworkDetectionItem {
   /**
-   * A file path
-   * @example "package.json"
+   * A file path to detect.
+   * If specified, "matchPackage" cannot be specified.
+   * @example "some-framework.config.json"
    */
-  path: string;
+  path?: string;
   /**
-   * A matcher
+   * A matcher for the entire file.
+   * If specified, "matchPackage" cannot be specified.
    * @example "\"(dev)?(d|D)ependencies\":\\s*{[^}]*\"next\":\\s*\".+?\"[^}]*}"
    */
   matchContent?: string;
+  /**
+   * A matcher for a package specifically found in a "package.json" file.
+   * If specified, "path" and "matchContext" cannot be specified.
+   * If specified in multiple detectors, the first one will be used to resolve the framework version.
+   * @example "\"(dev)?(d|D)ependencies\":\\s*{[^}]*\"next\":\\s*\".+?\"[^}]*}"
+   */
+  matchPackage?: string;
 }
 
 export interface SettingPlaceholder {
@@ -23,14 +32,32 @@ export interface SettingPlaceholder {
 
 export interface SettingValue {
   /**
-   * A predefined setting for the detected framework
+   * A predefined setting for the detected framework.
    * @example "next dev --port $PORT"
    */
-  value: string;
+  value: string | null;
+  /**
+   * Placeholder text that may be shown in the UI when
+   * the user is configuring this setting value.
+   * @example "`npm run build` or `next build`"
+   */
   placeholder?: string;
+  /**
+   * When set to `true`, then the builder will not
+   * invoke the equivalent script in `package.json`,
+   * and instead will invoke the command specified in
+   * configuration setting directly. When this
+   * configuration is enabled, `value` must be a string.
+   */
+  ignorePackageJsonScript?: boolean;
 }
 
 export type Setting = SettingValue | SettingPlaceholder;
+
+export type Redirect = Rewrite & {
+  statusCode?: number;
+  permanent?: boolean;
+};
 
 /**
  * Framework detection information.
@@ -48,12 +75,22 @@ export interface Framework {
   slug: string | null;
   /**
    * A URL to the logo of the framework
-   * @example "https://raw.githubusercontent.com/vercel/vercel/main/packages/frameworks/logos/next.svg"
+   * @example "https://api-frameworks.vercel.sh/framework-logos/next.svg"
    */
   logo: string;
   /**
+   * An additional URL to the logo of the framework optimized for dark mode
+   * @example "https://api-frameworks.vercel.sh/framework-logos/next-dark.svg"
+   */
+  darkModeLogo?: string;
+  /**
+   * A URL to a screenshot of the demo
+   * @example "https://assets.vercel.com/image/upload/v1647366075/front/import/nextjs.png"
+   */
+  screenshot?: string;
+  /**
    * A URL to a deployed example of the framework
-   * @example "https://nextjs.now-examples.vercel.app"
+   * @example "https://nextjs-template.vercel.app"
    */
   demo?: string;
   /**
@@ -96,7 +133,16 @@ export interface Framework {
      */
     use: string;
   };
+  /**
+   * Names of runtimes which will not be used for zero-config
+   * matches within the "api" directory.
+   */
   ignoreRuntimes?: string[];
+  /**
+   * If `true`, then root-level middleware will not be enabled
+   * for this framework. Defaults to `false`.
+   */
+  disableRootMiddleware?: boolean;
   /**
    * Detectors used to find out the framework
    */
@@ -120,11 +166,11 @@ export interface Framework {
     /**
      * Default Build Command or a placeholder
      */
-    buildCommand: Setting;
+    buildCommand: SettingValue;
     /**
      * Default Development Command or a placeholder
      */
-    devCommand: Setting;
+    devCommand: SettingValue;
     /**
      * Default Output Directory
      */
@@ -148,11 +194,12 @@ export interface Framework {
   /**
    * Name of a dependency in `package.json` to detect this framework.
    * @example "hexo"
+   * @deprecated use `detectors` instead (new frameworks should not use this prop)
    */
   dependency?: string;
   /**
    * Function that returns the name of the directory that the framework outputs
-   * its build results to. In some cases this is read from a configuration file.
+   * its STATIC build results to. In some cases this is read from a configuration file.
    */
   getOutputDirName: (dirPrefix: string) => Promise<string>;
   /**
@@ -167,19 +214,13 @@ export interface Framework {
    */
   cachePattern?: string;
   /**
-   * The default build command for the framework.
-   * @example "next build"
-   */
-  buildCommand: string | null;
-  /**
-   * The default development command for the framework.
-   * @example "next dev"
-   */
-  devCommand: string | null;
-  /**
    * The default version of the framework command that is available within the
    * build image. Usually an environment variable can be set to override this.
    * @example "0.13.0"
    */
   defaultVersion?: string;
+  /**
+   * Array of slugs for other framework presets which this framework supersedes.
+   */
+  supersedes?: string[];
 }

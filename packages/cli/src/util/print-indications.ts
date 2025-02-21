@@ -1,11 +1,10 @@
 import chalk from 'chalk';
-import { Response } from 'node-fetch';
-import { emoji, EmojiLabel, prependEmoji } from './emoji';
-import createOutput from './output';
+import type { Response } from 'node-fetch';
 import linkStyle from './output/link';
+import { emoji, type EmojiLabel, prependEmoji } from './emoji';
+import output from '../output-manager';
 
 export default function printIndications(res: Response) {
-  const _output = createOutput();
   const indications = new Set(['warning', 'notice', 'tip']);
   const regex = /^x-(?:vercel|now)-(warning|notice|tip)-(.*)$/;
 
@@ -25,7 +24,7 @@ export default function printIndications(res: Response) {
             chalk.dim(`${action || 'Learn More'}: ${linkStyle(link)}`) +
             newline;
         }
-        _output.print(message + finalLink);
+        output.print(message + finalLink);
       }
     }
   }

@@ -1,0 +1,10 @@
+{
+  "scripts": {
+    "build": "next build web"
+  },
+  "dependencies": {
+    "next": "15.2.0-canary.33",
+    "react": "latest",
+    "react-dom": "latest"
+  }
+}

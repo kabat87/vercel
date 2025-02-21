@@ -1,10 +1,8 @@
 import chalk from 'chalk';
 import plural from 'pluralize';
-
 import { DomainNotFound, DomainPermissionDenied } from '../../util/errors-ts';
-import { Domain } from '../../types';
-import { Output } from '../../util/output';
-import Client from '../../util/client';
+import type { Domain } from '@vercel-internals/types';
+import type Client from '../../util/client';
 import deleteCertById from '../../util/certs/delete-cert-by-id';
 import getDomainByName from '../../util/domains/get-domain-by-name';
 import getScope from '../../util/get-scope';
@@ -13,34 +11,36 @@ import removeDomainByName from '../../util/domains/remove-domain-by-name';
 import stamp from '../../util/output/stamp';
 import * as ERRORS from '../../util/errors-ts';
 import param from '../../util/output/param';
-import promptBool from '../../util/input/prompt-bool';
 import setCustomSuffix from '../../util/domains/set-custom-suffix';
 import { findProjectsForDomain } from '../../util/projects/find-projects-for-domain';
 import { getCommandName } from '../../util/pkg-name';
+import output from '../../output-manager';
+import { DomainsRmTelemetryClient } from '../../util/telemetry/commands/domains/rm';
+import { removeSubcommand } from './command';
+import { parseArguments } from '../../util/get-args';
+import { getFlagsSpecification } from '../../util/get-flags-specification';
+import { printError } from '../../util/error';
 
-type Options = {
-  '--yes': boolean;
-};
+export default async function rm(client: Client, argv: string[]) {
+  const telemetry = new DomainsRmTelemetryClient({
+    opts: {
+      store: client.telemetryEventStore,
+    },
+  });
 
-export default async function rm(
-  client: Client,
-  opts: Partial<Options>,
-  args: string[]
-) {
-  const { output } = client;
-  const [domainName] = args;
-  let contextName = null;
-
+  let parsedArgs;
+  const flagsSpecification = getFlagsSpecification(removeSubcommand.options);
   try {
-    ({ contextName } = await getScope(client));
-  } catch (err) {
-    if (err.code === 'NOT_AUTHORIZED' || err.code === 'TEAM_DELETED') {
-      output.error(err.message);
-      return 1;
-    }
-
-    throw err;
+    parsedArgs = parseArguments(argv, flagsSpecification);
+  } catch (error) {
+    printError(error);
+    return 1;
   }
+  const { args, flags: opts } = parsedArgs;
+  const [domainName] = args;
+
+  telemetry.trackCliArgumentDomain(domainName);
+  telemetry.trackCliFlagYes(opts['--yes']);
 
   if (!domainName) {
     output.error(
@@ -48,6 +48,8 @@ export default async function rm(
     );
     return 1;
   }
+
+  const { contextName } = await getScope(client);
 
   if (args.length !== 1) {
     output.error(
@@ -92,17 +94,19 @@ export default async function rm(
   const skipConfirmation = opts['--yes'] || false;
   if (
     !skipConfirmation &&
-    !(await promptBool(`Are you sure you want to remove ${param(domainName)}?`))
+    !(await client.input.confirm(
+      `Are you sure you want to remove ${param(domainName)}?`,
+      false
+    ))
   ) {
-    output.log('Aborted');
+    output.log('Canceled');
     return 0;
   }
 
-  return removeDomain(output, client, contextName, skipConfirmation, domain);
+  return removeDomain(client, contextName, skipConfirmation, domain);
 }
 
 async function removeDomain(
-  output: Output,
   client: Client,
   contextName: string,
   skipConfirmation: boolean,
@@ -119,10 +123,10 @@ async function removeDomain(
     output.debug(`Removing alias ${id}`);
     try {
       await removeAliasById(client, id);
-    } catch (error) {
+    } catch (err: unknown) {
       // Ignore if the alias does not exist anymore
-      if (error.status !== 404) {
-        throw error;
+      if (!ERRORS.isAPIError(err) || err.status !== 404) {
+        throw err;
       }
     }
   }
@@ -130,11 +134,11 @@ async function removeDomain(
   for (const id of certIds) {
     output.debug(`Removing cert ${id}`);
     try {
-      await deleteCertById(output, client, id);
-    } catch (error) {
+      await deleteCertById(client, id);
+    } catch (err: unknown) {
       // Ignore if the cert does not exist anymore
-      if (error.status !== 404) {
-        throw error;
+      if (!ERRORS.isAPIError(err) || err.status !== 404) {
+        throw err;
       }
     }
   }
@@ -230,14 +234,16 @@ async function removeDomain(
 
     if (
       !skipConfirmation &&
-      !(await promptBool(`Remove conflicts associated with domain?`))
+      !(await client.input.confirm(
+        `Remove conflicts associated with domain?`,
+        false
+      ))
     ) {
-      output.log('Aborted');
+      output.log('Canceled');
       return 0;
     }
 
     return removeDomain(
-      output,
       client,
       contextName,
       skipConfirmation,

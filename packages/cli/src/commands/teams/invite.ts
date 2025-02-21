@@ -1,16 +1,23 @@
 import chalk from 'chalk';
-import Client from '../../util/client';
+import type Client from '../../util/client';
 import cmd from '../../util/output/cmd';
 import stamp from '../../util/output/stamp';
 import param from '../../util/output/param';
 import chars from '../../util/output/chars';
-import textInput from '../../util/input/text';
 import eraseLines from '../../util/output/erase-lines';
 import getUser from '../../util/get-user';
 import { getCommandName } from '../../util/pkg-name';
 import { email as regexEmail } from '../../util/input/regexes';
 import getTeams from '../../util/teams/get-teams';
 import inviteUserToTeam from '../../util/teams/invite-user-to-team';
+import { isAPIError } from '../../util/errors-ts';
+import { errorToString, isError } from '@vercel/error-utils';
+import { TeamsInviteTelemetryClient } from '../../util/telemetry/commands/teams/invite';
+import output from '../../output-manager';
+import { parseArguments } from '../../util/get-args';
+import { getFlagsSpecification } from '../../util/get-flags-specification';
+import { printError } from '../../util/error';
+import { inviteSubcommand } from './command';
 
 const validateEmail = (data: string) =>
   regexEmail.test(data.trim()) || data.length === 0;
@@ -32,58 +39,41 @@ const domains = Array.from(
   ])
 );
 
-const emailAutoComplete = (value: string, teamSlug: string) => {
-  const parts = value.split('@');
-
-  if (parts.length === 2 && parts[1].length > 0) {
-    const [, host] = parts;
-    let suggestion: string | false = false;
-
-    domains.unshift(teamSlug);
-    for (const domain of domains) {
-      if (domain.startsWith(host)) {
-        suggestion = domain.substr(host.length);
-        break;
-      }
-    }
-
-    domains.shift();
-    return suggestion;
-  }
-
-  return false;
-};
-
 export default async function invite(
   client: Client,
-  emails: string[] = [],
+  argv: string[],
   { introMsg = '', noopMsg = 'No changes made' } = {}
 ): Promise<number> {
-  const { config, output } = client;
+  const { config, telemetryEventStore } = client;
   const { currentTeam: currentTeamId } = config;
+  const telemetry = new TeamsInviteTelemetryClient({
+    opts: {
+      store: telemetryEventStore,
+    },
+  });
+
+  let parsedArgs;
+  const flagsSpecification = getFlagsSpecification(inviteSubcommand.options);
+  try {
+    parsedArgs = parseArguments(argv, flagsSpecification);
+  } catch (error) {
+    printError(error);
+    return 1;
+  }
+  const { args: emails } = parsedArgs;
 
   output.spinner('Fetching teams');
   const teams = await getTeams(client);
   const currentTeam = teams.find(team => team.id === currentTeamId);
 
   output.spinner('Fetching user information');
-  let user;
-  try {
-    user = await getUser(client);
-  } catch (err) {
-    if (err.code === 'NOT_AUTHORIZED' || err.code === 'TEAM_DELETED') {
-      output.error(err.message);
-      return 1;
-    }
-
-    throw err;
-  }
+  const user = await getUser(client);
 
   domains.push(user.email.split('@')[1]);
 
   if (!currentTeam) {
     // We specifically need a team scope here
-    let err = `You can't run this command under ${param(
+    const err = `You can't run this command under ${param(
       user.username || user.email
     )}.\nPlease select a team scope using ${getCommandName(
       `switch`
@@ -96,6 +86,8 @@ export default async function invite(
     introMsg || `Inviting team members to ${chalk.bold(currentTeam.name)}`
   );
 
+  telemetry.trackCliArgumentEmail(emails);
+
   if (emails.length > 0) {
     for (const email of emails) {
       if (regexEmail.test(email)) {
@@ -107,8 +99,8 @@ export default async function invite(
           // eslint-disable-next-line no-await-in-loop
           const res = await inviteUserToTeam(client, currentTeam.id, email);
           userInfo = res.username;
-        } catch (err) {
-          if (err.code === 'user_not_found') {
+        } catch (err: unknown) {
+          if (isAPIError(err) && err.code === 'user_not_found') {
             output.error(`No user exists with the email address "${email}".`);
             return 1;
           }
@@ -136,13 +128,12 @@ export default async function invite(
     email = '';
     try {
       // eslint-disable-next-line no-await-in-loop
-      email = await textInput({
-        label: `- ${inviteUserPrefix}`,
-        validateValue: validateEmail,
-        autoComplete: value => emailAutoComplete(value, currentTeam.slug),
+      email = await client.input.text({
+        message: `- ${inviteUserPrefix}`,
+        validate: validateEmail,
       });
-    } catch (err) {
-      if (err.message !== 'USER_ABORT') {
+    } catch (err: unknown) {
+      if (!isError(err) || err.message !== 'USER_ABORT') {
         throw err;
       }
     }
@@ -174,7 +165,7 @@ export default async function invite(
       } catch (err) {
         output.stopSpinner();
         process.stderr.write(eraseLines(emails.length + 2));
-        output.error(err.message);
+        output.error(errorToString(err));
         hasError = true;
         for (const email of emails) {
           output.log(`${chalk.cyan(chars.tick)} ${sentEmailPrefix}${email}`);

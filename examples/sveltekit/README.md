@@ -1,16 +1,16 @@
-# SvelteKit
+# SvelteKit Demo app
 
-Example project using SvelteKit with the [SpaceX GraphQL API](https://api.spacex.land/graphql/), deployed to [Vercel](https://vercel.com).
+The official demo app for SvelteKit, hosted on Vercel.
 
 ## Deploy Your Own
 
-[![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https%3A%2F%2Fgithub.com%2Fvercel%2Fvercel%2Ftree%2Fmain%2Fexamples%2Fsveltekit&project-name=sveltekit-vercel&repository-name=sveltekit-vercel&demo-title=SvelteKit%20%2B%20Vercel&demo-description=SvelteKit%20app%20fetching%20data%20from%20the%20SpaceX%20GraphQL%20API.&demo-url=https%3A%2F%2Fsveltekit.examples.vercel.com%2F&demo-image=https%3A%2F%2Fsveltekit.examples.vercel.com%2Ftwitter.png)
+[![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https%3A%2F%2Fgithub.com%2Fvercel%2Fvercel%2Ftree%2Fmain%2Fexamples%2Fsveltekit-1&project-name=sveltekit-vercel&repository-name=sveltekit-vercel&demo-title=SvelteKit%20%2B%20Vercel&demo-url=https%3A%2F%2Fsveltekit-template.vercel.app%2F)
 
-_Live Example: https://sveltekit.examples.vercel.com_
+_Live Example: https://sveltekit-1-template.vercel.app_
 
 ## Developing
 
-Once you've created a project and installed dependencies with `npm install`, start a development server:
+Once you've created a project and installed dependencies with `npm install` (or `pnpm install` or `yarn`), start a development server:
 
 ```bash
 npm run dev
@@ -21,8 +21,16 @@ npm run dev -- --open
 
 ## Building
 
-This uses the [Vercel Adapter](https://github.com/sveltejs/kit/tree/master/packages/adapter-vercel) for SvelteKit.
+To create a production version of your app:
 
 ```bash
 npm run build
 ```
+
+You can preview the production build with `npm run preview`.
+
+## Speed Insights
+
+Once deployed on Vercel, you can benefit from [Speed Insights](https://vercel.com/docs/concepts/speed-insights) simply by navigating to Vercel's dashboard, clicking on the 'Speed Insights' tab, and enabling the product.
+
+You will get data once your application will be re-deployed and will receive visitors.

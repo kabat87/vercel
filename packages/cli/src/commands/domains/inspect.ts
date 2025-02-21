@@ -1,7 +1,6 @@
 import chalk from 'chalk';
 import { DomainNotFound, DomainPermissionDenied } from '../../util/errors-ts';
-import { Output } from '../../util/output';
-import Client from '../../util/client';
+import type Client from '../../util/client';
 import stamp from '../../util/output/stamp';
 import formatDate from '../../util/format-date';
 import formatNSTable from '../../util/format-ns-table';
@@ -14,30 +13,31 @@ import { getCommandName } from '../../util/pkg-name';
 import { getDomainConfig } from '../../util/domains/get-domain-config';
 import code from '../../util/output/code';
 import { getDomainRegistrar } from '../../util/domains/get-domain-registrar';
+import { DomainsInspectTelemetryClient } from '../../util/telemetry/commands/domains/inspect';
+import output from '../../output-manager';
+import { inspectSubcommand } from './command';
+import { parseArguments } from '../../util/get-args';
+import { getFlagsSpecification } from '../../util/get-flags-specification';
+import { printError } from '../../util/error';
 
-type Options = {};
+export default async function inspect(client: Client, argv: string[]) {
+  const telemetry = new DomainsInspectTelemetryClient({
+    opts: {
+      store: client.telemetryEventStore,
+    },
+  });
 
-export default async function inspect(
-  client: Client,
-  opts: Options,
-  args: string[]
-) {
-  const { output } = client;
-
-  let contextName = null;
-
+  let parsedArgs;
+  const flagsSpecification = getFlagsSpecification(inspectSubcommand.options);
   try {
-    ({ contextName } = await getScope(client));
-  } catch (err) {
-    if (err.code === 'NOT_AUTHORIZED' || err.code === 'TEAM_DELETED') {
-      output.error(err.message);
-      return 1;
-    }
-
-    throw err;
+    parsedArgs = parseArguments(argv, flagsSpecification);
+  } catch (error) {
+    printError(error);
+    return 1;
   }
-
+  const { args } = parsedArgs;
   const [domainName] = args;
+
   const inspectStamp = stamp();
 
   if (!domainName) {
@@ -46,6 +46,8 @@ export default async function inspect(
     );
     return 1;
   }
+
+  telemetry.trackCliArgumentDomain(domainName);
 
   if (args.length !== 1) {
     output.error(
@@ -58,12 +60,12 @@ export default async function inspect(
 
   output.debug(`Fetching domain info`);
 
+  const { contextName } = await getScope(client);
   output.spinner(
     `Fetching Domain ${domainName} under ${chalk.bold(contextName)}`
   );
 
   const information = await fetchInformation({
-    output,
     client,
     contextName,
     domainName,
@@ -123,9 +125,9 @@ export default async function inspect(
           rows: projects.map(project => {
             const name = project.name;
 
-            const domains = (project.alias || [])
-              .map(target => target.domain)
-              .filter(alias => alias.endsWith(domainName));
+            const domains = (project.targets?.production?.alias || []).filter(
+              alias => alias.endsWith(domainName)
+            );
 
             const cols = domains.length ? domains.join(', ') : '-';
 
@@ -150,17 +152,7 @@ export default async function inspect(
       `This Domain is not configured properly. To configure it you should either:`,
       null,
       null,
-      null,
-      {
-        boxen: {
-          margin: {
-            left: 2,
-            right: 0,
-            bottom: 0,
-            top: 0,
-          },
-        },
-      }
+      null
     );
     output.print(
       `  ${chalk.grey('a)')} ` +
@@ -199,12 +191,10 @@ export default async function inspect(
 }
 
 async function fetchInformation({
-  output,
   client,
   contextName,
   domainName,
 }: {
-  output: Output;
   client: Client;
   contextName: string;
   domainName: string;

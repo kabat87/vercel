@@ -1,13 +1,15 @@
 import chalk from 'chalk';
-import Client from '../client';
-import { ProjectAliasTarget } from '../../types';
+import type Client from '../client';
+import type { ProjectAliasTarget } from '@vercel-internals/types';
+import { isAPIError } from '../errors-ts';
+import output from '../../output-manager';
 
 export async function addDomainToProject(
   client: Client,
   projectNameOrId: string,
   domain: string
 ) {
-  client.output.spinner(
+  output.spinner(
     `Adding domain ${domain} to project ${chalk.bold(projectNameOrId)}`
   );
   try {
@@ -33,8 +35,8 @@ export async function addDomainToProject(
     }
 
     return aliasTarget;
-  } catch (err) {
-    if (err.status < 500) {
+  } catch (err: unknown) {
+    if (isAPIError(err) && err.status < 500) {
       return err;
     }
 
