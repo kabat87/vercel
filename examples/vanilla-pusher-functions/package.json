@@ -1,5 +1,5 @@
 {
   "dependencies": {
-    "pusher": "^2.2.2"
+    "pusher": "^4.0.0"
   }
 }
