@@ -962,6 +962,11 @@
     puppeteer "^2.0.0"
     yargs "^14.2.0"
 
+"@snyk/protect@^1.1300.2":
+  version "1.1300.2"
+  resolved "https://registry.yarnpkg.com/@snyk/protect/-/protect-1.1300.2.tgz#0b572a45de239b05efddfde6aa97f45a0fd77c2d"
+  integrity sha512-E74PgBzdP9tg7mH2Hqw3kJ1GHmeiZzQlXNdon/l0blzR7Zjm9L6wnuQgZwTkZGdKJqU1O4jpqPgyjul4RYd8Hg==
+
 "@types/deasync@0.1.0":
   version "0.1.0"
   resolved "https://registry.yarnpkg.com/@types/deasync/-/deasync-0.1.0.tgz#b2bd6c3fcde3cf67b8be4c2f70136ba8f157b45a"
