@@ -1,6 +1,8 @@
 import retry from 'async-retry';
-import { Cert } from '../../types';
-import Client from '../client';
+import type { Cert } from '@vercel-internals/types';
+import type Client from '../client';
+import { isAPIError } from '../errors-ts';
+import { isError } from '@vercel/error-utils';
 
 // When it's a configuration error we should retry because of the DNS propagation
 // otherwise we bail to handle the error in the upper level
@@ -8,15 +10,17 @@ export default async function issueCert(client: Client, cns: string[]) {
   return retry(
     async bail => {
       try {
-        return await client.fetch<Cert>('/v3/now/certs', {
+        return await client.fetch<Cert>('/v3/certs', {
           method: 'POST',
-          body: { domains: cns }
+          body: { domains: cns },
         });
-      } catch (error) {
-        if (error.code === 'configuration_error') {
-          throw error;
+      } catch (err: unknown) {
+        if (isAPIError(err) && err.code === 'configuration_error') {
+          throw err;
+        } else if (isError(err)) {
+          bail(err);
         } else {
-          bail(error);
+          throw err;
         }
       }
     },

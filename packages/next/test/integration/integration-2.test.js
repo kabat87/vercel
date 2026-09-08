@@ -1,0 +1,983 @@
+process.env.NEXT_BUILDER_INTEGRATION = '1';
+process.env.NEXT_TELEMETRY_DISABLED = '1';
+
+const path = require('path');
+const fs = require('fs-extra');
+const builder = require('../../');
+const {
+  createRunBuildLambda,
+} = require('../../../../test/lib/run-build-lambda');
+
+/**
+ * @type {(inputPath: string) => Promise<{
+ *  buildResult: import('@vercel/build-utils').BuildResultV2Typical,
+ *  workPath: string
+ * }>}
+ */
+const runBuildLambda = createRunBuildLambda(builder);
+
+vi.setConfig({ testTimeout: 360000, hookTimeout: 360000 });
+
+it('Should build the serverless-config-promise example', async () => {
+  let error = null;
+
+  try {
+    await runBuildLambda(path.join(__dirname, 'serverless-config-promise'));
+  } catch (err) {
+    error = err;
+  }
+
+  expect(error).toBe(null);
+});
+
+it('Should build the serverless-config-object example', async () => {
+  const {
+    workPath,
+    buildResult: { output },
+  } = await runBuildLambda(path.join(__dirname, 'serverless-config-object'));
+
+  expect(output['index']).toBeDefined();
+  expect(output.goodbye).toBeDefined();
+  const filePaths = Object.keys(output);
+  const serverlessError = filePaths.some(filePath => filePath.match(/_error/));
+  const hasUnderScoreAppStaticFile = filePaths.some(filePath =>
+    filePath.match(/static.*\/pages\/_app-.*\.js$/)
+  );
+  const hasUnderScoreErrorStaticFile = filePaths.some(filePath =>
+    filePath.match(/static.*\/pages\/_error-.*\.js$/)
+  );
+  expect(hasUnderScoreAppStaticFile).toBeTruthy();
+  expect(hasUnderScoreErrorStaticFile).toBeTruthy();
+  expect(serverlessError).toBeTruthy();
+
+  const contents = await fs.readdir(workPath);
+
+  expect(contents.some(name => name === 'next.config.js')).toBeTruthy();
+  expect(
+    contents.some(name =>
+      name.includes('next.config.__vercel_builder_backup__')
+    )
+  ).toBeFalsy();
+});
+
+it('Should build the serverless-no-config example', async () => {
+  const {
+    workPath,
+    buildResult: { output },
+  } = await runBuildLambda(path.join(__dirname, 'serverless-no-config'));
+
+  expect(output['index']).toBeDefined();
+  expect(output.goodbye).toBeDefined();
+  const filePaths = Object.keys(output);
+  const serverlessError = filePaths.some(filePath => filePath.match(/_error/));
+  const hasUnderScoreAppStaticFile = filePaths.some(filePath =>
+    filePath.match(/static.*\/pages\/_app-.*\.js$/)
+  );
+  const hasUnderScoreErrorStaticFile = filePaths.some(filePath =>
+    filePath.match(/static.*\/pages\/_error-.*\.js$/)
+  );
+  expect(hasUnderScoreAppStaticFile).toBeTruthy();
+  expect(hasUnderScoreErrorStaticFile).toBeTruthy();
+  expect(serverlessError).toBeTruthy();
+
+  const contents = await fs.readdir(workPath);
+
+  expect(contents.some(name => name === 'next.config.js')).toBeFalsy();
+  expect(
+    contents.some(name =>
+      name.includes('next.config.__vercel_builder_backup__')
+    )
+  ).toBeFalsy();
+});
+
+// biome-ignore lint/suspicious/noSkippedTests: temporarily disabled
+it.skip('Should invoke build command with serverless-no-config', async () => {
+  const {
+    workPath,
+    buildResult: { output },
+  } = await runBuildLambda(path.join(__dirname, 'serverless-no-config-build'));
+
+  expect(output['index']).toBeDefined();
+  const filePaths = Object.keys(output);
+  const serverlessError = filePaths.some(filePath => filePath.match(/_error/));
+  const hasUnderScoreAppStaticFile = filePaths.some(filePath =>
+    filePath.match(/static.*\/pages\/_app-.*\.js$/)
+  );
+  const hasUnderScoreErrorStaticFile = filePaths.some(filePath =>
+    filePath.match(/static.*\/pages\/_error-.*\.js$/)
+  );
+  const hasBuildFile = await fs.pathExists(
+    path.join(__dirname, 'serverless-no-config-build'),
+    '.next',
+    'world.txt'
+  );
+
+  expect(hasUnderScoreAppStaticFile).toBeTruthy();
+  expect(hasUnderScoreErrorStaticFile).toBeTruthy();
+  expect(serverlessError).toBeTruthy();
+  expect(hasBuildFile).toBeTruthy();
+
+  const contents = await fs.readdir(workPath);
+
+  expect(contents.some(name => name === 'next.config.js')).toBeFalsy();
+  expect(
+    contents.some(name =>
+      name.includes('next.config.__vercel_builder_backup__')
+    )
+  ).toBeFalsy();
+});
+
+// biome-ignore lint/suspicious/noSkippedTests: temporarily disabled
+it.skip('Should not exceed function limit for large dependencies (server build)', async () => {
+  let logs = '';
+
+  const origLog = console.log;
+
+  console.log = function (...args) {
+    logs += args.join(' ');
+    origLog(...args);
+  };
+
+  const {
+    buildResult: { output },
+  } = await runBuildLambda(
+    path.join(__dirname, '../fixtures/00-test-limit-server-build')
+  );
+  console.log = origLog;
+
+  expect(output['index']).toBeDefined();
+  expect(output['api/chrome']).toBeDefined();
+  expect(output['api/chrome-1']).toBeDefined();
+  expect(output['api/firebase']).toBeDefined();
+  expect(output['api/firebase-1']).toBeDefined();
+  expect(output['gssp']).toBeDefined();
+  expect(output['gssp-1']).toBeDefined();
+  const filePaths = Object.keys(output);
+
+  const hasUnderScoreAppStaticFile = filePaths.some(filePath =>
+    filePath.match(/static.*\/pages\/_app-.*\.js$/)
+  );
+  const hasUnderScoreErrorStaticFile = filePaths.some(filePath =>
+    filePath.match(/static.*\/pages\/_error-.*\.js$/)
+  );
+  expect(hasUnderScoreAppStaticFile).toBeTruthy();
+  expect(hasUnderScoreErrorStaticFile).toBeTruthy();
+
+  const lambdas = new Set();
+
+  filePaths.forEach(filePath => {
+    if (output[filePath].type === 'Lambda') {
+      lambdas.add(output[filePath]);
+    }
+  });
+  expect(lambdas.size).toBe(3);
+
+  // this assertion is unstable as `next-server`'s size can change up and down
+  // on canary so skipping to prevent random failures.
+  // expect(logs).toContain(
+  //   'Warning: Max serverless function size of 50 MB compressed or 250 MB uncompressed almost reached'
+  // );
+
+  expect(logs).toContain('node_modules/chrome-aws-lambda/bin');
+});
+
+/**
+ * Runs a build with the per-function size report forced on, returning the
+ * captured `console.log` output alongside the build output.
+ *
+ * Over-budget routes are emitted as their own large functions measured against
+ * the 5 GB ceiling, so a build like this no longer warns about the 250 MB
+ * limit — `NEXT_DEBUG_FUNCTION_SIZE` keeps the size diagnostics printed.
+ */
+async function runBuildWithSizeInfo(fixture) {
+  let logs = '';
+
+  const origLog = console.log;
+  console.log = function (...args) {
+    logs += args.join(' ');
+    origLog(...args);
+  };
+  process.env.NEXT_DEBUG_FUNCTION_SIZE = '1';
+
+  try {
+    const {
+      buildResult: { output },
+    } = await runBuildLambda(path.join(__dirname, fixture));
+    return { logs, output };
+  } finally {
+    console.log = origLog;
+    delete process.env.NEXT_DEBUG_FUNCTION_SIZE;
+  }
+}
+
+/**
+ * The routes sharing `page`'s function. Pages bundled into the same group point
+ * at the same `Lambda`, so a single-entry result means the route was emitted on
+ * its own.
+ */
+function routesSharingFunction(output, page) {
+  expect(output[page]).toBeDefined();
+  return Object.keys(output)
+    .filter(key => output[key] === output[page])
+    .sort();
+}
+
+it('Should provide lambda info for over-budget routes (server build)', async () => {
+  const { logs, output } = await runBuildWithSizeInfo(
+    'test-limit-exceeded-server-build'
+  );
+
+  // `api/both.js` traces both chrome-aws-lambda and firebase on top of the
+  // shared public/ files, putting it over the normal packing budget, so it is
+  // emitted as its own large function rather than bundled with another route.
+  expect(routesSharingFunction(output, 'api/both')).toEqual(['api/both']);
+  expect(routesSharingFunction(output, 'api/chrome')).toEqual(['api/chrome']);
+
+  expect(logs).toContain(`Serverless Function's page: api/both.js`);
+  expect(logs).toMatch(/Large Dependencies.*?Uncompressed size/);
+  expect(logs).toMatch(/node_modules\/chrome-aws-lambda\/bin.*?\d{2}.*?MB/);
+  expect(logs).toMatch(/node_modules\/@firebase\/firestore.*?\d{1}.*?MB/);
+  expect(logs).toMatch(/big-image-1/);
+  expect(logs).toMatch(/big-image-2/);
+});
+
+it('Should provide lambda info for over-budget routes with internal pages (server build)', async () => {
+  const { logs } = await runBuildWithSizeInfo(
+    'test-limit-exceeded-internal-files-server-build'
+  );
+
+  // expect(logs).toContain(`Serverless Function's page: api/firebase.js`);
+  expect(logs).toContain(`Serverless Function's page: api/chrome.js`);
+  expect(logs).toContain(`Serverless Function's page: api/both.js`);
+  expect(logs).toMatch(/Large Dependencies.*?Uncompressed size/);
+  expect(logs).toMatch(/node_modules\/chrome-aws-lambda\/bin.*?\d{2}.*?MB/);
+  expect(logs).toMatch(/node_modules\/@firebase\/firestore.*?\d{1}.*?MB/);
+  expect(logs).toMatch(/public\/big-image-1\.jpg/);
+  expect(logs).toMatch(/public\/big-image-2\.jpg/);
+});
+
+it('Should provide lambda info for over-budget routes (uncompressed)', async () => {
+  const { logs, output } = await runBuildWithSizeInfo(
+    'test-limit-exceeded-404-static-files'
+  );
+
+  // The 200 MB `data.txt` is traced into `/api/hello` only, so that route is
+  // the one pushed over the budget and split out on its own.
+  expect(routesSharingFunction(output, 'api/hello')).toEqual(['api/hello']);
+
+  expect(logs).toContain(`Serverless Function's page: api/hello.js`);
+  expect(logs).toMatch(/Large Dependencies.*?Uncompressed size/);
+  expect(logs).toMatch(/data\.txt/);
+  expect(logs).toMatch(/\.next\/server\/pages/);
+});
+
+it('Should de-dupe correctly when limit is close (uncompressed)', async () => {
+  const origLog = console.log;
+  const origError = console.error;
+  const caughtLogs = [];
+
+  console.log = function (...args) {
+    caughtLogs.push(args.join(' '));
+    origLog.apply(this, args);
+  };
+  console.error = function (...args) {
+    caughtLogs.push(args.join(' '));
+    origError.apply(this, args);
+  };
+
+  const {
+    buildResult: { output },
+  } = await runBuildLambda(
+    path.join(__dirname, 'test-limit-large-uncompressed-files')
+  );
+
+  console.log = origLog;
+  console.error = origError;
+
+  expect(output['index']).toBeDefined();
+  expect(output['another']).toBeDefined();
+  expect(output['api/hello']).toBeDefined();
+  expect(output['api/hello-1']).toBeDefined();
+  expect(output['api/hello-2']).toBeDefined();
+  expect(output['api/hello-3']).toBeDefined();
+  expect(output['api/hello-4']).toBeDefined();
+  expect(output['_app']).not.toBeDefined();
+  expect(output['_error']).not.toBeDefined();
+  expect(output['_document']).not.toBeDefined();
+
+  expect(output['index'] === output['another']).toBe(true);
+  expect(output['index'] !== output['api/hello']).toBe(true);
+  expect(output['api/hello'] === output['api/hello-1']).toBe(true);
+  expect(output['api/hello'] === output['api/hello-2']).toBe(true);
+  expect(output['api/hello'] === output['api/hello-3']).toBe(true);
+  expect(output['api/hello'] === output['api/hello-4']).toBe(true);
+
+  expect(
+    caughtLogs.some(log =>
+      log.includes('WARNING: Unable to find source file for page')
+    )
+  ).toBeFalsy();
+
+  const lambdas = new Set();
+  let totalLambdas = 0;
+
+  for (const item of Object.values(output)) {
+    if (item.type === 'Lambda') {
+      totalLambdas += 1;
+      lambdas.add(item);
+    } else if (item.type === 'Prerender') {
+      lambdas.add(item.lambda);
+      totalLambdas += 1;
+    }
+  }
+  expect(lambdas.size).toBe(2);
+  expect(lambdas.size).toBeLessThan(totalLambdas);
+});
+
+it('should handle edge functions in app with basePath', async () => {
+  const {
+    buildResult: { output },
+  } = await runBuildLambda(path.join(__dirname, 'edge-app-dir-basepath'));
+
+  console.error(output);
+
+  expect(output['test']).toBeDefined();
+  expect(output['test']).toBeDefined();
+  expect(output['test'].type).toBe('EdgeFunction');
+  expect(output['test'].type).toBe('EdgeFunction');
+
+  expect(output['test/another']).toBeDefined();
+  expect(output['test/another.rsc']).toBeDefined();
+  expect(output['test/another'].type).toBe('EdgeFunction');
+  expect(output['test/another.rsc'].type).toBe('EdgeFunction');
+
+  expect(output['test/dynamic/[slug]']).toBeDefined();
+  expect(output['test/dynamic/[slug].rsc']).toBeDefined();
+  expect(output['test/dynamic/[slug]'].type).toBe('EdgeFunction');
+  expect(output['test/dynamic/[slug].rsc'].type).toBe('EdgeFunction');
+
+  expect(output['test/dynamic/[slug]']).toBeDefined();
+  expect(output['test/dynamic/[slug].rsc']).toBeDefined();
+  expect(output['test/dynamic/[slug]'].type).toBe('EdgeFunction');
+  expect(output['test/dynamic/[slug].rsc'].type).toBe('EdgeFunction');
+
+  expect(output['test/test']).toBeDefined();
+  expect(output['test/test.rsc']).toBeDefined();
+  expect(output['test/test'].type).toBe('EdgeFunction');
+  expect(output['test/test.rsc'].type).toBe('EdgeFunction');
+
+  expect(output['test/_not-found']).toBeDefined();
+  expect(output['test/_not-found'].type).toBe('EdgeFunction');
+
+  const lambdas = new Set();
+  const edgeFunctions = new Set();
+
+  for (const item of Object.values(output)) {
+    if (item.type === 'Lambda') {
+      lambdas.add(item);
+    } else if (item.type === 'EdgeFunction') {
+      edgeFunctions.add(item);
+    }
+  }
+  expect(lambdas.size).toBe(0);
+  expect(edgeFunctions.size).toBe(5);
+});
+
+it('should not generate lambdas that conflict with static index route in app with basePath', async () => {
+  const {
+    buildResult: { output },
+  } = await runBuildLambda(path.join(__dirname, 'app-router-basepath'));
+
+  expect(output['test']).not.toBeDefined();
+  expect(output['test.rsc']).not.toBeDefined();
+  expect(output['test/index'].type).toBe('Prerender');
+  expect(output['test/index.rsc'].type).toBe('Prerender');
+
+  expect(output['test/_not-found']).toBeDefined();
+  expect(output['test/_not-found'].type).toBe('Prerender');
+
+  const lambdas = new Set();
+
+  for (const item of Object.values(output)) {
+    if (item.type === 'Lambda') {
+      lambdas.add(item);
+    }
+  }
+  expect(lambdas.size).toBe(0);
+});
+
+describe('PPR', () => {
+  describe('legacy', () => {
+    it('should have the same lambda for revalidation and resume', async () => {
+      const {
+        buildResult: { output },
+      } = await runBuildLambda(path.join(__dirname, 'ppr-legacy'));
+
+      // Validate that there are only the two lambdas created.
+      const lambdas = new Set();
+      for (const key of Object.keys(output)) {
+        if (output[key].type === 'Lambda') {
+          lambdas.add(output[key]);
+        }
+      }
+
+      expect(lambdas.size).toBe(2);
+
+      // Validate that these two lambdas are the same.
+      expect(output['index']).toBeDefined();
+      expect(output['index'].type).toBe('Prerender');
+      expect(output['index'].lambda).toBeDefined();
+      expect(output['index'].lambda.type).toBe('Lambda');
+
+      expect(output['_next/postponed/resume/index']).toBeDefined();
+      expect(output['_next/postponed/resume/index'].type).toBe('Lambda');
+
+      expect(output['index'].lambda).toBe(
+        output['_next/postponed/resume/index']
+      );
+    });
+
+    it('should support basePath', async () => {
+      const {
+        buildResult: { output },
+      } = await runBuildLambda(path.join(__dirname, 'ppr-legacy-basepath'));
+
+      // Validate that there are only the two lambdas created.
+      const lambdas = new Set();
+      for (const key of Object.keys(output)) {
+        if (output[key].type === 'Lambda') {
+          lambdas.add(output[key]);
+        }
+      }
+
+      expect(lambdas.size).toBe(2);
+
+      // Validate that these two lambdas are the same.
+      expect(output['chat/index']).toBeDefined();
+      expect(output['chat/index'].type).toBe('Prerender');
+      expect(output['chat/index'].lambda).toBeDefined();
+      expect(output['chat/index'].lambda.type).toBe('Lambda');
+
+      expect(output['chat/_next/postponed/resume/index']).toBeDefined();
+      expect(output['chat/_next/postponed/resume/index'].type).toBe('Lambda');
+
+      expect(output['chat/index'].lambda).toBe(
+        output['chat/_next/postponed/resume/index']
+      );
+      expect(output['chat/index'].experimentalStreamingLambdaPath).toBe(
+        'chat/_next/postponed/resume/index'
+      );
+      expect(output['chat/index'].chain?.outputPath).toBe(
+        'chat/_next/postponed/resume/index'
+      );
+      expect(output['chat/index'].chain?.headers).toEqual({
+        'x-matched-path': '_next/postponed/resume/index',
+      });
+    });
+  });
+
+  it('should have the chain added', async () => {
+    const {
+      buildResult: { output },
+    } = await runBuildLambda(path.join(__dirname, 'ppr'));
+
+    // Validate that there are only the two lambdas created.
+    const lambdas = new Set();
+    for (const key of Object.keys(output)) {
+      if (output[key].type === 'Lambda') {
+        lambdas.add(output[key]);
+      }
+    }
+
+    expect(lambdas.size).toBe(1);
+
+    expect(output['index']).toBeDefined();
+    expect(output['index'].type).toBe('Prerender');
+    expect(output['index'].chain?.outputPath).toBe('index');
+  });
+
+  it('should support basePath', async () => {
+    const {
+      buildResult: { output },
+    } = await runBuildLambda(path.join(__dirname, 'ppr-basepath'));
+
+    // Validate that there are only the two lambdas created.
+    const lambdas = new Set();
+    for (const key of Object.keys(output)) {
+      if (output[key].type === 'Lambda') {
+        lambdas.add(output[key]);
+      }
+    }
+
+    expect(lambdas.size).toBe(1);
+
+    // Validate that these two lambdas are the same.
+    expect(output['chat/index']).toBeDefined();
+    expect(output['chat/index'].type).toBe('Prerender');
+    expect(output['chat/index'].lambda).toBeDefined();
+    expect(output['chat/index'].lambda.type).toBe('Lambda');
+
+    expect(output['chat/index'].chain?.outputPath).toBe('chat/index');
+    expect(output['chat/index'].chain?.headers).toEqual({
+      'next-resume': '1',
+    });
+  });
+
+  describe('root params', () => {
+    it('should not generate a prerender for the missing root params route', async () => {
+      const {
+        buildResult: { output },
+      } = await runBuildLambda(path.join(__dirname, 'ppr-root-params'));
+
+      expect(output['[lang]']).toBeDefined();
+      expect(output['[lang]'].type).toBe('Prerender');
+
+      // We want this to be a chainable prerender (supports Partial
+      // Prerendering).
+      expect(output['[lang]'].chain).toBeDefined();
+
+      // TODO: once we support revalidating this page, we should remove this
+      // We don't want to generate a fallback for this route. If this case fails
+      // it indicates that the fallback was generated, and we're at risk of
+      // cache posioning.
+      expect(output['[lang]'].fallback).toEqual(null);
+    });
+
+    it('should attach segment fallbacks when client param parsing is enabled', async () => {
+      const {
+        buildResult: { output },
+      } = await runBuildLambda(path.join(__dirname, 'ppr-root-params'));
+
+      const segmentKeys = Object.keys(output).filter(
+        key =>
+          key.includes('[lang]/skills/[skill].segments/') &&
+          key.endsWith('.segment.rsc')
+      );
+
+      expect(segmentKeys.length).toBeGreaterThan(0);
+
+      for (const key of segmentKeys) {
+        expect(output[key].type).toBe('Prerender');
+        expect(output[key].fallback).toBeDefined();
+        expect(output[key].fallback).not.toBeNull();
+        expect(output[key].fallback.fsPath).toBeDefined();
+      }
+    });
+  });
+
+  it('should still support getStaticProps', async () => {
+    const {
+      buildResult: { output },
+    } = await runBuildLambda(path.join(__dirname, 'ppr-gsp'));
+
+    const html = output['gsp'];
+    expect(html).toBeDefined();
+    expect(html.type).toBe('FileFsRef');
+    expect(html.fsPath.endsWith('.next/server/pages/gsp.html')).toBe(true);
+
+    const data = Object.entries(output).find(
+      ([k]) => k.startsWith('_next/data/') && k.endsWith('/gsp.json')
+    );
+    expect(data).toBeDefined();
+    expect(data[1].type).toBe('FileFsRef');
+    expect(data[1].fsPath.endsWith('.next/server/pages/gsp.json')).toBe(true);
+  });
+});
+
+describe('rewrite headers', () => {
+  let routes;
+  beforeAll(async () => {
+    const output = await runBuildLambda(
+      path.join(__dirname, 'rewrite-headers')
+    );
+    routes = output.buildResult.routes;
+  });
+
+  it('should add rewrite headers to the original rewrite', () => {
+    let route = routes.filter(r => r.src?.includes('/hello/sam'));
+    expect(route.length).toBe(1);
+    expect(route[0].headers).toEqual({
+      'x-nextjs-rewritten-path': '/hello/samantha',
+      'x-nextjs-rewritten-query': undefined,
+    });
+  });
+
+  it('should add rewrite query headers', () => {
+    let route = routes.filter(r => r.src?.includes('/hello/fred'));
+    expect(route.length).toBe(1);
+    expect(route[0].headers).toEqual({
+      'x-nextjs-rewritten-path': '/other',
+      'x-nextjs-rewritten-query': 'key=value',
+    });
+  });
+
+  it('should not add external rewrite headers', () => {
+    const route = routes.filter(r => r.src?.includes('google'));
+    expect(route.length).toBe(1);
+    expect(route[0].headers).toBeUndefined();
+  });
+
+  it('should strip the hash from the rewritten path', () => {
+    const route = routes.filter(r => r.src?.includes('suffix'));
+    expect(route.length).toBe(1);
+    expect(route[0].headers).toEqual({
+      'x-nextjs-rewritten-path': '/$1',
+      'x-nextjs-rewritten-query': 'suffix=$1',
+    });
+  });
+});
+
+describe('rewrite headers with rewrite', () => {
+  let routes;
+  beforeAll(async () => {
+    const output = await runBuildLambda(
+      path.join(__dirname, 'rewrite-headers-with-rewrite')
+    );
+    routes = output.buildResult.routes;
+  });
+
+  it('should add rewrite headers to the original rewrite', () => {
+    let route = routes.filter(r => r.headers?.['x-nextjs-rewritten-path']);
+    expect(route.length).toBe(1);
+
+    expect(route[0].headers).toEqual({
+      'x-nextjs-rewritten-path': '/$1/landing',
+      'x-nextjs-rewritten-query': undefined,
+    });
+  });
+});
+
+describe('cache-control', () => {
+  /**
+   * @type {import('@vercel/build-utils').BuildResultV2Typical}
+   */
+  let buildResult;
+
+  beforeAll(async () => {
+    const result = await runBuildLambda(path.join(__dirname, 'use-cache'));
+    buildResult = result.buildResult;
+  });
+
+  it('should add expiration and staleExpiration values for ISR routes with "use cache"', async () => {
+    const { output } = buildResult;
+    const outputEntry = output['index'];
+
+    if (outputEntry.type !== 'Prerender') {
+      throw new Error('Unexpected output type ' + outputEntry.type);
+    }
+
+    // cache life profile "weeks"
+    expect(outputEntry.expiration).toBe(604800); // 1 week
+    expect(outputEntry.staleExpiration).toBe(2592000); // 30 days
+  });
+
+  it('should add expiration and staleExpiration values for PPR fallback routes with "use cache"', async () => {
+    const { output } = buildResult;
+    const outputEntry = output['[slug]'];
+
+    if (outputEntry.type !== 'Prerender') {
+      throw new Error('Unexpected output type ' + outputEntry.type);
+    }
+
+    // this uses default expiration as fallbacks don't have cacheLife
+    // applied to them
+    expect(outputEntry.expiration).toBe(1);
+  });
+
+  it('should not add a staleExpiration value for static routes', async () => {
+    const { output } = buildResult;
+    const outputEntry = output['static'];
+
+    if (outputEntry.type !== 'Prerender') {
+      throw new Error('Unexpected output type ' + outputEntry.type);
+    }
+
+    expect(outputEntry.expiration).toBe(false);
+    expect(outputEntry.staleExpiration).toBeUndefined();
+  });
+});
+
+describe('action-headers', () => {
+  /**
+   * @type {import('@vercel/build-utils').BuildResultV2Typical}
+   */
+  let buildResult;
+
+  beforeAll(async () => {
+    const result = await runBuildLambda(
+      path.join(__dirname, '../fixtures/00-app-dir-actions')
+    );
+    buildResult = result.buildResult;
+  });
+
+  it('should add action name meta routes', async () => {
+    const foundActionNames = [];
+
+    for (const route of buildResult.routes || []) {
+      if (route.has?.[0].key === 'next-action' && route.transforms) {
+        foundActionNames.push(route.transforms[0].args);
+      }
+    }
+    expect(foundActionNames.length).toBe(5);
+    expect(foundActionNames.sort()).toMatchSnapshot();
+  });
+
+  it('should set rather than append the action name', async () => {
+    const ops = new Set(
+      (buildResult.routes || [])
+        .filter(route => route.has?.[0].key === 'next-action')
+        .flatMap(route => route.transforms.map(({ op }) => op))
+    );
+
+    // `append` would preserve a client-supplied `x-server-action-name`
+    // alongside the resolved name.
+    expect([...ops]).toEqual(['set']);
+  });
+});
+
+describe('action-headers with an action shared across runtimes', () => {
+  /**
+   * @type {import('@vercel/build-utils').BuildResultV2Typical}
+   */
+  let buildResult;
+
+  beforeAll(async () => {
+    const result = await runBuildLambda(
+      path.join(__dirname, 'app-dir-actions-shared-runtime')
+    );
+    buildResult = result.buildResult;
+  });
+
+  it('should only route each action id once', async () => {
+    const foundActionIds = (buildResult.routes || [])
+      .filter(route => route.has?.[0].key === 'next-action')
+      .map(route => route.has[0].value);
+
+    // `app/counter.js` is rendered by both a Node and an Edge page, so
+    // `increment` is listed in both the `node` and `edge` maps of the server
+    // reference manifest under the same id. Routing it twice would match a
+    // single request twice and add `x-server-action-name` twice.
+    expect(foundActionIds.length).toBeGreaterThan(0);
+    expect(foundActionIds).toEqual([...new Set(foundActionIds)]);
+  });
+});
+
+describe('determinism', () => {
+  /**
+   * @type {import('@vercel/build-utils').BuildResultV2Typical}
+   */
+  let buildResult;
+  let workPath;
+
+  describe('with pages/404', () => {
+    beforeAll(async () => {
+      const oldValue = process.env.NEXT_DEPLOYMENT_ID;
+      try {
+        process.env.NEXT_DEPLOYMENT_ID = '123456789';
+        const result = await runBuildLambda(
+          path.join(__dirname, '../fixtures/00-app-dir-not-found-pages-interop')
+        );
+        ({ buildResult, workPath } = result);
+      } finally {
+        process.env.NEXT_DEPLOYMENT_ID = oldValue;
+      }
+    });
+
+    it('should not include prerenders in functions lambdas', async () => {
+      for (const entry of Object.values(buildResult.output)) {
+        if (entry.type === 'Lambda' || entry.type === 'EdgeFunction') {
+          expect(Object.keys(entry.files)).not.toContainEqual(
+            expect.stringMatching(/\.html$|.rsc$/)
+          );
+        }
+      }
+    });
+
+    it('should strip routes-manifest', async () => {
+      let originalManifest = JSON.parse(
+        await fs.readFile(
+          path.join(workPath, '.next', 'routes-manifest.json'),
+          'utf8'
+        )
+      );
+      expect(originalManifest.deploymentId).toBeDefined();
+
+      for (const entry of Object.values(buildResult.output)) {
+        if (entry.type === 'Lambda' || entry.type === 'EdgeFunction') {
+          const manifest = entry.files['.next/routes-manifest.json'];
+          if (manifest) {
+            expect(manifest.type).toBe('FileBlob');
+            let parsed = JSON.parse(manifest.data);
+            expect(parsed.deploymentId).toBeUndefined();
+            expect(parsed.headers.length).toBe(0);
+            expect(parsed.onMatchHeaders.length).toBe(0);
+          }
+        }
+      }
+    });
+  });
+
+  describe('without pages/404', () => {
+    beforeAll(async () => {
+      const oldValue = process.env.NEXT_DEPLOYMENT_ID;
+      try {
+        process.env.NEXT_DEPLOYMENT_ID = '123456789';
+        const result = await runBuildLambda(
+          path.join(__dirname, '../fixtures/00-app-dir-not-found')
+        );
+        ({ buildResult, workPath } = result);
+      } finally {
+        process.env.NEXT_DEPLOYMENT_ID = oldValue;
+      }
+    });
+
+    it('should not include prerenders in functions lambdas', async () => {
+      for (const entry of Object.values(buildResult.output)) {
+        if (entry.type === 'Lambda' || entry.type === 'EdgeFunction') {
+          expect(Object.keys(entry.files)).not.toContainEqual(
+            expect.stringMatching(/\.html$|.rsc$/)
+          );
+        }
+      }
+    });
+  });
+});
+
+describe('preferredRegion', () => {
+  let buildResult;
+
+  beforeAll(async () => {
+    const result = await runBuildLambda(
+      path.join(__dirname, 'preferred-region')
+    );
+    buildResult = result.buildResult;
+  });
+
+  describe('edge runtime', () => {
+    it('should set regions to undefined for "home" when VERCEL_FUNCTION_REGIONS is not set', () => {
+      const edgeFunction = buildResult.output['edge-home'];
+      expect(edgeFunction).toBeDefined();
+      expect(edgeFunction.type).toBe('EdgeFunction');
+      expect(edgeFunction.regions).toBeUndefined();
+    });
+
+    it('should set regions to "all" for "global"', () => {
+      const edgeFunction = buildResult.output['edge-global'];
+      expect(edgeFunction).toBeDefined();
+      expect(edgeFunction.type).toBe('EdgeFunction');
+      expect(edgeFunction.regions).toBe('all');
+    });
+
+    it('should set regions to "auto" for "auto"', () => {
+      const edgeFunction = buildResult.output['edge-auto'];
+      expect(edgeFunction).toBeDefined();
+      expect(edgeFunction.type).toBe('EdgeFunction');
+      expect(edgeFunction.regions).toBe('auto');
+    });
+
+    it('should pass through specific region codes', () => {
+      const edgeFunction = buildResult.output['edge-specific'];
+      expect(edgeFunction).toBeDefined();
+      expect(edgeFunction.type).toBe('EdgeFunction');
+      expect(edgeFunction.regions).toEqual(['iad1', 'sfo1']);
+    });
+  });
+
+  describe('node runtime', () => {
+    // Note: preferredRegion for Node.js functions is not yet passed through
+    // to the Lambda's regions property. When this is implemented, these tests
+    // should be updated to assert the expected regions values.
+
+    it('should create Lambda for node runtime with home region', () => {
+      const lambda = buildResult.output['node-home'];
+      expect(lambda).toBeDefined();
+      expect(lambda.type).toBe('Lambda');
+      expect(lambda.regions).toBeUndefined();
+    });
+
+    it('should create Lambda for node runtime with global region', () => {
+      const lambda = buildResult.output['node-global'];
+      expect(lambda).toBeDefined();
+      expect(lambda.type).toBe('Lambda');
+      expect(lambda.regions).toBeUndefined();
+    });
+
+    it('should create Lambda for node runtime with auto region', () => {
+      const lambda = buildResult.output['node-auto'];
+      expect(lambda).toBeDefined();
+      expect(lambda.type).toBe('Lambda');
+      expect(lambda.regions).toBeUndefined();
+    });
+
+    it('should create Lambda for node runtime with specific regions', () => {
+      const lambda = buildResult.output['node-specific'];
+      expect(lambda).toBeDefined();
+      expect(lambda.type).toBe('Lambda');
+      expect(lambda.regions).toBeUndefined();
+    });
+  });
+});
+
+describe('vercel.json functions regions', () => {
+  let buildResult;
+
+  beforeAll(async () => {
+    const result = await runBuildLambda(
+      path.join(__dirname, 'vercel-json-regions')
+    );
+    buildResult = result.buildResult;
+  });
+
+  it('should use vercel.json functions regions over preferredRegion and regions from route config', () => {
+    const lambda = buildResult.output['api-route'];
+    expect(lambda).toBeDefined();
+    expect(lambda.type).toBe('Lambda');
+    expect(lambda.regions).toEqual(['iad1', 'sfo1']);
+    expect(lambda.functionFailoverRegions).toEqual(['dub1', 'hnd1']);
+  });
+
+  it('should ignore preferredRegion and regions from route config when no vercel.json functions config', () => {
+    const lambda = buildResult.output['no-override'];
+    expect(lambda).toBeDefined();
+    expect(lambda.type).toBe('Lambda');
+    expect(lambda.regions).toBeUndefined();
+    expect(lambda.functionFailoverRegions).toBeUndefined();
+  });
+
+  it('should not set regions on routes without any config', () => {
+    const output = buildResult.output['index'] || buildResult.output[''];
+    if (output && output.type === 'Lambda') {
+      expect(output.regions).toBeUndefined();
+    }
+  });
+});
+
+describe('vercel.json functions regions with glob pattern', () => {
+  let buildResult;
+
+  beforeAll(async () => {
+    const result = await runBuildLambda(
+      path.join(__dirname, 'vercel-json-regions-glob')
+    );
+    buildResult = result.buildResult;
+  });
+
+  it('should match multiple routes with glob pattern', () => {
+    const lambdaOne = buildResult.output['api-one'];
+    expect(lambdaOne).toBeDefined();
+    expect(lambdaOne.type).toBe('Lambda');
+    expect(lambdaOne.regions).toEqual(['iad1']);
+
+    const lambdaTwo = buildResult.output['api-two'];
+    expect(lambdaTwo).toBeDefined();
+    expect(lambdaTwo.type).toBe('Lambda');
+    expect(lambdaTwo.regions).toEqual(['iad1']);
+  });
+
+  it('should not match routes outside the glob pattern', () => {
+    const output = buildResult.output['index'] || buildResult.output[''];
+    if (output && output.type === 'Lambda') {
+      expect(output.regions).toBeUndefined();
+    }
+  });
+});

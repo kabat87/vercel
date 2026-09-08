@@ -1,0 +1,23 @@
+[
+  {
+    "handle": "filesystem"
+  },
+  {
+    "src": "^(?:\\/users\\/([^\\/]+))(?:\\/$)?$",
+    "dest": "/users/:id",
+    "methods": [
+      "GET"
+    ]
+  },
+  {
+    "src": "/(.*)",
+    "dest": "/",
+    "transforms": [
+      {
+        "type": "request.path",
+        "op": "set",
+        "args": "/$1"
+      }
+    ]
+  }
+]

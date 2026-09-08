@@ -1,0 +1,792 @@
+# @vercel/koa
+
+## 7.0.1
+
+### Patch Changes
+
+- Updated dependencies [1817491]
+  - @vercel/build-utils@14.9.1
+  - @vercel/node@12.0.1
+
+## 7.0.0
+
+### Patch Changes
+
+- Updated dependencies [392c759]
+  - @vercel/build-utils@14.9.0
+  - @vercel/node@12.0.0
+
+## 6.0.0
+
+### Patch Changes
+
+- Updated dependencies [a652a99]
+  - @vercel/build-utils@14.8.0
+  - @vercel/node@11.0.0
+
+## 5.0.0
+
+### Patch Changes
+
+- Updated dependencies [26b891e]
+- Updated dependencies [37ff9da]
+  - @vercel/build-utils@14.7.0
+  - @vercel/node@10.0.0
+
+## 4.0.1
+
+### Patch Changes
+
+- Updated dependencies [aad9541]
+  - @vercel/build-utils@14.6.1
+  - @vercel/node@9.0.1
+
+## 4.0.0
+
+### Patch Changes
+
+- Updated dependencies [e82de48]
+  - @vercel/build-utils@14.6.0
+  - @vercel/node@9.0.0
+
+## 3.0.3
+
+### Patch Changes
+
+- Updated dependencies [b9e12f0]
+  - @vercel/static-config@3.4.3
+  - @vercel/node@8.1.2
+
+## 3.0.2
+
+### Patch Changes
+
+- Updated dependencies [a443e57]
+  - @vercel/build-utils@14.5.1
+  - @vercel/node@8.1.1
+
+## 3.0.1
+
+### Patch Changes
+
+- Updated dependencies [44be84d]
+- Updated dependencies [2c363fd]
+  - @vercel/node@8.1.0
+  - @vercel/static-config@3.4.2
+
+## 3.0.0
+
+### Minor Changes
+
+- 90afd71: Expose the resolved rewrite destination as the request path observed by Node backend framework applications (express, hono, h3, koa, nestjs, fastify, elysia) and the unified backends builder, and warn affected backend projects about the behavior change.
+
+### Patch Changes
+
+- Updated dependencies [90afd71]
+  - @vercel/build-utils@14.5.0
+  - @vercel/node@8.0.0
+
+## 2.0.1
+
+### Patch Changes
+
+- Updated dependencies [1c3e6e9]
+- Updated dependencies [e5b0363]
+  - @vercel/node@7.0.1
+  - @vercel/build-utils@14.4.1
+
+## 2.0.0
+
+### Patch Changes
+
+- Updated dependencies [f8add0a]
+  - @vercel/build-utils@14.4.0
+  - @vercel/node@7.0.0
+
+## 1.0.0
+
+### Patch Changes
+
+- 0d71a61: Declare `@vercel/build-utils` as a peer dependency provided by Vercel CLI so builders load correctly with strict dependency isolation, including pnpm global installs.
+- Updated dependencies [0b08df6]
+- Updated dependencies [cd6b038]
+- Updated dependencies [0d71a61]
+- Updated dependencies [96444ba]
+  - @vercel/build-utils@14.3.0
+  - @vercel/node@6.0.0
+
+## 0.1.99
+
+### Patch Changes
+
+- @vercel/node@5.10.2
+
+## 0.1.98
+
+### Patch Changes
+
+- Updated dependencies [b4f09c1]
+  - @vercel/node@5.10.1
+
+## 0.1.97
+
+### Patch Changes
+
+- Updated dependencies [852e1a0]
+  - @vercel/node@5.10.0
+
+## 0.1.96
+
+### Patch Changes
+
+- Updated dependencies [2da7809]
+  - @vercel/node@5.9.9
+
+## 0.1.95
+
+### Patch Changes
+
+- Updated dependencies [e829b31]
+  - @vercel/node@5.9.8
+
+## 0.1.94
+
+### Patch Changes
+
+- @vercel/node@5.9.7
+
+## 0.1.93
+
+### Patch Changes
+
+- @vercel/node@5.9.6
+
+## 0.1.92
+
+### Patch Changes
+
+- 6d7fbfa: Bump all workspace packages to trigger a full publish from vercel-internal.
+- Updated dependencies [6d7fbfa]
+  - @vercel/node@5.9.5
+  - @vercel/static-config@3.4.1
+
+## 0.1.91
+
+### Patch Changes
+
+- @vercel/node@5.9.4
+
+## 0.1.90
+
+### Patch Changes
+
+- @vercel/node@5.9.3
+
+## 0.1.89
+
+### Patch Changes
+
+- @vercel/node@5.9.2
+
+## 0.1.88
+
+### Patch Changes
+
+- @vercel/node@5.9.1
+
+## 0.1.87
+
+### Patch Changes
+
+- Updated dependencies [4502520]
+  - @vercel/node@5.9.0
+
+## 0.1.86
+
+### Patch Changes
+
+- @vercel/node@5.8.27
+
+## 0.1.85
+
+### Patch Changes
+
+- @vercel/node@5.8.26
+
+## 0.1.84
+
+### Patch Changes
+
+- @vercel/node@5.8.25
+
+## 0.1.83
+
+### Patch Changes
+
+- @vercel/node@5.8.24
+
+## 0.1.82
+
+### Patch Changes
+
+- @vercel/node@5.8.23
+
+## 0.1.81
+
+### Patch Changes
+
+- @vercel/node@5.8.22
+
+## 0.1.80
+
+### Patch Changes
+
+- @vercel/node@5.8.21
+
+## 0.1.79
+
+### Patch Changes
+
+- @vercel/node@5.8.20
+
+## 0.1.78
+
+### Patch Changes
+
+- Updated dependencies [2158ab6]
+  - @vercel/node@5.8.19
+
+## 0.1.77
+
+### Patch Changes
+
+- @vercel/node@5.8.18
+
+## 0.1.76
+
+### Patch Changes
+
+- @vercel/node@5.8.17
+
+## 0.1.75
+
+### Patch Changes
+
+- @vercel/node@5.8.16
+
+## 0.1.74
+
+### Patch Changes
+
+- @vercel/node@5.8.15
+
+## 0.1.73
+
+### Patch Changes
+
+- @vercel/node@5.8.14
+
+## 0.1.72
+
+### Patch Changes
+
+- @vercel/node@5.8.13
+
+## 0.1.71
+
+### Patch Changes
+
+- @vercel/node@5.8.12
+
+## 0.1.70
+
+### Patch Changes
+
+- @vercel/node@5.8.11
+
+## 0.1.69
+
+### Patch Changes
+
+- @vercel/node@5.8.10
+
+## 0.1.68
+
+### Patch Changes
+
+- @vercel/node@5.8.9
+
+## 0.1.67
+
+### Patch Changes
+
+- Updated dependencies [ab0e5aa]
+  - @vercel/node@5.8.8
+
+## 0.1.66
+
+### Patch Changes
+
+- @vercel/node@5.8.7
+
+## 0.1.65
+
+### Patch Changes
+
+- Updated dependencies [eecd10d]
+  - @vercel/static-config@3.4.0
+  - @vercel/node@5.8.6
+
+## 0.1.64
+
+### Patch Changes
+
+- Updated dependencies [ecf5033]
+  - @vercel/node@5.8.5
+
+## 0.1.63
+
+### Patch Changes
+
+- @vercel/node@5.8.4
+
+## 0.1.62
+
+### Patch Changes
+
+- @vercel/node@5.8.3
+
+## 0.1.61
+
+### Patch Changes
+
+- @vercel/node@5.8.2
+
+## 0.1.60
+
+### Patch Changes
+
+- @vercel/node@5.8.1
+
+## 0.1.59
+
+### Patch Changes
+
+- Updated dependencies [22f77b9]
+  - @vercel/node@5.8.0
+
+## 0.1.58
+
+### Patch Changes
+
+- Updated dependencies [f0d7d32]
+  - @vercel/node@5.7.17
+
+## 0.1.57
+
+### Patch Changes
+
+- Updated dependencies [94c29b8]
+  - @vercel/node@5.7.16
+
+## 0.1.56
+
+### Patch Changes
+
+- Updated dependencies [f7b5377]
+  - @vercel/node@5.7.15
+
+## 0.1.55
+
+### Patch Changes
+
+- Updated dependencies [c56f851]
+  - @vercel/static-config@3.3.0
+  - @vercel/node@5.7.14
+
+## 0.1.54
+
+### Patch Changes
+
+- Updated dependencies []:
+  - @vercel/node@5.7.13
+
+## 0.1.53
+
+### Patch Changes
+
+- Updated dependencies []:
+  - @vercel/node@5.7.12
+
+## 0.1.52
+
+### Patch Changes
+
+- Updated dependencies []:
+  - @vercel/node@5.7.11
+
+## 0.1.51
+
+### Patch Changes
+
+- Updated dependencies []:
+  - @vercel/node@5.7.10
+
+## 0.1.50
+
+### Patch Changes
+
+- Updated dependencies []:
+  - @vercel/node@5.7.9
+
+## 0.1.49
+
+### Patch Changes
+
+- Updated dependencies []:
+  - @vercel/node@5.7.8
+
+## 0.1.48
+
+### Patch Changes
+
+- Updated dependencies [[`16aca7dadcea2f877ffae79afa72c14a95f682e3`](https://github.com/vercel/vercel/commit/16aca7dadcea2f877ffae79afa72c14a95f682e3)]:
+  - @vercel/node@5.7.7
+
+## 0.1.47
+
+### Patch Changes
+
+- Updated dependencies []:
+  - @vercel/node@5.7.6
+
+## 0.1.46
+
+### Patch Changes
+
+- Updated dependencies []:
+  - @vercel/node@5.7.5
+
+## 0.1.45
+
+### Patch Changes
+
+- Updated dependencies []:
+  - @vercel/node@5.7.4
+
+## 0.1.44
+
+### Patch Changes
+
+- Updated dependencies []:
+  - @vercel/node@5.7.3
+
+## 0.1.43
+
+### Patch Changes
+
+- Updated dependencies []:
+  - @vercel/node@5.7.2
+
+## 0.1.42
+
+### Patch Changes
+
+- Updated dependencies []:
+  - @vercel/node@5.7.1
+
+## 0.1.41
+
+### Patch Changes
+
+- Updated dependencies [[`aa3ad226ef7b4ab98ef97e15f81c91f4f7c527e9`](https://github.com/vercel/vercel/commit/aa3ad226ef7b4ab98ef97e15f81c91f4f7c527e9)]:
+  - @vercel/node@5.7.0
+
+## 0.1.40
+
+### Patch Changes
+
+- Updated dependencies []:
+  - @vercel/node@5.6.24
+
+## 0.1.39
+
+### Patch Changes
+
+- Updated dependencies []:
+  - @vercel/node@5.6.23
+
+## 0.1.38
+
+### Patch Changes
+
+- Updated dependencies []:
+  - @vercel/node@5.6.22
+
+## 0.1.37
+
+### Patch Changes
+
+- Updated dependencies []:
+  - @vercel/node@5.6.21
+
+## 0.1.36
+
+### Patch Changes
+
+- Updated dependencies [[`69cd8ea307f507037fe735d7ba09c58fb4193e13`](https://github.com/vercel/vercel/commit/69cd8ea307f507037fe735d7ba09c58fb4193e13)]:
+  - @vercel/node@5.6.20
+
+## 0.1.35
+
+### Patch Changes
+
+- Updated dependencies []:
+  - @vercel/node@5.6.19
+
+## 0.1.34
+
+### Patch Changes
+
+- Updated dependencies [[`bb5277ab85e41810f96d1619949d76ea5603a58f`](https://github.com/vercel/vercel/commit/bb5277ab85e41810f96d1619949d76ea5603a58f)]:
+  - @vercel/node@5.6.18
+
+## 0.1.33
+
+### Patch Changes
+
+- Updated dependencies []:
+  - @vercel/node@5.6.17
+
+## 0.1.32
+
+### Patch Changes
+
+- Updated dependencies []:
+  - @vercel/node@5.6.16
+
+## 0.1.31
+
+### Patch Changes
+
+- Updated dependencies [[`8a3558f680d592b4ea47ac7e48c99145d6368941`](https://github.com/vercel/vercel/commit/8a3558f680d592b4ea47ac7e48c99145d6368941)]:
+  - @vercel/static-config@3.2.0
+  - @vercel/node@5.6.15
+
+## 0.1.30
+
+### Patch Changes
+
+- Updated dependencies []:
+  - @vercel/node@5.6.14
+
+## 0.1.29
+
+### Patch Changes
+
+- Updated dependencies []:
+  - @vercel/node@5.6.13
+
+## 0.1.28
+
+### Patch Changes
+
+- Updated dependencies []:
+  - @vercel/node@5.6.12
+
+## 0.1.27
+
+### Patch Changes
+
+- Updated dependencies []:
+  - @vercel/node@5.6.11
+
+## 0.1.26
+
+### Patch Changes
+
+- Updated dependencies []:
+  - @vercel/node@5.6.10
+
+## 0.1.25
+
+### Patch Changes
+
+- Updated dependencies []:
+  - @vercel/node@5.6.9
+
+## 0.1.24
+
+### Patch Changes
+
+- Updated dependencies [[`3d872692c601abeec98743d2af3a3ea19587e799`](https://github.com/vercel/vercel/commit/3d872692c601abeec98743d2af3a3ea19587e799)]:
+  - @vercel/node@5.6.8
+
+## 0.1.23
+
+### Patch Changes
+
+- Updated dependencies []:
+  - @vercel/node@5.6.7
+
+## 0.1.22
+
+### Patch Changes
+
+- Updated dependencies []:
+  - @vercel/node@5.6.6
+
+## 0.1.21
+
+### Patch Changes
+
+- Updated dependencies []:
+  - @vercel/node@5.6.5
+
+## 0.1.20
+
+### Patch Changes
+
+- Updated dependencies []:
+  - @vercel/node@5.6.4
+
+## 0.1.19
+
+### Patch Changes
+
+- Updated dependencies []:
+  - @vercel/node@5.6.3
+
+## 0.1.18
+
+### Patch Changes
+
+- Updated dependencies []:
+  - @vercel/node@5.6.2
+
+## 0.1.17
+
+### Patch Changes
+
+- Updated dependencies []:
+  - @vercel/node@5.6.1
+
+## 0.1.16
+
+### Patch Changes
+
+- Updated dependencies [[`2edb2843d99bdfa4bf4697826a5f6eeedccdef78`](https://github.com/vercel/vercel/commit/2edb2843d99bdfa4bf4697826a5f6eeedccdef78)]:
+  - @vercel/node@5.6.0
+
+## 0.1.15
+
+### Patch Changes
+
+- Updated dependencies [[`f708ca65bccf6942bcd8501f34101e659aa256d6`](https://github.com/vercel/vercel/commit/f708ca65bccf6942bcd8501f34101e659aa256d6)]:
+  - @vercel/node@5.5.33
+
+## 0.1.14
+
+### Patch Changes
+
+- Updated dependencies []:
+  - @vercel/node@5.5.32
+
+## 0.1.13
+
+### Patch Changes
+
+- Updated dependencies []:
+  - @vercel/node@5.5.31
+
+## 0.1.12
+
+### Patch Changes
+
+- Updated dependencies []:
+  - @vercel/node@5.5.30
+
+## 0.1.11
+
+### Patch Changes
+
+- Updated dependencies []:
+  - @vercel/node@5.5.29
+
+## 0.1.10
+
+### Patch Changes
+
+- Updated dependencies []:
+  - @vercel/node@5.5.28
+
+## 0.1.9
+
+### Patch Changes
+
+- Updated dependencies []:
+  - @vercel/node@5.5.27
+
+## 0.1.8
+
+### Patch Changes
+
+- Updated dependencies []:
+  - @vercel/node@5.5.26
+
+## 0.1.7
+
+### Patch Changes
+
+- Updated dependencies []:
+  - @vercel/node@5.5.25
+
+## 0.1.6
+
+### Patch Changes
+
+- Updated dependencies []:
+  - @vercel/node@5.5.24
+
+## 0.1.5
+
+### Patch Changes
+
+- Updated dependencies []:
+  - @vercel/node@5.5.23
+
+## 0.1.4
+
+### Patch Changes
+
+- Updated dependencies []:
+  - @vercel/node@5.5.22
+
+## 0.1.3
+
+### Patch Changes
+
+- Updated dependencies [[`74a6b49c53a5cee731c89437b06fc875731c0a87`](https://github.com/vercel/vercel/commit/74a6b49c53a5cee731c89437b06fc875731c0a87)]:
+  - @vercel/node@5.5.21
+
+## 0.1.2
+
+### Patch Changes
+
+- Updated dependencies [[`92fe2dfd81c617fb733fec95a2547024d120a408`](https://github.com/vercel/vercel/commit/92fe2dfd81c617fb733fec95a2547024d120a408)]:
+  - @vercel/node@5.5.20
+
+## 0.1.1
+
+### Patch Changes
+
+- Add zero-config support for Koa.js ([#14567](https://github.com/vercel/vercel/pull/14567))
+
+- Updated dependencies [[`b7fe57260459697e7bb16fabde80f4caf147aec4`](https://github.com/vercel/vercel/commit/b7fe57260459697e7bb16fabde80f4caf147aec4)]:
+  - @vercel/node@5.5.19
+
+## 0.1.0
+
+### Minor Changes
+
+- Add Koa framework support with zero-config deployment

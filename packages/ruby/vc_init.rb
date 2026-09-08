@@ -3,19 +3,25 @@ require 'webrick'
 require 'net/http'
 require 'base64'
 require 'json'
+require_relative 'vc__utils__ruby'
 
 $entrypoint = '__VC_HANDLER_FILENAME'
 
 ENV['RAILS_ENV'] ||= 'production'
+ENV['RACK_ENV'] ||= 'production'
 ENV['RAILS_LOG_TO_STDOUT'] ||= '1'
 
-def rack_handler(httpMethod, path, body, headers)
+
+$service_route_prefix = resolve_service_route_prefix
+
+def rack_handler(httpMethod, path, body, headers, script_name = '')
   require 'rack'
 
   app, _ = Rack::Builder.parse_file($entrypoint)
   server = Rack::MockRequest.new app
 
   env = headers.transform_keys { |k| k.split('-').join('_').prepend('HTTP_').upcase }
+  env['SCRIPT_NAME'] = script_name unless script_name.empty?
   res = server.request(httpMethod, path, env.merge({ :input => body }))
 
   {
@@ -60,7 +66,7 @@ def webrick_handler(httpMethod, path, body, headers)
   server.shutdown
   Thread.kill(th)
 
-  # Net::HTTP doesnt read the set the encoding so we must set manually.
+  # Net::HTTP doesn't read the set the encoding so we must set manually.
   # Bug: https://bugs.ruby-lang.org/issues/15517
   # More: https://yehudakatz.com/2010/05/17/encodings-unabridged/
   res_headers = res.each_capitalized.to_h
@@ -73,7 +79,7 @@ def webrick_handler(httpMethod, path, body, headers)
   {
     :statusCode => res.code.to_i,
     :headers => res_headers,
-    :body => res.body,
+    :body => res.body.nil? ? "" : res.body,
   }
 end
 
@@ -81,6 +87,12 @@ def vc__handler(event:, context:)
   payload = JSON.parse(event['body'])
   path = payload['path']
   headers = payload['headers']
+
+  if ENV['VERCEL_DEBUG']
+    puts 'Request Headers: '
+    puts headers
+  end
+
   httpMethod = payload['method']
   encoding = payload['encoding']
   body = payload['body']
@@ -89,8 +101,13 @@ def vc__handler(event:, context:)
     body = Base64.decode64(body)
   end
 
+  path, script_name = apply_service_route_prefix_to_target(
+    path,
+    $service_route_prefix
+  )
+
   if $entrypoint.end_with? '.ru'
-    return rack_handler(httpMethod, path, body, headers)
+    return rack_handler(httpMethod, path, body, headers, script_name)
   end
 
   return webrick_handler(httpMethod, path, body, headers)

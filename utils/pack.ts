@@ -1,0 +1,242 @@
+import execa from 'execa';
+import path from 'path';
+import fs from 'fs-extra';
+import { TurboDryRun } from './types';
+import {
+  hoistRegistryDependenciesFromWorkspaceTarballs,
+  pinWorkspacePeerDependencies,
+  selectPackageTasks,
+} from './pack-task-selection';
+const { getPythonPackages } = require('./get-python-packages.js');
+const { previewTarballFilename } = require('./preview-tarball-filename.js');
+
+const rootDir = path.join(__dirname, '..');
+const ignoredPackages = ['api', 'examples'];
+const pythonWheelPackages = getPythonPackages(rootDir).map(
+  (pkg: {
+    packageDir: string;
+    projectDir: string;
+    label: string;
+    nodePackageName: string;
+  }) => ({
+    packageDir: pkg.packageDir,
+    tag: `${pkg.nodePackageName}@*`,
+    packagePath: pkg.projectDir,
+    packageLabel: pkg.label,
+  })
+);
+
+function getTarballBaseUrl(): string {
+  if (process.env.VERCEL_TARBALL_BASE_URL) {
+    return process.env.VERCEL_TARBALL_BASE_URL.replace(/\/$/, '');
+  }
+  return `https://${process.env.VERCEL_URL}/tarballs`;
+}
+
+async function main() {
+  const sha = await getSha();
+  const tarballBaseUrl = getTarballBaseUrl();
+
+  const { stdout: turboStdout } = await execa(
+    'turbo',
+    ['run', 'build:package', '--dry=json'],
+    {
+      cwd: rootDir,
+    }
+  );
+  const turboJson: TurboDryRun = JSON.parse(turboStdout);
+  const packageTasks = selectPackageTasks(turboJson.tasks);
+  const workspaceVersions = new Map<string, string>();
+  const workspaceDependencies = new Map<string, Record<string, string>>();
+  for (const task of packageTasks) {
+    const packageJsonPath = path.join(rootDir, task.directory, 'package.json');
+    if (await fs.pathExists(packageJsonPath)) {
+      const packageObj = await fs.readJson(packageJsonPath);
+      if (packageObj.name === task.package && packageObj.version) {
+        workspaceVersions.set(packageObj.name, packageObj.version);
+        if (packageObj.dependencies) {
+          workspaceDependencies.set(packageObj.name, packageObj.dependencies);
+        }
+      }
+    }
+  }
+
+  for (const task of packageTasks) {
+    if (ignoredPackages.includes(task.directory)) {
+      continue;
+    }
+
+    const dir = path.join(rootDir, task.directory);
+    const packageJsonPath = path.join(dir, 'package.json');
+    if (!(await fs.pathExists(packageJsonPath))) {
+      continue;
+    }
+    const originalPackageObj = await fs.readJson(packageJsonPath);
+    if (originalPackageObj.name !== task.package) {
+      continue;
+    }
+    const packageObj = await fs.readJson(packageJsonPath);
+    const previewSha = sha.trim();
+    packageObj.version += `-${previewSha}`;
+    pinWorkspacePeerDependencies(packageObj, workspaceVersions, previewSha);
+
+    if (task.dependencies.length > 0) {
+      for (const dependency of task.dependencies) {
+        const name = dependency.split('#')[0];
+        // Flat filename: no `@` (pnpm 8) and no `%40` (yarn 1).
+        const tarballUrl = `${tarballBaseUrl}/${previewTarballFilename(name)}`;
+        if (packageObj.dependencies && name in packageObj.dependencies) {
+          packageObj.dependencies[name] = tarballUrl;
+        }
+        if (packageObj.devDependencies && name in packageObj.devDependencies) {
+          packageObj.devDependencies[name] = tarballUrl;
+        }
+        // Preview tarballs also pin `builders` to the same URLs so
+        // importBuilders installs the PR build instead of the npm version.
+        // pin-builders prepack leaves non-workspace entries alone.
+        if (packageObj.builders && name in packageObj.builders) {
+          packageObj.builders[name] = tarballUrl;
+        }
+      }
+    }
+    hoistRegistryDependenciesFromWorkspaceTarballs(
+      packageObj,
+      workspaceDependencies
+    );
+    await fs.writeJson(packageJsonPath, packageObj, { spaces: 2 });
+
+    await execa('pnpm', ['pack'], {
+      cwd: dir,
+      stdio: 'inherit',
+    });
+    await fs.writeJson(packageJsonPath, originalPackageObj, { spaces: 2 });
+  }
+
+  // Build Python wheels so they can be hosted on preview deployments.
+  for (const pkg of pythonWheelPackages) {
+    await buildPythonWheel(pkg);
+  }
+}
+
+async function buildPythonWheel({
+  packageDir,
+  tag,
+  packagePath,
+  packageLabel,
+}: {
+  packageDir: string;
+  tag: string;
+  packagePath: string;
+  packageLabel: string;
+}) {
+  const pythonPackageDir = path.join(rootDir, 'python', packageDir);
+  const pyprojectPath = path.join(pythonPackageDir, 'pyproject.toml');
+
+  if (!(await fs.pathExists(pyprojectPath))) {
+    console.log(
+      `Skipping Python ${packageLabel} wheel build: missing ${pyprojectPath}`
+    );
+    return;
+  }
+
+  try {
+    // Find the last release tag for this package
+    let lastTag: string;
+    try {
+      const { stdout } = await execa('git', [
+        'describe',
+        '--tags',
+        '--match',
+        tag,
+        '--abbrev=0',
+      ]);
+      lastTag = stdout.trim();
+    } catch {
+      console.log(
+        `No previous ${tag} tag found, building ${packageLabel} wheel.`
+      );
+      lastTag = '';
+    }
+
+    // Check if there are changes since the last tag
+    // (git diff --quiet exits 0 if no changes, 1 if changes)
+    if (lastTag) {
+      const result = await execa('git', [
+        'diff',
+        '--quiet',
+        lastTag,
+        'HEAD',
+        '--',
+        packagePath,
+      ]).catch(err => err);
+
+      if (result.exitCode === 0) {
+        console.log(
+          `No changes to ${packagePath} since ${lastTag}, skipping wheel build.`
+        );
+        return;
+      }
+    }
+
+    const sha = (await getSha()).trim();
+    let timestamp: number;
+    try {
+      const { stdout } = await execa('git', ['log', '-1', '--format=%ct'], {
+        env: { ...process.env, LC_ALL: 'C', TZ: 'UTC' },
+      });
+      timestamp = Number(stdout.trim()) || 0;
+    } catch {
+      timestamp = 0;
+    }
+    const original = await fs.readFile(pyprojectPath, 'utf8');
+    // e.g. 0.4.0 -> 0.5.0.dev1739371200+d496c36
+    const devVersion = original.replace(
+      /^(version\s*=\s*")(\d+)\.(\d+)\.(\d+)(")/m,
+      (
+        _m: string,
+        pre: string,
+        major: string,
+        minor: string,
+        _patch: string,
+        post: string
+      ) => `${pre}${major}.${Number(minor) + 1}.0.dev${timestamp}+${sha}${post}`
+    );
+    await fs.writeFile(pyprojectPath, devVersion);
+
+    console.log(
+      `Building Python ${packageLabel} wheel (dev${timestamp}+${sha}, ${lastTag || 'no prior tag'})...`
+    );
+
+    try {
+      await execa('uv', ['build', '--wheel', '--out-dir', 'dist/'], {
+        cwd: pythonPackageDir,
+        stdio: 'inherit',
+      });
+      console.log(`Python ${packageLabel} wheel built successfully.`);
+    } finally {
+      await fs.writeFile(pyprojectPath, original);
+    }
+  } catch (err) {
+    console.error(`Failed to build Python ${packageLabel} wheel:`, err);
+    throw err;
+  }
+}
+
+async function getSha(): Promise<string> {
+  try {
+    const { stdout } = await execa('git', ['rev-parse', '--short', 'HEAD'], {
+      cwd: rootDir,
+    });
+    return stdout;
+  } catch (error) {
+    console.error(error);
+
+    console.log('Assuming this is not a git repo. Using "local" as the SHA.');
+    return 'local';
+  }
+}
+
+main().catch(err => {
+  console.log('error running pack:', err);
+  process.exit(1);
+});

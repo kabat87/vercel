@@ -1,38 +1,88 @@
-import inquirer from 'inquirer';
-import confirm from './confirm';
 import chalk from 'chalk';
-import { Output } from '../output';
-import { Framework } from '@vercel/frameworks';
+import { frameworkList, type Framework } from '@vercel/frameworks';
+import type Client from '../client';
 import { isSettingValue } from '../is-setting-value';
-import { ProjectSettings } from '../../types';
+import type { ProjectSettings } from '@vercel-internals/types';
+import output from '../../output-manager';
 
-export interface PartialProjectSettings {
-  buildCommand: string | null;
-  outputDirectory: string | null;
-  devCommand: string | null;
-}
-
-const fields: { name: string; value: keyof PartialProjectSettings }[] = [
-  { name: 'Build Command', value: 'buildCommand' },
-  { name: 'Output Directory', value: 'outputDirectory' },
-  { name: 'Development Command', value: 'devCommand' },
+const settingMap = {
+  buildCommand: 'Build Command',
+  devCommand: 'Development Command',
+  commandForIgnoringBuildStep: 'Ignore Command',
+  installCommand: 'Install Command',
+  outputDirectory: 'Output Directory',
+  framework: 'Framework',
+} as const;
+type ConfigKeys = keyof typeof settingMap;
+const settingKeys = Object.keys(settingMap).sort() as unknown as readonly [
+  ConfigKeys,
 ];
 
-export default async function editProjectSettings(
-  output: Output,
+export type PartialProjectSettings = Pick<
+  ProjectSettings,
+  ConfigKeys | 'monorepoManager'
+>;
+
+export async function editProjectSettings(
+  client: Client,
   projectSettings: PartialProjectSettings | null,
   framework: Framework | null,
-  autoConfirm?: boolean
+  autoConfirm: boolean,
+  localConfigurationOverrides: PartialProjectSettings | null,
+  configFileName = 'vercel.json'
 ): Promise<ProjectSettings> {
-  // create new settings object, missing values will be filled with `null`
+  // Create initial settings object defaulting everything to `null` and assigning what may exist in `projectSettings`
   const settings: ProjectSettings = Object.assign(
-    { framework: null },
+    {
+      buildCommand: null,
+      devCommand: null,
+      framework: null,
+      commandForIgnoringBuildStep: null,
+      installCommand: null,
+      outputDirectory: null,
+    },
     projectSettings
   );
 
-  for (let field of fields) {
-    settings[field.value] =
-      (projectSettings && projectSettings[field.value]) || null;
+  const hasLocalConfigurationOverrides =
+    localConfigurationOverrides &&
+    Object.values(localConfigurationOverrides ?? {}).some(Boolean);
+
+  // Start UX by displaying (and applying) overrides. They will be referenced throughout remainder of CLI.
+  if (hasLocalConfigurationOverrides) {
+    // Apply local overrides (from `vercel.json`)
+    for (const setting of settingKeys) {
+      const localConfigValue = localConfigurationOverrides[setting];
+      if (localConfigValue) settings[setting] = localConfigValue;
+    }
+
+    output.print(`  Local settings detected in ${configFileName}:\n`);
+
+    // Print provided overrides including framework
+    for (const setting of settingKeys) {
+      const override = localConfigurationOverrides[setting];
+      if (override) {
+        output.print(
+          `  ${chalk.dim(
+            `${chalk.bold(`${settingMap[setting]}:`)} ${override}`
+          )}\n`
+        );
+      }
+    }
+
+    // If framework is overridden, set it to the `framework` parameter and let the normal framework-flow occur
+    if (localConfigurationOverrides.framework) {
+      const overrideFramework = frameworkList.find(
+        f => f.slug === localConfigurationOverrides.framework
+      );
+
+      if (overrideFramework) {
+        framework = overrideFramework;
+        output.print(
+          `  Merging default Project Settings for ${framework.name}. Previously listed overrides are prioritized.\n`
+        );
+      }
+    }
   }
 
   // skip editing project settings if no framework is detected
@@ -41,52 +91,94 @@ export default async function editProjectSettings(
     return settings;
   }
 
-  output.print(
-    !framework.slug
-      ? `No framework detected. Default Project Settings:\n`
-      : `Auto-detected Project Settings (${chalk.bold(framework.name)}):\n`
-  );
+  output.print('\n');
+
+  // A missing framework slug implies the "Other" framework was selected
+  if (!framework.slug) {
+    output.print(`  No framework detected. Default Project Settings:\n`);
+  } else {
+    // Compress "Auto-detected Project Settings for X" into a single line that
+    // also names the key commands the user is about to run with.
+    // Use output.print (not output.log) to skip the gray "> " prefix so this
+    // line visually matches the bold-label block (Linked / Inspect / Production).
+    // Title Case the inline labels so they match the checkbox panel below.
+    const buildCmd = framework.settings.buildCommand?.value ?? null;
+    const outputSetting = framework.settings.outputDirectory;
+    const outputDir = outputSetting
+      ? isSettingValue(outputSetting)
+        ? outputSetting.value
+        : outputSetting.placeholder
+      : null;
+    const inline = [
+      buildCmd ? `${settingMap.buildCommand}: ${buildCmd}` : null,
+      outputDir ? `${settingMap.outputDirectory}: ${outputDir}` : null,
+    ].filter(Boolean);
+    const detail = inline.length ? chalk.dim(` (${inline.join(', ')})`) : '';
+    // 2-space indent matches the Directory setup row and printAlignedLabel block.
+    // Framework name is plain (not bold) per prototype — only "Detected" is bold.
+    output.print(`  ${chalk.bold('Detected')} ${framework.name}${detail}\n`);
+  }
 
   settings.framework = framework.slug;
 
-  for (let field of fields) {
-    const defaults = framework.settings[field.value];
+  // Now print defaults for the provided framework whether it was auto-detected or overwritten
+  if (!framework.slug) {
+    for (const setting of settingKeys) {
+      if (
+        setting === 'framework' ||
+        setting === 'commandForIgnoringBuildStep'
+      ) {
+        continue;
+      }
 
-    output.print(
-      chalk.dim(
-        `- ${chalk.bold(`${field.name}:`)} ${`${
-          isSettingValue(defaults)
-            ? defaults.value
-            : chalk.italic(`${defaults.placeholder}`)
-        }`}`
-      ) + '\n'
-    );
+      const defaultSetting = framework.settings[setting];
+      const override = localConfigurationOverrides?.[setting];
+
+      if (!override && defaultSetting) {
+        output.print(
+          `  ${chalk.dim(
+            `${chalk.bold(`${settingMap[setting]}:`)} ${
+              isSettingValue(defaultSetting)
+                ? defaultSetting.value
+                : chalk.italic(`${defaultSetting.placeholder}`)
+            }`
+          )}\n`
+        );
+      }
+    }
   }
 
+  // Prompt the user if they want to modify any settings not defined by local configuration.
   if (
     autoConfirm ||
-    !(await confirm(`Want to override the settings?`, false))
+    !(await client.input.confirm('Customize settings?', false))
   ) {
     return settings;
   }
 
-  const { settingFields } = await inquirer.prompt({
-    name: 'settingFields',
-    type: 'checkbox',
+  const choices = settingKeys.reduce(
+    (acc, setting) => {
+      const skip =
+        setting === 'framework' ||
+        setting === 'commandForIgnoringBuildStep' ||
+        setting === 'installCommand' ||
+        localConfigurationOverrides?.[setting];
+      if (skip) return acc;
+      return [...acc, { name: settingMap[setting], value: setting }];
+    },
+    [] as { name: string; value: ConfigKeys }[]
+  );
+
+  const settingFields = await client.input.checkbox({
     message: 'Which settings would you like to overwrite (select multiple)?',
-    choices: fields,
+    choices,
   });
 
-  for (let setting of settingFields as (keyof PartialProjectSettings)[]) {
-    const field = fields.find(f => f.value === setting);
-    const name = `${Date.now()}`;
-    const answers = await inquirer.prompt({
-      type: 'input',
-      name: name,
-      message: `What's your ${chalk.bold(field ? field.name : setting)}?`,
+  for (const setting of settingFields) {
+    const field = settingMap[setting];
+    settings[setting] = await client.input.text({
+      message: `${chalk.bold(field)}?`,
     });
-    settings[setting] = answers[name] as string;
   }
-
   return settings;
 }

@@ -1,0 +1,43 @@
+{
+  "name": "@vercel/fs-detectors",
+  "version": "7.2.1",
+  "description": "Vercel filesystem detectors",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/vercel/vercel.git",
+    "directory": "packages/fs-detectors"
+  },
+  "license": "Apache-2.0",
+  "scripts": {
+    "build": "node ../../utils/build.mjs",
+    "test": "vitest run --config ../../vitest.config.mts",
+    "test-unit": "vitest run --config ../../vitest.config.mts test/unit.",
+    "type-check": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@vercel/build-utils": "workspace:*",
+    "@vercel/error-utils": "workspace:*",
+    "@vercel/frameworks": "workspace:*",
+    "@vercel/python-analysis": "workspace:*",
+    "@vercel/routing-utils": "workspace:*",
+    "glob": "8.0.3",
+    "js-yaml": "4.1.0",
+    "json5": "2.2.2",
+    "minimatch": "3.1.2",
+    "semver": "6.3.1",
+    "smol-toml": "1.5.2"
+  },
+  "devDependencies": {
+    "@types/glob": "7.2.0",
+    "@types/js-yaml": "4.0.5",
+    "@types/minimatch": "3.0.5",
+    "@types/node": "20.11.0",
+    "@types/semver": "7.3.10",
+    "vitest": "4.1.10"
+  }
+}

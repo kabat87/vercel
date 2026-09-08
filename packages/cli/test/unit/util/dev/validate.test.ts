@@ -1,0 +1,1678 @@
+import { describe, it, expect, afterEach } from 'vitest';
+import { validateConfig } from '../../../../src/util/validate-config';
+
+describe('validateConfig', () => {
+  describe('proxy', () => {
+    it.each([
+      'proxy.js',
+      'src/proxy.ts',
+    ])('accepts the supported entrypoint %s', entrypoint => {
+      expect(validateConfig({ proxy: { entrypoint } })).toBeNull();
+    });
+
+    it.each([
+      '/api/:func*',
+      ['/api/:func*', '/dashboard/:path*'],
+    ])('accepts the matcher %j', matcher => {
+      expect(
+        validateConfig({ proxy: { entrypoint: 'proxy.ts', matcher } })
+      ).toBeNull();
+    });
+
+    it('accepts functions configuration for the proxy', () => {
+      expect(
+        validateConfig({
+          proxy: { entrypoint: 'proxy.ts' },
+          functions: {
+            'proxy.ts': {
+              maxDuration: 10,
+              memory: 1024,
+            },
+          },
+        })
+      ).toBeNull();
+    });
+
+    it.each([
+      'proxy.ts',
+      '**/*.ts',
+    ])('accepts a functions runtime targeting the proxy through %s', pattern => {
+      expect(
+        validateConfig({
+          proxy: { entrypoint: 'proxy.ts' },
+          functions: {
+            [pattern]: {
+              runtime: 'some-runtime@1.0.0',
+            },
+          },
+        })
+      ).toBeNull();
+    });
+
+    it('requires an entrypoint', () => {
+      const error = validateConfig({
+        // @ts-expect-error - testing invalid configuration
+        proxy: {},
+      });
+
+      expect(error?.message).toBe(
+        'Invalid vercel.json - `proxy` missing required property `entrypoint`.'
+      );
+    });
+
+    it('rejects unsupported entrypoint extensions', () => {
+      const error = validateConfig({
+        proxy: { entrypoint: 'proxy.mjs' },
+      });
+
+      expect(error?.code).toBe('INVALID_PROXY_ENTRYPOINT');
+      expect(error?.message).toBe(
+        'The `proxy.entrypoint` path must end in `.js` or `.ts` and reference an executable file.'
+      );
+    });
+
+    it('accepts proxy together with services', () => {
+      expect(
+        validateConfig({
+          services: {
+            web: { root: 'apps/web', framework: 'nextjs' },
+            vr: { root: 'apps/vr' },
+          },
+          rewrites: [
+            { source: '/app/(.*)', destination: { service: 'vr' } },
+            { source: '/(.*)', destination: { service: 'web' } },
+          ],
+          proxy: { entrypoint: 'proxy.ts' },
+        })
+      ).toBeNull();
+    });
+
+    it('rejects proxy together with builds', () => {
+      const error = validateConfig({
+        proxy: { entrypoint: 'proxy.ts' },
+        builds: [{ src: 'api/index.ts', use: '@vercel/node' }],
+      });
+
+      expect(error?.code).toBe('PROXY_AND_BUILDS');
+      expect(error?.message).toBe(
+        'The `proxy` property cannot be used with the `builds` property. Remove `builds` to use an explicit proxy entrypoint.'
+      );
+    });
+
+    it.each([
+      '/proxy.ts',
+      '../proxy.ts',
+      'src\\proxy.ts',
+      'proxy.ts?x=1',
+    ])('rejects the unsafe entrypoint %s', entrypoint => {
+      const error = validateConfig({ proxy: { entrypoint } });
+
+      expect(error?.code).toBe('INVALID_PROXY_ENTRYPOINT');
+      expect(error?.message).toBe(
+        'The `proxy.entrypoint` path must be relative to the project root and cannot contain traversal, query, fragment, or control characters.'
+      );
+    });
+
+    it.each([
+      'api/:func*',
+      ['/api/:func*', 'dashboard/:path*'],
+    ])('rejects the invalid matcher %j', matcher => {
+      const error = validateConfig({
+        proxy: { entrypoint: 'proxy.ts', matcher },
+      });
+
+      expect(error?.code).toBe('INVALID_PROXY_MATCHER');
+      expect(error?.message).toBe(
+        'The `proxy.matcher` value must be a path matcher starting with `/`, or an array of path matchers starting with `/`.'
+      );
+    });
+  });
+
+  describe('services', () => {
+    it('should not error with a valid canonical config', () => {
+      const error = validateConfig({
+        services: {
+          my_frontend: {
+            root: 'frontend/',
+            framework: 'nextjs',
+            bindings: [
+              {
+                type: 'service',
+                service: 'my_backend',
+                format: 'url',
+                env: 'BACKEND_URL',
+              },
+            ],
+          },
+          my_backend: {
+            root: 'backend/',
+            runtime: 'python',
+            entrypoint: 'main:app',
+          },
+        },
+      } satisfies Parameters<typeof validateConfig>[0]);
+      expect(error).toBeNull();
+    });
+
+    it('should keep experimentalServicesV2 as a backwards-compatible alias', () => {
+      const error = validateConfig({
+        experimentalServicesV2: {
+          api: { root: 'api', framework: 'express' },
+        },
+      });
+
+      expect(error).toBeNull();
+    });
+
+    it('should reject services together with experimentalServicesV2', () => {
+      const error = validateConfig({
+        services: { web: { root: '.', framework: 'nextjs' } },
+        experimentalServicesV2: {
+          api: { root: 'api', framework: 'express' },
+        },
+      });
+
+      expect(error?.code).toBe('SERVICES_AND_EXPERIMENTAL_SERVICES_V2');
+    });
+
+    it('should report canonical services validation errors', () => {
+      const error = validateConfig({
+        services: {
+          web: {
+            root: '.',
+            bindings: [
+              {
+                type: 'service',
+                service: 'ghost',
+                format: 'url',
+                env: 'GHOST_URL',
+              },
+            ],
+          },
+        },
+      });
+
+      expect(error?.code).toBe('SERVICES_BINDING_UNKNOWN_SERVICE');
+      expect(error?.message).toContain('`services`');
+    });
+
+    it('should not error with a service-local route table and functions', () => {
+      const error = validateConfig({
+        experimentalServicesV2: {
+          web: {
+            root: '.',
+            headers: [{ source: '/', headers: [{ key: 'x-id', value: '1' }] }],
+            redirects: [{ source: '/old', destination: '/new' }],
+            rewrites: [{ source: '/a', destination: '/b' }],
+            cleanUrls: true,
+            trailingSlash: false,
+            functions: { 'api/*.ts': { memory: 256, maxDuration: 10 } },
+          },
+        },
+      });
+      expect(error).toBeNull();
+    });
+
+    it('should accept a request path transform on a service rewrite', () => {
+      const error = validateConfig({
+        experimentalServicesV2: {
+          my_backend: {
+            root: 'backend/',
+          },
+        },
+        rewrites: [
+          {
+            source: '/api/:path*',
+            destination: {
+              type: 'service',
+              service: 'my_backend',
+              path: '/:path*',
+            },
+            transforms: [
+              {
+                type: 'request.path',
+                op: 'set',
+                args: '/:path*',
+              },
+            ],
+          },
+        ],
+      } as unknown as Parameters<typeof validateConfig>[0]);
+
+      expect(error).toBeNull();
+    });
+
+    it('should accept per-service build overrides', () => {
+      const error = validateConfig({
+        experimentalServicesV2: {
+          api: {
+            root: 'api/',
+            installCommand: 'pnpm install',
+            buildCommand: 'pnpm build',
+            devCommand: 'pnpm dev',
+            ignoreCommand: 'echo test',
+            outputDirectory: 'dist',
+          },
+        },
+      });
+      expect(error).toBeNull();
+    });
+
+    it('should require root', () => {
+      const error = validateConfig({
+        experimentalServicesV2: {
+          api: { framework: 'nextjs' } as any,
+        },
+      });
+      expect(error?.message).toContain('missing required property `root`');
+    });
+
+    it.each([
+      ['type', { type: 'web' }],
+      ['trigger', { trigger: 'schedule' }],
+      ['mount', { mount: '/api' }],
+      ['routePrefix', { routePrefix: '/api' }],
+      ['subdomain', { subdomain: 'api' }],
+      ['schedule', { schedule: '0 0 * * *' }],
+      ['topics', { topics: ['orders'] }],
+      ['memory', { memory: 1024 }],
+      ['maxDuration', { maxDuration: 10 }],
+      ['includeFiles', { includeFiles: 'config/*.json' }],
+      ['excludeFiles', { excludeFiles: 'fixtures/**' }],
+      ['workspace', { workspace: '.' }],
+      ['builder', { builder: '@vercel/node' }],
+      ['preDeployCommand', { preDeployCommand: 'pnpm migrate' }],
+      ['consumer', { consumer: 'group' }],
+    ])('should reject removed service field %s', (_, serviceConfig) => {
+      const error = validateConfig({
+        experimentalServicesV2: {
+          api: { root: '.', ...serviceConfig } as any,
+        },
+      });
+      expect(error).not.toBeNull();
+    });
+
+    it('should reject a binding to an unknown service', () => {
+      const error = validateConfig({
+        experimentalServicesV2: {
+          web: {
+            root: '.',
+            bindings: [
+              {
+                type: 'service',
+                service: 'ghost',
+                format: 'url',
+                env: 'GHOST_URL',
+              },
+            ],
+          },
+        },
+      });
+      expect(error?.code).toBe(
+        'EXPERIMENTAL_SERVICES_V2_BINDING_UNKNOWN_SERVICE'
+      );
+    });
+
+    it('should accept a binding with `type` omitted', () => {
+      const error = validateConfig({
+        services: {
+          web: { root: '.' },
+          api: {
+            root: 'api/',
+            bindings: [{ service: 'web', format: 'url', env: 'WEB_URL' }],
+          },
+        },
+      } as any);
+      expect(error).toBeNull();
+    });
+
+    it('should reject a binding missing a required field', () => {
+      const error = validateConfig({
+        experimentalServicesV2: {
+          web: { root: '.' },
+          api: {
+            root: 'api/',
+            bindings: [
+              { type: 'service', service: 'web', format: 'url' } as any,
+            ],
+          },
+        },
+      });
+      expect(error).not.toBeNull();
+    });
+
+    it.each([
+      ['type', { type: 'queue', service: 'web', format: 'url', env: 'X' }],
+      ['format', { type: 'service', service: 'web', format: 'grpc', env: 'X' }],
+    ])('should reject a binding with invalid %s', (_, binding) => {
+      const error = validateConfig({
+        experimentalServicesV2: {
+          web: { root: '.', bindings: [binding] } as any,
+        },
+      });
+      expect(error).not.toBeNull();
+    });
+
+    it('should reject the removed `env` field', () => {
+      const error = validateConfig({
+        experimentalServicesV2: {
+          web: {
+            root: '.',
+            env: { LOG_LEVEL: 'info' },
+          } as any,
+        },
+      });
+      expect(error).not.toBeNull();
+    });
+
+    it.each([
+      ['functions', { functions: { 'api/*.ts': { memory: 128 } } }],
+      ['installCommand', { installCommand: 'pnpm install' }],
+      ['buildCommand', { buildCommand: 'pnpm build' }],
+      ['devCommand', { devCommand: 'pnpm dev' }],
+      ['ignoreCommand', { ignoreCommand: 'exit 0' }],
+      ['outputDirectory', { outputDirectory: 'dist' }],
+      ['framework', { framework: 'nextjs' }],
+    ])('should reject top-level %s in experimentalServicesV2 mode', (_, topLevel) => {
+      const error = validateConfig({
+        experimentalServicesV2: { web: { root: '.' } },
+        ...topLevel,
+      } as any);
+      expect(error).not.toBeNull();
+    });
+
+    it('should report all confusing top-level fields at once', () => {
+      const error = validateConfig({
+        experimentalServicesV2: { web: { root: '.' } },
+        framework: 'nextjs',
+        outputDirectory: 'dist',
+      } as any);
+      expect(error?.code).toBe(
+        'EXPERIMENTAL_SERVICES_V2_AND_TOP_LEVEL_BUILD_SETTINGS'
+      );
+      expect(error?.message).toContain('`framework`');
+      expect(error?.message).toContain('`outputDirectory`');
+    });
+
+    it('should reject experimentalServicesV2 together with experimentalServices', () => {
+      const error = validateConfig({
+        experimentalServices: { api: { entrypoint: 'api/index.ts' } },
+        experimentalServicesV2: { web: { root: '.' } },
+      });
+      expect(error?.code).toBe(
+        'EXPERIMENTAL_SERVICES_V2_AND_EXPERIMENTAL_SERVICES'
+      );
+    });
+  });
+
+  it('should not error with empty config', async () => {
+    const config = {};
+    const error = validateConfig(config);
+    expect(error).toBeNull();
+  });
+
+  it('should not error with complete config', async () => {
+    const config = {
+      version: 2,
+      regions: ['sfo1', 'iad1'],
+      cleanUrls: true,
+      headers: [{ source: '/', headers: [{ key: 'x-id', value: '123' }] }],
+      rewrites: [{ source: '/help', destination: '/support' }],
+      redirects: [{ source: '/kb', destination: 'https://example.com' }],
+      trailingSlash: false,
+      functions: {
+        'api/user.go': { memory: 128, maxDuration: 5, maxConcurrency: 8 },
+      },
+    };
+    const error = validateConfig(config);
+    expect(error).toBeNull();
+  });
+
+  it('should not error with maxDuration set to "max"', async () => {
+    // Runtime allows maxDuration "max"; VercelConfig types expect number only.
+    const config = {
+      functions: {
+        'api/user.go': { memory: 128, maxDuration: 'max' as const },
+      },
+    } as unknown as Parameters<typeof validateConfig>[0];
+    const error = validateConfig(config);
+    expect(error).toBeNull();
+  });
+
+  it.each([
+    0, -1, 1.5,
+  ])('should reject maxConcurrency set to %s', maxConcurrency => {
+    const error = validateConfig({
+      functions: { 'api/user.go': { maxConcurrency } },
+    } as Parameters<typeof validateConfig>[0]);
+    expect(error).not.toBeNull();
+    expect(error?.message).toContain('maxConcurrency');
+  });
+
+  // Regression test for honoring the env var when it is set *after* this module
+  // is imported: `validateConfig` (and therefore `@vercel/build-utils`' functions
+  // schema) is imported at the top of this file, before the env var below is ever
+  // set. The gate must still take effect, which only works if the validator reads
+  // the env var at validation time instead of baking the bound in at module load.
+  describe('VERCEL_CLI_SKIP_MAX_DURATION_LIMIT', () => {
+    const ENV = 'VERCEL_CLI_SKIP_MAX_DURATION_LIMIT';
+
+    afterEach(() => {
+      delete process.env[ENV];
+    });
+
+    const configWith = (maxDuration: number) =>
+      ({ functions: { 'api/*.js': { maxDuration } } }) satisfies Parameters<
+        typeof validateConfig
+      >[0];
+
+    it('rejects maxDuration above the default 3600s bound when unset', () => {
+      const error = validateConfig(configWith(3700));
+      expect(error).not.toBeNull();
+      expect(error?.message).toMatch(/3600/);
+    });
+
+    it('allows maxDuration above 3600s when set to "1" (defers to the server)', () => {
+      process.env[ENV] = '1';
+      expect(validateConfig(configWith(3600))).toBeNull();
+      expect(validateConfig(configWith(3700))).toBeNull();
+    });
+
+    it('still enforces the lower bound and integer check when skipped', () => {
+      process.env[ENV] = '1';
+      expect(validateConfig(configWith(0))).not.toBeNull();
+      expect(validateConfig(configWith(1.5))).not.toBeNull();
+    });
+
+    it('re-applies the 3600s bound once the variable is unset again', () => {
+      process.env[ENV] = '1';
+      expect(validateConfig(configWith(3700))).toBeNull();
+      delete process.env[ENV];
+      expect(validateConfig(configWith(3700))).not.toBeNull();
+    });
+  });
+
+  it('should not error with experimentalServices mount config', async () => {
+    const config = {
+      experimentalServices: {
+        frontend: {
+          framework: 'nextjs',
+          mount: '/',
+        },
+        api: {
+          entrypoint: 'api/index.ts',
+          mount: {
+            path: '/api',
+            subdomain: 'api',
+          },
+        },
+        docs: {
+          framework: 'nextjs',
+          mount: {
+            subdomain: 'docs',
+          },
+        },
+      },
+    } satisfies Parameters<typeof validateConfig>[0];
+    const error = validateConfig(config);
+    expect(error).toBeNull();
+  });
+
+  it('should validate the `services` property', () => {
+    const error = validateConfig({
+      services: {
+        frontend: {
+          framework: 'nextjs',
+          mount: '/',
+        },
+      },
+    } as any);
+    expect(error).not.toBeNull();
+  });
+
+  it('should reject strict affinity outside a service', () => {
+    const error = validateConfig({
+      functions: {
+        'api/test.js': {
+          affinity: { mode: 'strict' },
+        },
+      },
+    });
+    expect(error?.code).toBe('FUNCTION_AFFINITY_REQUIRES_SERVICE');
+  });
+
+  it('should reject strict affinity with the all function region', () => {
+    const error = validateConfig({
+      services: {
+        api: {
+          root: 'api',
+          functions: {
+            'test.js': {
+              affinity: { mode: 'strict' },
+              regions: ['all'],
+            },
+          },
+        },
+      },
+    });
+    expect(error?.code).toBe('INVALID_FUNCTION_AFFINITY_REGIONS');
+  });
+
+  it.each([
+    'services',
+    'experimentalServicesV2',
+  ] as const)('should reject strict affinity with multiple function regions in `%s`', configKey => {
+    const error = validateConfig({
+      [configKey]: {
+        api: {
+          root: 'api',
+          functions: {
+            'test.js': {
+              affinity: { mode: 'strict' },
+              regions: ['iad1', 'sfo1'],
+            },
+          },
+        },
+      },
+    });
+    expect(error?.code).toBe('INVALID_FUNCTION_AFFINITY_REGIONS');
+  });
+
+  it('should allow strict affinity to inherit multiple project regions', () => {
+    const error = validateConfig({
+      regions: ['iad1', 'sfo1'],
+      services: {
+        api: {
+          root: 'api',
+          functions: {
+            'test.js': {
+              affinity: { mode: 'strict' },
+            },
+          },
+        },
+      },
+    });
+    expect(error).toBeNull();
+  });
+
+  it.each([
+    'services',
+    'experimentalServicesV2',
+  ] as const)('should reject invalid service names in `%s`', configKey => {
+    for (const name of ['Bad', 'api1', 'api.service', 'api_', 'api-']) {
+      const error = validateConfig({
+        [configKey]: {
+          [name]: {
+            root: 'api',
+          },
+        },
+      } as any);
+
+      expect(error).not.toBeNull();
+    }
+  });
+
+  it.each([
+    'services',
+    'experimentalServicesV2',
+  ] as const)('should reject service names longer than 64 characters in `%s`', configKey => {
+    const error = validateConfig({
+      [configKey]: {
+        ['a'.repeat(65)]: {
+          root: 'api',
+        },
+      },
+    } as any);
+
+    expect(error).not.toBeNull();
+  });
+
+  it.each([
+    'services',
+    'experimentalServicesV2',
+  ] as const)('should accept service names matching the API schema in `%s`', configKey => {
+    const error = validateConfig({
+      [configKey]: {
+        ['a'.repeat(64)]: {
+          root: 'api',
+        },
+        my_service: {
+          root: 'worker',
+        },
+        'my-service': {
+          root: 'web',
+        },
+      },
+    } as any);
+
+    expect(error).toBeNull();
+  });
+
+  it('should reject invalid `experimentalServicesV2` service binding names', () => {
+    const error = validateConfig({
+      experimentalServicesV2: {
+        web: {
+          root: 'web',
+          bindings: [
+            { type: 'service', service: 'Api', format: 'url', env: 'API_URL' },
+          ],
+        },
+      },
+    } as any);
+
+    expect(error).not.toBeNull();
+  });
+
+  it('should not error with experimentalServices static schedule arrays', () => {
+    const error = validateConfig({
+      experimentalServices: {
+        cleanup: {
+          type: 'job',
+          trigger: 'schedule',
+          runtime: 'python',
+          entrypoint: 'jobs/cleanup.py',
+          schedule: ['0 0 * * *', '0 12 * * *'],
+        },
+      },
+    } satisfies Parameters<typeof validateConfig>[0]);
+    expect(error).toBeNull();
+  });
+
+  it('should reject dynamic schedules inside experimentalServices schedule arrays', () => {
+    const error = validateConfig({
+      experimentalServices: {
+        cleanup: {
+          type: 'job',
+          trigger: 'schedule',
+          runtime: 'python',
+          entrypoint: 'jobs/cleanup.py',
+          schedule: ['<dynamic>'],
+        },
+      },
+    } satisfies Parameters<typeof validateConfig>[0]);
+    expect(error).not.toBeNull();
+  });
+
+  it('should not error with experimentalServices dynamic schedule string', () => {
+    const error = validateConfig({
+      experimentalServices: {
+        cleanup: {
+          type: 'job',
+          trigger: 'schedule',
+          runtime: 'python',
+          entrypoint: 'jobs/cleanup.py',
+          schedule: '<dynamic>',
+        },
+      },
+    } satisfies Parameters<typeof validateConfig>[0]);
+    expect(error).toBeNull();
+  });
+
+  it('should not error with legacy cron service type', () => {
+    const error = validateConfig({
+      experimentalServices: {
+        cleanup: {
+          type: 'cron',
+          entrypoint: 'cleanup.py',
+          schedule: '0 0 * * *',
+        },
+      },
+    } satisfies Parameters<typeof validateConfig>[0]);
+    expect(error).toBeNull();
+  });
+
+  it('should not error with schedule-triggered job services', () => {
+    const error = validateConfig({
+      experimentalServices: {
+        cleanup: {
+          type: 'job',
+          trigger: 'schedule',
+          entrypoint: 'cleanup.py',
+          schedule: '0 0 * * *',
+        },
+      },
+    } satisfies Parameters<typeof validateConfig>[0]);
+    expect(error).toBeNull();
+  });
+
+  it('should not error with queue-triggered job services using topic objects', () => {
+    const error = validateConfig({
+      experimentalServices: {
+        processor: {
+          type: 'job',
+          trigger: 'queue',
+          entrypoint: 'worker.py',
+          topics: [
+            {
+              topic: 'orders',
+              retryAfterSeconds: 10,
+              initialDelaySeconds: 5,
+            },
+          ],
+        },
+      },
+    } satisfies Parameters<typeof validateConfig>[0]);
+    expect(error).toBeNull();
+  });
+
+  it('should not error with workflow-triggered job services', () => {
+    const error = validateConfig({
+      experimentalServices: {
+        workflow: {
+          type: 'job',
+          trigger: 'workflow',
+          entrypoint: 'src/workflow.ts',
+        },
+      },
+    } satisfies Parameters<typeof validateConfig>[0]);
+    expect(error).toBeNull();
+  });
+
+  it('should reject unsupported beat config for job services', () => {
+    const error = validateConfig({
+      experimentalServices: {
+        processor: {
+          type: 'job',
+          trigger: 'queue',
+          entrypoint: 'worker.py',
+          topics: ['orders'],
+          beat: {
+            schedule: '0 * * * *',
+          },
+        } as any,
+      },
+    });
+    expect(error).not.toBeNull();
+  });
+
+  it('should not error with builds and routes', async () => {
+    const config = {
+      builds: [{ src: 'api/index.js', use: '@vercel/node' }],
+      routes: [{ src: '/(.*)', dest: '/api/index.js' }],
+    };
+    const error = validateConfig(config);
+    expect(error).toBeNull();
+  });
+
+  it('should error with invalid rewrites due to additional property and offer suggestion', async () => {
+    const error = validateConfig({
+      // @ts-ignore
+      rewrites: [{ src: '/(.*)', dest: '/api/index.js' }],
+    });
+    expect(error!.message).toEqual(
+      'Invalid vercel.json - `rewrites[0]` should NOT have additional property `src`. Did you mean `source`?'
+    );
+    expect(error!.link).toEqual(
+      'https://vercel.com/docs/concepts/projects/project-configuration#rewrites'
+    );
+  });
+
+  it('should not error with routes using source and destination aliases', async () => {
+    const error = validateConfig({
+      // @ts-expect-error - testing runtime alias support (source/destination accepted by schema, converted to src/dest at runtime)
+      routes: [{ source: '/(.*)', destination: '/api/index.js' }],
+    });
+    expect(error).toBeNull();
+  });
+
+  it('should not error with routes using source, destination, and statusCode aliases', async () => {
+    const error = validateConfig({
+      routes: [
+        // @ts-expect-error - testing runtime alias support (source/destination/statusCode accepted by schema, converted at runtime)
+        { source: '/(.*)', destination: '/api/index.js', statusCode: 200 },
+      ],
+    });
+    expect(error).toBeNull();
+  });
+
+  it('should error with invalid routes array type', async () => {
+    const error = validateConfig({
+      // @ts-ignore
+      routes: { src: '/(.*)', dest: '/api/index.js' },
+    });
+    expect(error!.message).toEqual(
+      'Invalid vercel.json - `routes` should be array.'
+    );
+    expect(error!.link).toEqual(
+      'https://vercel.com/docs/concepts/projects/project-configuration#routes'
+    );
+  });
+
+  it('should error with invalid redirects array object', async () => {
+    const error = validateConfig({
+      redirects: [
+        // @ts-ignore
+        {
+          /* intentionally empty */
+        },
+      ],
+    });
+    expect(error!.message).toEqual(
+      'Invalid vercel.json - `redirects[0]` missing required property `source`.'
+    );
+    expect(error!.link).toEqual(
+      'https://vercel.com/docs/concepts/projects/project-configuration#redirects'
+    );
+  });
+
+  it('should error with invalid redirects.permanent poperty', async () => {
+    const error = validateConfig({
+      // @ts-ignore
+      redirects: [{ source: '/', destination: '/go', permanent: 'yes' }],
+    });
+    expect(error!.message).toEqual(
+      'Invalid vercel.json - `redirects[0].permanent` should be boolean.'
+    );
+    expect(error!.link).toEqual(
+      'https://vercel.com/docs/concepts/projects/project-configuration#redirects'
+    );
+  });
+
+  it('should error with invalid cleanUrls type', async () => {
+    const error = validateConfig({
+      // @ts-ignore
+      cleanUrls: 'true',
+    });
+    expect(error!.message).toEqual(
+      'Invalid vercel.json - `cleanUrls` should be boolean.'
+    );
+    expect(error!.link).toEqual(
+      'https://vercel.com/docs/concepts/projects/project-configuration#cleanurls'
+    );
+  });
+
+  it('should error with invalid trailingSlash type', async () => {
+    const error = validateConfig({
+      // @ts-ignore
+      trailingSlash: [true],
+    });
+    expect(error!.message).toEqual(
+      'Invalid vercel.json - `trailingSlash` should be boolean.'
+    );
+    expect(error!.link).toEqual(
+      'https://vercel.com/docs/concepts/projects/project-configuration#trailingslash'
+    );
+  });
+
+  it('should error with invalid headers property', async () => {
+    const error = validateConfig({
+      // @ts-ignore
+      headers: [{ 'Content-Type': 'text/html' }],
+    });
+    expect(error!.message).toEqual(
+      'Invalid vercel.json - `headers[0]` should NOT have additional property `Content-Type`. Please remove it.'
+    );
+    expect(error!.link).toEqual(
+      'https://vercel.com/docs/concepts/projects/project-configuration#headers'
+    );
+  });
+
+  it('should error with invalid headers.source type', async () => {
+    const error = validateConfig({
+      // @ts-ignore
+      headers: [{ source: [{ 'Content-Type': 'text/html' }] }],
+    });
+    expect(error!.message).toEqual(
+      'Invalid vercel.json - `headers[0].source` should be string.'
+    );
+    expect(error!.link).toEqual(
+      'https://vercel.com/docs/concepts/projects/project-configuration#headers'
+    );
+  });
+
+  it('should error with invalid headers additional property', async () => {
+    const error = validateConfig({
+      // @ts-ignore
+      headers: [{ source: '/', stuff: [{ 'Content-Type': 'text/html' }] }],
+    });
+    expect(error!.message).toEqual(
+      'Invalid vercel.json - `headers[0]` should NOT have additional property `stuff`. Please remove it.'
+    );
+    expect(error!.link).toEqual(
+      'https://vercel.com/docs/concepts/projects/project-configuration#headers'
+    );
+  });
+
+  it('should error with invalid headers wrong nested headers type', async () => {
+    const error = validateConfig({
+      // @ts-ignore
+      headers: [{ source: '/', headers: [{ 'Content-Type': 'text/html' }] }],
+    });
+    expect(error!.message).toEqual(
+      'Invalid vercel.json - `headers[0].headers[0]` should NOT have additional property `Content-Type`. Please remove it.'
+    );
+    expect(error!.link).toEqual(
+      'https://vercel.com/docs/concepts/projects/project-configuration#headers'
+    );
+  });
+
+  it('should error with invalid headers wrong nested headers additional property', async () => {
+    const error = validateConfig({
+      headers: [
+        // @ts-ignore
+        { source: '/', headers: [{ key: 'Content-Type', val: 'text/html' }] },
+      ],
+    });
+    expect(error!.message).toEqual(
+      'Invalid vercel.json - `headers[0].headers[0]` should NOT have additional property `val`. Please remove it.'
+    );
+    expect(error!.link).toEqual(
+      'https://vercel.com/docs/concepts/projects/project-configuration#headers'
+    );
+  });
+
+  it('should error with too many redirects', async () => {
+    const error = validateConfig({
+      redirects: Array.from({ length: 5000 }).map((_, i) => ({
+        source: `/${i}`,
+        destination: `/v/${i}`,
+      })),
+    });
+    expect(error!.message).toEqual(
+      'Invalid vercel.json - `redirects` should NOT have more than 2048 items.'
+    );
+    expect(error!.link).toEqual(
+      'https://vercel.com/docs/concepts/projects/project-configuration#redirects'
+    );
+  });
+
+  it('should error with too many nested headers', async () => {
+    const error = validateConfig({
+      headers: [
+        {
+          source: '/',
+          headers: [{ key: `x-id`, value: `123` }],
+        },
+        {
+          source: '/too-many',
+          headers: Array.from({ length: 5000 }).map((_, i) => ({
+            key: `${i}`,
+            value: `${i}`,
+          })),
+        },
+      ],
+    });
+    expect(error!.message).toEqual(
+      'Invalid vercel.json - `headers[1].headers` should NOT have more than 1024 items.'
+    );
+    expect(error!.link).toEqual(
+      'https://vercel.com/docs/concepts/projects/project-configuration#headers'
+    );
+  });
+
+  it('should error with too low memory value', async () => {
+    const error = validateConfig({
+      functions: {
+        'api/test.js': {
+          memory: 127,
+        },
+      },
+    });
+    expect(error!.message).toEqual(
+      "Invalid vercel.json - `functions['api/test.js'].memory` should be >= 128."
+    );
+    expect(error!.link).toEqual(
+      'https://vercel.com/docs/concepts/projects/project-configuration#functions'
+    );
+  });
+
+  it('should error with too high memory value', async () => {
+    const error = validateConfig({
+      functions: {
+        'api/test.js': {
+          memory: 10241,
+        },
+      },
+    });
+    expect(error!.message).toEqual(
+      "Invalid vercel.json - `functions['api/test.js'].memory` should be <= 10240."
+    );
+    expect(error!.link).toEqual(
+      'https://vercel.com/docs/concepts/projects/project-configuration#functions'
+    );
+  });
+
+  it('should not error with valid function regions', async () => {
+    const error = validateConfig({
+      functions: {
+        'api/test.js': {
+          regions: ['sfo1', 'iad1'],
+        },
+      },
+    });
+    expect(error).toBeNull();
+  });
+
+  it('should error with invalid function regions type', async () => {
+    const error = validateConfig({
+      functions: {
+        'api/test.js': {
+          // @ts-ignore
+          regions: 'iad1',
+        },
+      },
+    });
+    expect(error!.message).toEqual(
+      "Invalid vercel.json - `functions['api/test.js'].regions` should be array."
+    );
+    expect(error!.link).toEqual(
+      'https://vercel.com/docs/concepts/projects/project-configuration#functions'
+    );
+  });
+
+  it('should not error with valid functionFailoverRegions', async () => {
+    const error = validateConfig({
+      functions: {
+        'api/test.js': {
+          functionFailoverRegions: ['dub1', 'fra1'],
+        },
+      },
+    });
+    expect(error).toBeNull();
+  });
+
+  it('should error with invalid functionFailoverRegions type', async () => {
+    const error = validateConfig({
+      functions: {
+        'api/test.js': {
+          // @ts-ignore
+          functionFailoverRegions: 'dub1',
+        },
+      },
+    });
+    expect(error!.message).toEqual(
+      "Invalid vercel.json - `functions['api/test.js'].functionFailoverRegions` should be array."
+    );
+    expect(error!.link).toEqual(
+      'https://vercel.com/docs/concepts/projects/project-configuration#functions'
+    );
+  });
+
+  it('should error with "functions" and "builds"', async () => {
+    const error = validateConfig({
+      builds: [
+        {
+          src: 'index.html',
+          use: '@vercel/static',
+        },
+      ],
+      functions: {
+        'api/test.js': {
+          memory: 1024,
+        },
+      },
+    });
+    expect(error!.message).toEqual(
+      'The `functions` property cannot be used in conjunction with the `builds` property. Please remove one of them.'
+    );
+
+    expect(error!.link).toEqual('https://vercel.link/functions-and-builds');
+  });
+
+  it('should error when crons have missing schedule', () => {
+    const error = validateConfig({
+      // @ts-ignore
+      crons: [{ path: '/api/test.js' }],
+    });
+    expect(error!.message).toEqual(
+      'Invalid vercel.json - `crons[0]` missing required property `schedule`.'
+    );
+    expect(error!.link).toEqual(
+      'https://vercel.com/docs/concepts/projects/project-configuration#crons'
+    );
+  });
+
+  it('should error when crons have missing path', () => {
+    const error = validateConfig({
+      // @ts-ignore
+      crons: [{ schedule: '* * * * *' }],
+    });
+    expect(error!.message).toEqual(
+      'Invalid vercel.json - `crons[0]` missing required property `path`.'
+    );
+    expect(error!.link).toEqual(
+      'https://vercel.com/docs/concepts/projects/project-configuration#crons'
+    );
+  });
+
+  it('should error when path is too long', () => {
+    const error = validateConfig({
+      crons: [{ path: '/' + 'x'.repeat(512), schedule: '* * * * *' }],
+    });
+    expect(error!.message).toEqual(
+      'Invalid vercel.json - `crons[0].path` should NOT be longer than 512 characters.'
+    );
+    expect(error!.link).toEqual(
+      'https://vercel.com/docs/concepts/projects/project-configuration#crons'
+    );
+  });
+
+  it('should error when schedule is too long', () => {
+    const error = validateConfig({
+      crons: [{ path: '/', schedule: '*'.repeat(257) }],
+    });
+    expect(error!.message).toEqual(
+      'Invalid vercel.json - `crons[0].schedule` should NOT be longer than 256 characters.'
+    );
+    expect(error!.link).toEqual(
+      'https://vercel.com/docs/concepts/projects/project-configuration#crons'
+    );
+  });
+
+  it('should error when path is empty', () => {
+    const error = validateConfig({
+      crons: [{ path: '', schedule: '* * * * *' }],
+    });
+    expect(error!.message).toEqual(
+      'Invalid vercel.json - `crons[0].path` should NOT be shorter than 1 characters.'
+    );
+    expect(error!.link).toEqual(
+      'https://vercel.com/docs/concepts/projects/project-configuration#crons'
+    );
+  });
+
+  it('should error when schedule is too short', () => {
+    const error = validateConfig({
+      crons: [{ path: '/', schedule: '* * * * ' }],
+    });
+    expect(error!.message).toEqual(
+      'Invalid vercel.json - `crons[0].schedule` should NOT be shorter than 9 characters.'
+    );
+    expect(error!.link).toEqual(
+      'https://vercel.com/docs/concepts/projects/project-configuration#crons'
+    );
+  });
+
+  it("should error when path doesn't start with `/`", () => {
+    const error = validateConfig({
+      crons: [{ path: 'api/cron', schedule: '* * * * *' }],
+    });
+    expect(error!.message).toEqual(
+      'Invalid vercel.json - `crons[0].path` should match pattern "^/.*".'
+    );
+    expect(error!.link).toEqual(
+      'https://vercel.com/docs/concepts/projects/project-configuration#crons'
+    );
+  });
+
+  it.each([
+    'x86_64',
+    'arm64',
+  ] as const)('should not error with valid architecture: %s', architecture => {
+    const error = validateConfig({
+      functions: {
+        'api/user.go': { architecture, memory: 128, maxDuration: 5 },
+      },
+    });
+    expect(error).toBeNull();
+  });
+
+  it('should error with invalid architecture', () => {
+    const error = validateConfig({
+      functions: {
+        // @ts-ignore
+        'api/user.go': { architecture: 'invalid', memory: 128, maxDuration: 5 },
+      },
+    });
+    expect(error!.message).toEqual(
+      "Invalid vercel.json - `functions['api/user.go'].architecture` should be equal to one of the allowed values."
+    );
+    expect(error!.link).toEqual(
+      'https://vercel.com/docs/concepts/projects/project-configuration#functions'
+    );
+  });
+
+  it('should not error with valid experimentalTriggers', () => {
+    const error = validateConfig({
+      functions: {
+        'api/webhook.js': {
+          experimentalTriggers: [
+            {
+              type: 'queue/v1beta',
+              topic: 'user-events',
+              consumer: 'webhook-processors',
+              maxDeliveries: 3,
+              retryAfterSeconds: 10,
+              initialDelaySeconds: 0,
+              maxConcurrency: 5,
+            },
+          ],
+        },
+      },
+    });
+    expect(error).toBeNull();
+  });
+
+  it('should not error with minimal experimentalTriggers configuration', () => {
+    const error = validateConfig({
+      functions: {
+        'api/trigger.js': {
+          experimentalTriggers: [
+            {
+              type: 'queue/v1beta',
+              topic: 'test-topic',
+              consumer: 'test-consumer',
+            },
+          ],
+        },
+      },
+    });
+    expect(error).toBeNull();
+  });
+
+  it('should error with invalid experimentalTriggers type', () => {
+    const error = validateConfig({
+      functions: {
+        // @ts-ignore
+        'api/test.js': { experimentalTriggers: 'invalid' },
+      },
+    });
+    expect(error!.message).toEqual(
+      "Invalid vercel.json - `functions['api/test.js'].experimentalTriggers` should be array."
+    );
+    expect(error!.link).toEqual(
+      'https://vercel.com/docs/concepts/projects/project-configuration#functions'
+    );
+  });
+
+  it('should error with invalid type', () => {
+    const error = validateConfig({
+      functions: {
+        'api/test.js': {
+          experimentalTriggers: [
+            {
+              // @ts-ignore - Intentionally testing invalid type for runtime validation
+              type: 'invalid.type',
+              topic: 'test-topic',
+              consumer: 'test-consumer',
+            },
+          ],
+        },
+      },
+    });
+    expect(error!.message).toEqual(
+      "Invalid vercel.json - `functions['api/test.js'].experimentalTriggers[0].type` should be equal to constant."
+    );
+    expect(error!.link).toEqual(
+      'https://vercel.com/docs/concepts/projects/project-configuration#functions'
+    );
+  });
+
+  it('should error with missing type', () => {
+    const error = validateConfig({
+      functions: {
+        'api/test.js': {
+          experimentalTriggers: [
+            // @ts-expect-error - Testing missing required property
+            {
+              topic: 'test-topic',
+              consumer: 'test-consumer',
+            },
+          ],
+        },
+      },
+    });
+    expect(error!.message).toEqual(
+      "Invalid vercel.json - `functions['api/test.js'].experimentalTriggers[0]` missing required property `type`."
+    );
+    expect(error!.link).toEqual(
+      'https://vercel.com/docs/concepts/projects/project-configuration#functions'
+    );
+  });
+
+  it('should error with missing topic', () => {
+    const error = validateConfig({
+      functions: {
+        'api/test.js': {
+          experimentalTriggers: [
+            // @ts-expect-error - Testing missing required property
+            {
+              type: 'queue/v1beta',
+              consumer: 'test-consumer',
+            },
+          ],
+        },
+      },
+    });
+    expect(error!.message).toEqual(
+      "Invalid vercel.json - `functions['api/test.js'].experimentalTriggers[0]` missing required property `topic`."
+    );
+    expect(error!.link).toEqual(
+      'https://vercel.com/docs/concepts/projects/project-configuration#functions'
+    );
+  });
+
+  it('should error with missing consumer', () => {
+    const error = validateConfig({
+      functions: {
+        'api/test.js': {
+          experimentalTriggers: [
+            // @ts-expect-error - Testing missing required property
+            {
+              type: 'queue/v1beta',
+              topic: 'test-topic',
+            },
+          ],
+        },
+      },
+    });
+    expect(error!.message).toEqual(
+      "Invalid vercel.json - `functions['api/test.js'].experimentalTriggers[0]` missing required property `consumer`."
+    );
+    expect(error!.link).toEqual(
+      'https://vercel.com/docs/concepts/projects/project-configuration#functions'
+    );
+  });
+
+  it('should error with invalid maxDeliveries type', () => {
+    const error = validateConfig({
+      functions: {
+        'api/test.js': {
+          experimentalTriggers: [
+            {
+              type: 'queue/v1beta',
+              topic: 'test-topic',
+              consumer: 'test-consumer',
+              // @ts-expect-error - Testing invalid maxDeliveries type
+              maxDeliveries: 'three',
+            },
+          ],
+        },
+      },
+    });
+    expect(error!.message).toEqual(
+      "Invalid vercel.json - `functions['api/test.js'].experimentalTriggers[0].maxDeliveries` should be number."
+    );
+    expect(error!.link).toEqual(
+      'https://vercel.com/docs/concepts/projects/project-configuration#functions'
+    );
+  });
+
+  it('should error with invalid maxDeliveries value', () => {
+    const error = validateConfig({
+      functions: {
+        'api/test.js': {
+          experimentalTriggers: [
+            {
+              type: 'queue/v1beta',
+              topic: 'test-topic',
+              consumer: 'test-consumer',
+              maxDeliveries: 0,
+            },
+          ],
+        },
+      },
+    });
+    expect(error!.message).toEqual(
+      "Invalid vercel.json - `functions['api/test.js'].experimentalTriggers[0].maxDeliveries` should be >= 1."
+    );
+    expect(error!.link).toEqual(
+      'https://vercel.com/docs/concepts/projects/project-configuration#functions'
+    );
+  });
+
+  it('should error with zero retryAfterSeconds', () => {
+    const error = validateConfig({
+      functions: {
+        'api/test.js': {
+          experimentalTriggers: [
+            {
+              type: 'queue/v1beta',
+              topic: 'test-topic',
+              consumer: 'test-consumer',
+              retryAfterSeconds: 0,
+            },
+          ],
+        },
+      },
+    });
+    expect(error!.message).toEqual(
+      "Invalid vercel.json - `functions['api/test.js'].experimentalTriggers[0].retryAfterSeconds` should be > 0."
+    );
+    expect(error!.link).toEqual(
+      'https://vercel.com/docs/concepts/projects/project-configuration#functions'
+    );
+  });
+
+  it('should error with negative initialDelaySeconds', () => {
+    const error = validateConfig({
+      functions: {
+        'api/test.js': {
+          experimentalTriggers: [
+            {
+              type: 'queue/v1beta',
+              topic: 'test-topic',
+              consumer: 'test-consumer',
+              initialDelaySeconds: -1,
+            },
+          ],
+        },
+      },
+    });
+    expect(error!.message).toEqual(
+      "Invalid vercel.json - `functions['api/test.js'].experimentalTriggers[0].initialDelaySeconds` should be >= 0."
+    );
+    expect(error!.link).toEqual(
+      'https://vercel.com/docs/concepts/projects/project-configuration#functions'
+    );
+  });
+
+  it('should allow zero initialDelaySeconds', () => {
+    const error = validateConfig({
+      functions: {
+        'api/test.js': {
+          experimentalTriggers: [
+            {
+              type: 'queue/v1beta',
+              topic: 'test-topic',
+              consumer: 'test-consumer',
+              initialDelaySeconds: 0,
+            },
+          ],
+        },
+      },
+    });
+    expect(error).toBeNull();
+  });
+
+  it('should error with invalid maxConcurrency type', () => {
+    const error = validateConfig({
+      functions: {
+        'api/test.js': {
+          experimentalTriggers: [
+            {
+              type: 'queue/v1beta',
+              topic: 'test-topic',
+              consumer: 'test-consumer',
+              // @ts-expect-error - Testing invalid maxConcurrency type
+              maxConcurrency: 'five',
+            },
+          ],
+        },
+      },
+    });
+    expect(error!.message).toEqual(
+      "Invalid vercel.json - `functions['api/test.js'].experimentalTriggers[0].maxConcurrency` should be number."
+    );
+    expect(error!.link).toEqual(
+      'https://vercel.com/docs/concepts/projects/project-configuration#functions'
+    );
+  });
+
+  it('should error with invalid maxConcurrency value', () => {
+    const error = validateConfig({
+      functions: {
+        'api/test.js': {
+          experimentalTriggers: [
+            {
+              type: 'queue/v1beta',
+              topic: 'test-topic',
+              consumer: 'test-consumer',
+              maxConcurrency: 0,
+            },
+          ],
+        },
+      },
+    });
+    expect(error!.message).toEqual(
+      "Invalid vercel.json - `functions['api/test.js'].experimentalTriggers[0].maxConcurrency` should be >= 1."
+    );
+    expect(error!.link).toEqual(
+      'https://vercel.com/docs/concepts/projects/project-configuration#functions'
+    );
+  });
+
+  it('should allow supportsCancellation boolean', () => {
+    const error = validateConfig({
+      functions: {
+        'api/test.js': {
+          supportsCancellation: true,
+        },
+      },
+    });
+    expect(error).toBeNull();
+  });
+
+  it('should allow strict function affinity', () => {
+    const error = validateConfig({
+      services: {
+        api: {
+          root: 'api',
+          functions: {
+            'test.js': {
+              affinity: { mode: 'strict' },
+            },
+          },
+        },
+      },
+    });
+    expect(error).toBeNull();
+  });
+
+  it.each([
+    {},
+    { mode: 'loose' },
+    { mode: 'strict', extra: true },
+  ])('should reject invalid function affinity %o', affinity => {
+    const error = validateConfig({
+      functions: {
+        'api/test.js': {
+          affinity: affinity as any,
+        },
+      },
+    });
+    expect(error).not.toBeNull();
+  });
+
+  it('should error with invalid supportsCancellation type', () => {
+    const error = validateConfig({
+      functions: {
+        'api/test.js': {
+          supportsCancellation: 'true' as any,
+        },
+      },
+    });
+    expect(error?.message).toMatch(
+      "Invalid vercel.json - `functions['api/test.js'].supportsCancellation` should be boolean."
+    );
+    expect(error?.link).toEqual(
+      'https://vercel.com/docs/concepts/projects/project-configuration#functions'
+    );
+  });
+
+  describe('queue/v2beta', () => {
+    it('should allow valid v2beta trigger without consumer', () => {
+      const error = validateConfig({
+        functions: {
+          'api/test.js': {
+            experimentalTriggers: [
+              {
+                type: 'queue/v2beta',
+                topic: 'test-topic',
+              },
+            ],
+          },
+        },
+      });
+      expect(error).toBeNull();
+    });
+
+    it('should allow v2beta trigger with optional fields', () => {
+      const error = validateConfig({
+        functions: {
+          'api/test.js': {
+            experimentalTriggers: [
+              {
+                type: 'queue/v2beta',
+                topic: 'test-topic',
+                maxDeliveries: 3,
+                retryAfterSeconds: 10,
+                initialDelaySeconds: 60,
+                maxConcurrency: 5,
+              },
+            ],
+          },
+        },
+      });
+      expect(error).toBeNull();
+    });
+
+    it('should error when v2beta has consumer field', () => {
+      const error = validateConfig({
+        functions: {
+          'api/test.js': {
+            experimentalTriggers: [
+              {
+                type: 'queue/v2beta',
+                topic: 'test-topic',
+                consumer: 'should-not-be-here',
+              } as any,
+            ],
+          },
+        },
+      });
+      expect(error).not.toBeNull();
+      expect(error!.link).toEqual(
+        'https://vercel.com/docs/concepts/projects/project-configuration#functions'
+      );
+    });
+
+    it('should error when v2beta has missing topic', () => {
+      const error = validateConfig({
+        functions: {
+          'api/test.js': {
+            experimentalTriggers: [
+              {
+                type: 'queue/v2beta',
+              } as any,
+            ],
+          },
+        },
+      });
+      expect(error).not.toBeNull();
+      expect(error!.link).toEqual(
+        'https://vercel.com/docs/concepts/projects/project-configuration#functions'
+      );
+    });
+
+    it('should error when v2beta has invalid maxDeliveries', () => {
+      const error = validateConfig({
+        functions: {
+          'api/test.js': {
+            experimentalTriggers: [
+              {
+                type: 'queue/v2beta',
+                topic: 'test-topic',
+                maxDeliveries: 0,
+              },
+            ],
+          },
+        },
+      });
+      expect(error).not.toBeNull();
+      expect(error!.link).toEqual(
+        'https://vercel.com/docs/concepts/projects/project-configuration#functions'
+      );
+    });
+  });
+});

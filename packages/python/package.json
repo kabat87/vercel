@@ -1,12 +1,12 @@
 {
   "name": "@vercel/python",
-  "version": "2.0.6-canary.4",
+  "version": "13.0.1",
   "main": "./dist/index.js",
-  "license": "MIT",
+  "license": "Apache-2.0",
   "homepage": "https://vercel.com/docs/runtimes#official-runtimes/python",
   "files": [
     "dist",
-    "vc_init.py"
+    "templates"
   ],
   "repository": {
     "type": "git",
@@ -14,14 +14,40 @@
     "directory": "packages/python"
   },
   "scripts": {
-    "build": "node build",
-    "test-integration-once": "jest --env node --verbose --runInBand --bail",
-    "prepublishOnly": "node build"
+    "build": "node ../../utils/build-builder.mjs",
+    "type-check": "tsc --noEmit",
+    "test": "cross-env VERCEL_FORCE_PYTHON_STREAMING=1 NODE_OPTIONS=--experimental-vm-modules vitest run --config ../../vitest.config.mts",
+    "test-unit": "cross-env VERCEL_FORCE_PYTHON_STREAMING=1 NODE_OPTIONS=--experimental-vm-modules vitest run --config ../../vitest.config.mts test/unit",
+    "test-e2e": "cross-env VERCEL_FORCE_PYTHON_STREAMING=1 NODE_OPTIONS=--experimental-vm-modules vitest run --config ../../vitest.config.mts test/integration-",
+    "test-e2e-builder": "pnpm run test-e2e"
+  },
+  "dependencies": {
+    "@vercel/python-analysis": "workspace:*"
+  },
+  "peerDependencies": {
+    "@vercel/build-utils": "workspace:*"
   },
   "devDependencies": {
+    "@vercel/build-utils": "workspace:*",
+    "@renovatebot/pep440": "4.2.1",
     "@types/execa": "^0.9.0",
-    "@vercel/ncc": "0.24.0",
+    "@types/fs-extra": "11.0.2",
+    "@types/node": "20.11.0",
+    "@types/semver": "6.0.0",
+    "@types/which": "3.0.0",
+    "@vercel/error-utils": "workspace:*",
+    "@vercel/python-runtime": "workspace:*",
+    "cross-env": "7.0.3",
+    "detect-libc": "2.1.2",
     "execa": "^1.0.0",
-    "typescript": "4.3.4"
+    "fs-extra": "11.1.1",
+    "get-port": "5.1.1",
+    "is-port-reachable": "3.1.0",
+    "minimatch": "10.1.1",
+    "pip-requirements-js": "1.0.2",
+    "semver": "6.3.1",
+    "smol-toml": "1.5.2",
+    "vitest": "4.1.10",
+    "which": "3.0.0"
   }
 }

@@ -1,6 +1,6 @@
 import assert from 'assert';
 import intoStream from 'into-stream';
-import { File } from './types';
+import { FileBase } from './types';
 
 interface FileBlobOptions {
   mode?: number;
@@ -14,7 +14,7 @@ interface FromStreamOptions {
   stream: NodeJS.ReadableStream;
 }
 
-export default class FileBlob implements File {
+export default class FileBlob implements FileBase {
   public type: 'FileBlob';
   public mode: number;
   public data: string | Buffer;
@@ -36,10 +36,16 @@ export default class FileBlob implements File {
   }: FromStreamOptions) {
     assert(typeof mode === 'number');
     assert(typeof stream.pipe === 'function'); // is-stream
-    const chunks: Buffer[] = [];
+    const chunks: Uint8Array[] = [];
 
     await new Promise<void>((resolve, reject) => {
-      stream.on('data', chunk => chunks.push(Buffer.from(chunk)));
+      stream.on('data', chunk =>
+        // Usually the chunks we receive here are already buffers, so we
+        // avoid the extra buffer copy in those cases to save memory
+        chunks.push(
+          Uint8Array.from(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk))
+        )
+      );
       stream.on('error', error => reject(error));
       stream.on('end', () => resolve());
     });
@@ -48,7 +54,19 @@ export default class FileBlob implements File {
     return new FileBlob({ mode, contentType, data });
   }
 
+  async toStreamAsync(): Promise<NodeJS.ReadableStream> {
+    return this.toStream();
+  }
+
   toStream(): NodeJS.ReadableStream {
-    return intoStream(this.data);
+    // Encode strings before streaming. into-stream@5 slices strings with
+    // String#slice at the ~16KiB highWaterMark; a UTF-16 surrogate pair
+    // (any 4-byte UTF-8 character) on that boundary is split and each half
+    // becomes U+FFFD when re-encoded, corrupting Edge Function bundles.
+    const data =
+      typeof this.data === 'string'
+        ? Buffer.from(this.data, 'utf8')
+        : this.data;
+    return intoStream(data);
   }
 }

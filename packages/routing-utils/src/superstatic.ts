@@ -3,8 +3,94 @@
  * See https://github.com/firebase/superstatic#configuration
  */
 import { parse as parseUrl, format as formatUrl } from 'url';
-import { pathToRegexp, compile, Key } from 'path-to-regexp';
-import { Route, Redirect, Rewrite, HasField, Header } from './types';
+import {
+  Route,
+  RouteWithSrc,
+  Redirect,
+  Rewrite,
+  HasField,
+  Header,
+} from './types';
+
+/*
+  [START] Temporary double-install of path-to-regexp to compare the impact of the update
+  https://linear.app/vercel/issue/ZERO-3067/log-potential-impact-of-path-to-regexpupdate
+*/
+import {
+  pathToRegexp as pathToRegexpCurrent,
+  Key,
+  compile,
+} from 'path-to-regexp';
+import { pathToRegexp as pathToRegexpUpdated } from 'path-to-regexp-updated';
+
+function cloneKeys(keys: Key[] | undefined): Key[] | undefined {
+  if (typeof keys === 'undefined') {
+    return undefined;
+  }
+
+  return keys.slice(0);
+}
+
+function compareKeys(left: Key[] | undefined, right: Key[] | undefined) {
+  const leftSerialized =
+    typeof left === 'undefined' ? 'undefined' : left.toString();
+  const rightSerialized =
+    typeof right === 'undefined' ? 'undefined' : right.toString();
+  return leftSerialized === rightSerialized;
+}
+
+// run the updated version of path-to-regexp, compare the results, and log if different
+export function pathToRegexp(
+  callerId: string,
+  path: string,
+  keys?: Key[],
+  options?: { strict: boolean; sensitive: boolean; delimiter: string }
+) {
+  const newKeys = cloneKeys(keys);
+  const currentRegExp = pathToRegexpCurrent(path, keys, options);
+
+  try {
+    const currentKeys = keys;
+    const newRegExp = pathToRegexpUpdated(path, newKeys, options);
+
+    // FORCE_PATH_TO_REGEXP_LOG can be used to force these logs to render
+    // for verification that they show up in the build logs as expected
+
+    const isDiffRegExp = currentRegExp.toString() !== newRegExp.toString();
+    if (process.env.FORCE_PATH_TO_REGEXP_LOG || isDiffRegExp) {
+      const message = JSON.stringify({
+        path,
+        currentRegExp: currentRegExp.toString(),
+        newRegExp: newRegExp.toString(),
+      });
+      console.error(`[vc] PATH TO REGEXP PATH DIFF @ #${callerId}: ${message}`);
+    }
+
+    const isDiffKeys = !compareKeys(keys, newKeys);
+    if (process.env.FORCE_PATH_TO_REGEXP_LOG || isDiffKeys) {
+      const message = JSON.stringify({
+        isDiffKeys,
+        currentKeys,
+        newKeys,
+      });
+      console.error(`[vc] PATH TO REGEXP KEYS DIFF @ #${callerId}: ${message}`);
+    }
+  } catch (err) {
+    const error = err as Error;
+    const message = JSON.stringify({
+      path,
+      error: error.message,
+    });
+
+    console.error(`[vc] PATH TO REGEXP ERROR @ #${callerId}: ${message}`);
+  }
+
+  return currentRegExp;
+}
+/*
+  [END] Temporary double-install of path-to-regexp to compare the impact of the update
+  https://linear.app/vercel/issue/ZERO-3067/log-potential-impact-of-path-to-regexpupdate
+*/
 
 const UN_NAMED_SEGMENT = '__UN_NAMED_SEGMENT__';
 
@@ -51,6 +137,9 @@ export function convertRedirects(
   return redirects.map(r => {
     const { src, segments } = sourceToRegex(r.source);
     const hasSegments = collectHasSegments(r.has);
+    normalizeHasKeys(r.has);
+    normalizeHasKeys(r.missing);
+
     try {
       const loc = replaceSegments(segments, hasSegments, r.destination, true);
       let status: number;
@@ -67,11 +156,17 @@ export function convertRedirects(
         status,
       };
 
+      if (typeof r.env !== 'undefined') {
+        route.env = r.env;
+      }
       if (r.has) {
         route.has = r.has;
       }
+      if (r.missing) {
+        route.missing = r.missing;
+      }
       return route;
-    } catch (e) {
+    } catch (_e) {
       throw new Error(`Failed to parse redirect: ${JSON.stringify(r)}`);
     }
   });
@@ -84,21 +179,66 @@ export function convertRewrites(
   return rewrites.map(r => {
     const { src, segments } = sourceToRegex(r.source);
     const hasSegments = collectHasSegments(r.has);
-    try {
-      const dest = replaceSegments(
-        segments,
-        hasSegments,
-        r.destination,
-        false,
-        internalParamNames
-      );
-      const route: Route = { src, dest, check: true };
+    normalizeHasKeys(r.has);
+    normalizeHasKeys(r.missing);
 
+    try {
+      // Replace `:param` placeholders with `$1`/`$name` backrefs that point at
+      // the source's capture groups.
+      const interpolate = (value: string): string =>
+        replaceSegments(
+          segments,
+          hasSegments,
+          value,
+          false,
+          internalParamNames
+        );
+
+      let route: RouteWithSrc;
+      if (typeof r.destination === 'string') {
+        route = { src, dest: interpolate(r.destination), check: true };
+      } else {
+        // Service destination: a terminal handoff into the target service's
+        // route table. Interpolate `path` like a string `dest`.
+        const destination = { ...r.destination, type: 'service' as const };
+        if (typeof destination.path === 'string') {
+          destination.path = interpolate(destination.path);
+        }
+        route = { src, destination };
+      }
+
+      if (r.transforms) {
+        route.transforms = r.transforms.map(transform => {
+          if (transform.type !== 'request.path') {
+            return { ...transform };
+          }
+
+          return {
+            ...transform,
+            args: compilePathToRegexpTemplateFromSegments(
+              transform.args,
+              segments,
+              hasSegments,
+              transform.env
+            ),
+          };
+        });
+      }
+
+      if (typeof r.env !== 'undefined') {
+        route.env = r.env;
+      }
       if (r.has) {
         route.has = r.has;
       }
+      if (r.missing) {
+        route.missing = r.missing;
+      }
+      if (r.statusCode) {
+        route.status = r.statusCode;
+      }
       return route;
-    } catch (e) {
+    } catch (_e) {
       throw new Error(`Failed to parse rewrite: ${JSON.stringify(r)}`);
     }
   });
@@ -109,6 +249,9 @@ export function convertHeaders(headers: Header[]): Route[] {
     const obj: { [key: string]: string } = {};
     const { src, segments } = sourceToRegex(h.source);
     const hasSegments = collectHasSegments(h.has);
+    normalizeHasKeys(h.has);
+    normalizeHasKeys(h.missing);
+
     const namedSegments = segments.filter(name => name !== UN_NAMED_SEGMENT);
     const indexes: { [k: string]: string } = {};
 
@@ -139,6 +282,9 @@ export function convertHeaders(headers: Header[]): Route[] {
 
     if (h.has) {
       route.has = h.has;
+    }
+    if (h.missing) {
+      route.missing = h.missing;
     }
     return route;
   });
@@ -175,7 +321,7 @@ export function sourceToRegex(source: string): {
   segments: string[];
 } {
   const keys: Key[] = [];
-  const r = pathToRegexp(source, keys, {
+  const r = pathToRegexp('632', source, keys, {
     strict: true,
     sensitive: true,
     delimiter: '/',
@@ -191,22 +337,46 @@ export function sourceToRegex(source: string): {
   return { src: r.source, segments };
 }
 
-const namedGroupsRegex = /\(\?<([a-zA-Z][a-zA-Z0-9]*)>/g;
+// The ECMA-262 specification explicitly allows for underscores in
+// CaptureGroupName's (see https://tc39.es/ecma262/#prod-GroupName).
+const namedGroupsRegex = /\(\?<([a-zA-Z][a-zA-Z0-9_]*)>/g;
+
+const normalizeHasKeys = (hasItems: HasField = []) => {
+  for (const hasItem of hasItems) {
+    if ('key' in hasItem && hasItem.type === 'header') {
+      hasItem.key = hasItem.key.toLowerCase();
+    }
+  }
+  return hasItems;
+};
+
+function getStringValueForRegex(
+  value: HasField[number]['value'] | undefined
+): string | null {
+  if (typeof value === 'string') {
+    return value;
+  }
+
+  if (value && typeof value === 'object' && value !== null) {
+    if ('re' in value && typeof value.re === 'string') {
+      return value.re;
+    }
+  }
+
+  return null;
+}
 
 export function collectHasSegments(has?: HasField) {
   const hasSegments = new Set<string>();
 
   for (const hasItem of has || []) {
-    if ('key' in hasItem && hasItem.type === 'header') {
-      hasItem.key = hasItem.key.toLowerCase();
-    }
-
     if (!hasItem.value && 'key' in hasItem) {
       hasSegments.add(hasItem.key);
     }
 
-    if (hasItem.value) {
-      for (const match of hasItem.value.matchAll(namedGroupsRegex)) {
+    const stringValue = getStringValueForRegex(hasItem.value);
+    if (stringValue) {
+      for (const match of stringValue.matchAll(namedGroupsRegex)) {
         if (match[1]) {
           hasSegments.add(match[1]);
         }
@@ -224,6 +394,116 @@ const escapeSegment = (str: string, segmentName: string) =>
   str.replace(new RegExp(`:${segmentName}`, 'g'), `__ESC_COLON_${segmentName}`);
 
 const unescapeSegments = (str: string) => str.replace(/__ESC_COLON_/gi, ':');
+
+const pathTemplateSegmentNameRegex = /^([a-zA-Z_][a-zA-Z0-9_]*)/;
+
+function isEscaped(value: string, index: number): boolean {
+  let backslashCount = 0;
+  for (let i = index - 1; i >= 0 && value[i] === '\\'; i--) {
+    backslashCount++;
+  }
+  return backslashCount % 2 === 1;
+}
+
+function collectPathTemplateSegments(template: string): string[] {
+  const segments: string[] = [];
+
+  for (let i = 0; i < template.length; i++) {
+    if (template[i] !== ':' || isEscaped(template, i)) {
+      continue;
+    }
+
+    const match = template.slice(i + 1).match(pathTemplateSegmentNameRegex);
+    if (match) {
+      segments.push(match[1]);
+      i += match[1].length;
+    }
+  }
+
+  return segments;
+}
+
+function collectNamedDollarReferences(template: string): string[] {
+  const references: string[] = [];
+
+  for (let i = 0; i < template.length; i++) {
+    if (template[i] !== '$' || isEscaped(template, i)) {
+      continue;
+    }
+
+    const remainder = template.slice(i + 1);
+    const bracedMatch = remainder.match(/^\{([a-zA-Z_][a-zA-Z0-9_]*)\}/);
+    const unbracedMatch = remainder.match(pathTemplateSegmentNameRegex);
+    const name = bracedMatch?.[1] || unbracedMatch?.[1];
+    if (name) {
+      references.push(name);
+    }
+  }
+
+  return references;
+}
+
+function compilePathToRegexpTemplateFromSegments(
+  template: string,
+  segments: string[],
+  hasItemSegments: string[],
+  env: string[] = []
+): string {
+  const indexes: Record<string, string> = {};
+
+  segments.forEach((name, index) => {
+    indexes[name] = toSegmentDest(index);
+  });
+
+  // Named `has` captures remain named in the low-level route matcher.
+  hasItemSegments.forEach(name => {
+    indexes[name] = `$${name}`;
+  });
+
+  for (const name of collectPathTemplateSegments(template)) {
+    if (!(name in indexes)) {
+      throw new Error(
+        `Path template references parameter ":${name}" that is not present in the source or has conditions.`
+      );
+    }
+  }
+
+  const routeParameters = new Set([
+    ...segments.filter(name => name !== UN_NAMED_SEGMENT),
+    ...hasItemSegments,
+  ]);
+  for (const name of collectNamedDollarReferences(template)) {
+    if (routeParameters.has(name) && !env.includes(name)) {
+      throw new Error(
+        `Path template references route parameter "${name}" as \`$${name}\`. Use \`:${name}\` path-to-regexp syntax in high-level rewrites, or list "${name}" in the transform env allowlist if it is an environment variable.`
+      );
+    }
+  }
+
+  return safelyCompile(template, indexes, true);
+}
+
+/**
+ * Compiles a high-level path-to-regexp template into the capture syntax used by
+ * low-level routes. Source parameters become numbered captures (`:path*` ->
+ * `$1`) while named `has` captures remain named (`:tenant` -> `$tenant`).
+ * Existing `$N` and environment-variable references are preserved. An env
+ * allowlist disambiguates a `$name` reference that collides with a route param.
+ */
+export function compilePathToRegexpTemplate(
+  source: string,
+  template: string,
+  has?: HasField,
+  env?: string[]
+): string {
+  const { segments } = sourceToRegex(source);
+  return compilePathToRegexpTemplateFromSegments(
+    template,
+    segments,
+    collectHasSegments(has),
+    env
+  );
+}
 
 function replaceSegments(
   segments: string[],
@@ -260,7 +540,6 @@ function replaceSegments(
   delete (parsedDestination as any).path;
   delete (parsedDestination as any).search;
   delete (parsedDestination as any).host;
-  // eslint-disable-next-line prefer-const
   let { pathname, hash, query, hostname, ...rest } = parsedDestination;
   pathname = unescapeSegments(pathname || '');
   hash = unescapeSegments(hash || '');
@@ -273,9 +552,9 @@ function replaceSegments(
   const hostnameKeys: Key[] = [];
 
   try {
-    pathToRegexp(pathname, pathnameKeys);
-    pathToRegexp(hash || '', hashKeys);
-    pathToRegexp(hostname || '', hostnameKeys);
+    pathToRegexp('528', pathname, pathnameKeys);
+    pathToRegexp('834', hash || '', hashKeys);
+    pathToRegexp('712', hostname || '', hostnameKeys);
   } catch (_) {
     // this is not fatal so don't error when failing to parse the
     // params from the destination
@@ -297,7 +576,12 @@ function replaceSegments(
         safelyCompile(unescapeSegments(str), indexes, true)
       );
     } else {
-      query[key] = safelyCompile(unescapeSegments(strOrArray), indexes, true);
+      // TODO: handle strOrArray is undefined
+      query[key] = safelyCompile(
+        unescapeSegments(strOrArray as string),
+        indexes,
+        true
+      );
     }
   }
 
@@ -349,7 +633,7 @@ function safelyCompile(
       // to safely compiling to handle edge cases if path-to-regexp compile
       // fails
       return compile(value, { validate: false })(indexes);
-    } catch (e) {
+    } catch (_e) {
       // non-fatal, we continue to safely compile
     }
   }
@@ -381,7 +665,7 @@ function safelyCompile(
 
   // the value needs to start with a forward-slash to be compiled
   // correctly
-  return compile(`/${value}`, { validate: false })(indexes).substr(1);
+  return compile(`/${value}`, { validate: false })(indexes).slice(1);
 }
 
 function toSegmentDest(index: number): string {

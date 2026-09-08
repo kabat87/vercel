@@ -1,0 +1,1242 @@
+import type {
+  AutoProvisionedResponse,
+  AutoProvisionFallback,
+  Configuration,
+  InstallationBalancesAndThresholds,
+  Integration,
+  MetadataSchema,
+} from '../../src/util/integration/types';
+import type { Resource } from '../../src/util/integration-resource/types';
+import { client } from './client';
+
+const metadataSchema1: MetadataSchema = {
+  type: 'object',
+  properties: {
+    region: {
+      'ui:control': 'select',
+      'ui:label': 'Primary Region',
+      default: 'us-east-1',
+      description: 'Primary region where your database will be hosted',
+      'ui:placeholder': 'Choose your region',
+      type: 'string',
+      'ui:hidden': 'update',
+      'ui:options': [
+        {
+          value: 'us-west-1',
+          label: 'West US (North California)',
+        },
+        {
+          value: 'us-east-1',
+          label: 'East US (North Virginia)',
+        },
+      ],
+    },
+  },
+  required: ['region'],
+};
+
+const metadataSchema2: MetadataSchema = {
+  type: 'object',
+  properties: {
+    version: {
+      'ui:label': 'Version',
+      'ui:control': 'select',
+      description: 'Version to use',
+      type: 'string',
+      default: '5.6',
+      'ui:options': [
+        {
+          value: '5.6',
+          label: '5.6 (latest)',
+        },
+        {
+          label: '5.4',
+          value: '5.4',
+        },
+        {
+          label: '5.2',
+          value: '5.2',
+        },
+        {
+          label: '4.5',
+          value: '4.5',
+        },
+        {
+          label: '4.2',
+          value: '4.2',
+        },
+      ],
+    },
+    region: {
+      'ui:label': 'Region',
+      'ui:hidden': 'update',
+      'ui:control': 'vercel-region',
+      type: 'string',
+      default: 'cle1',
+      'ui:options': ['pdx1', 'cle1', 'dub1'],
+    },
+    compute: {
+      'ui:label': 'Compute',
+      description: '',
+      'ui:control': 'select',
+      'ui:hidden': true,
+      type: 'string',
+      'ui:options': [
+        {
+          value: '1/4',
+          label: '1/4 compute unit',
+          hidden: true,
+        },
+        {
+          label: '1 compute unit (0.25vCPU, 2GiB RAM)',
+          value: '1',
+        },
+        {
+          label: '2 compute units (0.5vCPU, 4GiB RAM)',
+          value: '2',
+        },
+        {
+          label: '3 compute units (0.75vCPU, 6GiB RAM)',
+          value: '3',
+        },
+        {
+          label: '4 compute units (1vCPU, 8GiB RAM)',
+          value: '4',
+        },
+        {
+          label: '8 compute units (2vCPU, 16GiB RAM)',
+          value: '8',
+        },
+        {
+          label: '12 compute units (3vCPU, 24GiB RAM)',
+          value: '12',
+        },
+      ],
+    },
+    storage: {
+      type: 'number',
+      'ui:control': 'input',
+      'ui:hidden': true,
+      'ui:label': 'Storage',
+      description: 'Disk space in GiB',
+      minimum: 1,
+      maximum: 256,
+    },
+  },
+  required: ['version', 'region'],
+};
+
+const metadataSchema3: MetadataSchema = {
+  type: 'object',
+  properties: {
+    Region: {
+      'ui:label': 'Region',
+      description: '',
+      default: 'us-east-1',
+      'ui:read-only': true,
+      'ui:control': 'vercel-region',
+      type: 'string',
+      'ui:options': [
+        {
+          value: 'us-east-1',
+          label: 'US East (N. Virginia) us-east-1',
+        },
+      ],
+    },
+  },
+  required: ['Region'],
+};
+
+const metadataFullTypes: MetadataSchema = {
+  type: 'object',
+  properties: {
+    region: {
+      'ui:control': 'select',
+      'ui:label': 'Region',
+      type: 'string',
+      'ui:options': ['iad1', 'sfo1'],
+    },
+    auth: {
+      'ui:control': 'toggle',
+      'ui:label': 'Auth',
+      description: 'Enable built-in authentication',
+      type: 'boolean',
+      default: false,
+    },
+    readRegions: {
+      type: 'array',
+      'ui:control': 'multi-vercel-region',
+      'ui:label': 'Read Regions',
+      items: { type: 'string' },
+      'ui:options': ['iad1', 'sfo1', 'fra1'],
+    },
+  },
+  required: ['region'],
+};
+
+const integrations: Record<string, Integration> = {
+  acme: {
+    id: 'acme',
+    name: 'Acme Integration',
+    slug: 'acme',
+    eulaDocUri: 'https://example.com/eula',
+    privacyDocUri: 'https://example.com/privacy',
+    products: [
+      {
+        id: 'acme-product',
+        name: 'Acme Product',
+        slug: 'acme',
+        type: 'storage',
+        shortDescription: 'The Acme product',
+        metadataSchema: metadataSchema1,
+      },
+    ],
+  },
+  'acme-skills': {
+    id: 'acme-skills',
+    name: 'Acme Integration With Skills',
+    slug: 'acme-skills',
+    eulaDocUri: 'https://example.com/eula',
+    privacyDocUri: 'https://example.com/privacy',
+    products: [
+      {
+        id: 'acme-product',
+        name: 'Acme Product',
+        slug: 'acme',
+        type: 'storage',
+        shortDescription: 'The Acme product',
+        metadataSchema: metadataSchema1,
+        agentSkills: [
+          'https://github.com/Shopify/Shopify-AI-Toolkit/blob/main/skills/shopify-dev/SKILL.md',
+        ],
+      },
+    ],
+  },
+  'acme-two-products': {
+    id: 'acme-two-products',
+    name: 'Acme Integration Two Products',
+    slug: 'acme-two-products',
+    eulaDocUri: 'https://example.com/eula',
+    privacyDocUri: 'https://example.com/privacy',
+    products: [
+      {
+        id: 'acme-product-a',
+        name: 'Acme Product A',
+        slug: 'acme-a',
+        type: 'storage',
+        shortDescription: 'The Acme A product',
+        metadataSchema: metadataSchema2,
+      },
+      {
+        id: 'acme-product-b',
+        name: 'Acme Product B',
+        slug: 'acme-b',
+        type: 'storage',
+        shortDescription: 'The Acme B product',
+        metadataSchema: metadataSchema3,
+      },
+    ],
+  },
+  'aws-apg': {
+    id: 'aws-apg',
+    name: 'Aurora Postgres',
+    slug: 'aws-apg',
+    capabilities: {
+      requiresBrowserInstall: true,
+    },
+    products: [
+      {
+        id: 'aws-apg-product',
+        name: 'Aurora Postgres',
+        slug: 'aws-apg',
+        type: 'storage',
+        shortDescription: 'Amazon Aurora PostgreSQL',
+        metadataSchema: metadataSchema1,
+      },
+    ],
+  },
+  neon: {
+    id: 'neon',
+    name: 'Neon',
+    slug: 'neon',
+    products: [
+      {
+        id: 'neon-product',
+        name: 'Neon Postgres',
+        slug: 'neon',
+        type: 'storage',
+        shortDescription: 'Serverless Postgres database',
+        metadataSchema: metadataSchema1,
+      },
+    ],
+  },
+  'acme-external': {
+    id: 'acme-external',
+    name: 'Acme Integration External',
+    slug: 'acme-external',
+  },
+  'acme-no-products': {
+    id: 'acme-no-products',
+    name: 'Acme Integration No Products',
+    slug: 'acme-no-products',
+    products: [],
+  },
+  'acme-full-schema': {
+    id: 'acme-full-schema',
+    name: 'Acme Full Schema',
+    slug: 'acme-full-schema',
+    products: [
+      {
+        id: 'acme-product',
+        name: 'Acme Product',
+        slug: 'acme',
+        type: 'storage',
+        shortDescription: 'The Acme product with all field types',
+        metadataSchema: metadataFullTypes,
+      },
+    ],
+  },
+  'acme-prepayment': {
+    id: 'acme-prepayment',
+    name: 'Acme Prepayment',
+    slug: 'acme-prepayment',
+    products: [
+      {
+        id: 'acme-product',
+        name: 'Acme Product',
+        slug: 'acme',
+        type: 'ai',
+        shortDescription: 'The Acme product',
+        metadataSchema: metadataSchema1,
+      },
+    ],
+  },
+  // Sentry-like integration with both installation-level and product-level metadata
+  'acme-install-meta': {
+    id: 'acme-install-meta',
+    name: 'Acme Install Meta',
+    slug: 'acme-install-meta',
+    eulaDocUri: 'https://example.com/eula',
+    privacyDocUri: 'https://example.com/privacy',
+    metadataSchema: {
+      type: 'object',
+      properties: {
+        name: {
+          type: 'string',
+          'ui:control': 'input',
+          'ui:label': 'Organization Name',
+          'ui:placeholder': 'e.g. my-org',
+        },
+        'install-region': {
+          type: 'string',
+          'ui:control': 'select',
+          'ui:label': 'Data Region',
+          'ui:placeholder': 'Choose region',
+          'ui:options': [
+            { value: 'us', label: 'US' },
+            { value: 'eu', label: 'EU' },
+          ],
+        },
+      },
+      required: ['name', 'install-region'],
+    },
+    products: [
+      {
+        id: 'acme-install-meta-product',
+        name: 'Acme Install Meta Product',
+        slug: 'acme-install-meta',
+        type: 'storage',
+        shortDescription: 'Product with installation-level metadata',
+        metadataSchema: {
+          type: 'object',
+          properties: {
+            platform: {
+              type: 'string',
+              'ui:control': 'select',
+              'ui:label': 'Platform',
+              'ui:placeholder': 'e.g. Next.js',
+              'ui:options': [
+                { value: 'nextjs', label: 'Next.js' },
+                { value: 'react', label: 'React' },
+              ],
+            },
+          },
+          required: ['platform'],
+        },
+      },
+    ],
+  },
+};
+
+const configurations: Record<string, Configuration[]> = {
+  acme: [
+    {
+      id: 'acme-1',
+      integrationId: 'acme',
+      ownerId: 'team_dummy',
+      slug: 'acme',
+      teamId: 'team_dummy',
+      userId: 'user_dummy',
+      scopes: ['read-write:integration-resource'],
+      source: 'marketplace',
+      installationType: 'marketplace',
+      projects: ['acme-project'],
+    },
+  ],
+  'acme-two-configurations': [
+    {
+      id: 'acme-first',
+      integrationId: 'acme',
+      ownerId: 'team_dummy',
+      slug: 'acme-two-configurations',
+      teamId: 'team_dummy',
+      userId: 'user_dummy',
+      scopes: ['read-write:integration-resource'],
+      source: 'marketplace',
+      installationType: 'marketplace',
+      projects: ['acme-project'],
+    },
+    {
+      id: 'acme-second',
+      integrationId: 'acme',
+      ownerId: 'team_dummy',
+      slug: 'acme-two-configurations',
+      teamId: 'team_dummy',
+      userId: 'user_dummy',
+      scopes: ['read-write:integration-resource'],
+      source: 'marketplace',
+      installationType: 'marketplace',
+      projects: ['acme-project'],
+    },
+  ],
+  'acme-no-projects': [
+    {
+      id: 'acme-first',
+      integrationId: 'acme',
+      ownerId: 'team_dummy',
+      slug: 'acme-no-projects',
+      teamId: 'team_dummy',
+      userId: 'user_dummy',
+      scopes: ['read-write:integration-resource'],
+      source: 'marketplace',
+      installationType: 'marketplace',
+      projects: [],
+    },
+  ],
+  'acme-prepayment': [
+    {
+      id: 'acme-1',
+      integrationId: 'acme-prepayment',
+      ownerId: 'team_dummy',
+      slug: 'acme-prepayment',
+      teamId: 'team_dummy',
+      userId: 'user_dummy',
+      scopes: ['read-write:integration-resource'],
+      source: 'marketplace',
+      installationType: 'marketplace',
+      projects: ['acme-project'],
+    },
+  ],
+  'acme-no-results': [],
+  'acme-multi': [
+    {
+      id: 'icfg_install_a',
+      integrationId: 'acme-multi',
+      ownerId: 'team_dummy',
+      slug: 'acme-multi',
+      teamId: 'team_dummy',
+      userId: 'user_dummy',
+      scopes: ['read-write:integration-resource'],
+      source: 'marketplace',
+      installationType: 'marketplace',
+      projects: [],
+    },
+    {
+      id: 'icfg_install_b',
+      integrationId: 'acme-multi',
+      ownerId: 'team_dummy',
+      slug: 'acme-multi',
+      teamId: 'team_dummy',
+      userId: 'user_dummy',
+      scopes: ['read-write:integration-resource'],
+      source: 'marketplace',
+      installationType: 'marketplace',
+      projects: [],
+    },
+  ],
+};
+
+const configurationPrepaymentInformation: Record<
+  string,
+  InstallationBalancesAndThresholds
+> = {
+  'acme-prepayment': {
+    installationId: 'acme-prepayment-installation',
+    ownerId: 'team_dummy',
+    balances: [
+      {
+        resourceId: 'store_1',
+        timestamp: '2024-01-01T00:00:00Z',
+        credit: '$15.00',
+        nameLabel: '$',
+        currencyValueInCents: 1500,
+      },
+    ],
+    thresholds: [
+      {
+        resourceId: 'store_1',
+        minimumAmountInCents: 1000,
+        billingPlanId: 'pro',
+        metadata: '{}',
+        purchaseAmountInCents: 1000,
+        maximumAmountPerPeriodInCents: 5000,
+      },
+    ],
+  },
+  'acme-no-balance': {
+    installationId: 'acme-prepayment-installation',
+    ownerId: 'team_dummy',
+    balances: [],
+    thresholds: [
+      {
+        resourceId: 'store_1',
+        minimumAmountInCents: 1000,
+        billingPlanId: 'pro',
+        metadata: '{}',
+        purchaseAmountInCents: 1000,
+        maximumAmountPerPeriodInCents: 5000,
+      },
+    ],
+  },
+  'acme-no-threshold': {
+    installationId: 'acme-prepayment-installation',
+    ownerId: 'team_dummy',
+    balances: [
+      {
+        resourceId: 'store_1',
+        timestamp: '2024-01-01T00:00:00Z',
+        credit: '$15.00',
+        nameLabel: '$',
+        currencyValueInCents: 1500,
+      },
+    ],
+    thresholds: [],
+  },
+  'acme-multiple-balances-and-thresholds': {
+    installationId: 'acme-prepayment-installation',
+    ownerId: 'team_dummy',
+    balances: [
+      {
+        resourceId: 'store_1',
+        timestamp: '2024-01-01T00:00:00Z',
+        credit: '$15.00',
+        nameLabel: '$',
+        currencyValueInCents: 1500,
+      },
+      {
+        resourceId: 'store_2',
+        timestamp: '2024-01-01T00:00:00Z',
+        credit: '$12.00',
+        nameLabel: '$',
+        currencyValueInCents: 1200,
+      },
+    ],
+    thresholds: [
+      {
+        resourceId: 'store_1',
+        minimumAmountInCents: 1000,
+        billingPlanId: 'pro',
+        metadata: '{}',
+        purchaseAmountInCents: 1000,
+        maximumAmountPerPeriodInCents: 5000,
+      },
+      {
+        resourceId: 'store_2',
+        minimumAmountInCents: 500,
+        billingPlanId: 'pro',
+        metadata: '{}',
+        purchaseAmountInCents: 2000,
+        maximumAmountPerPeriodInCents: 50000,
+      },
+    ],
+  },
+  'acme-prepayment-installation-level': {
+    installationId: 'acme-prepayment-installation',
+    ownerId: 'team_dummy',
+    balances: [
+      {
+        timestamp: '2024-01-01T00:00:00Z',
+        credit: '$15.00',
+        nameLabel: '$',
+        currencyValueInCents: 1500,
+      },
+    ],
+    thresholds: [
+      {
+        minimumAmountInCents: 1000,
+        billingPlanId: 'pro',
+        metadata: '{}',
+        purchaseAmountInCents: 1000,
+        maximumAmountPerPeriodInCents: 5000,
+      },
+    ],
+  },
+  'acme-prepayment-installation-level-no-threshold': {
+    installationId: 'acme-prepayment-installation',
+    ownerId: 'team_dummy',
+    balances: [
+      {
+        timestamp: '2024-01-01T00:00:00Z',
+        credit: '$15.00',
+        nameLabel: '$',
+        currencyValueInCents: 1500,
+      },
+    ],
+    thresholds: [],
+  },
+  'acme-empty': {
+    installationId: 'acme-prepayment-installation',
+    ownerId: 'team_dummy',
+    balances: [],
+    thresholds: [],
+  },
+};
+
+const resources: { stores: Resource[] } = {
+  stores: [
+    {
+      id: 'store_not_marketplace',
+      type: 'postgres',
+      name: 'foobar',
+      status: 'available',
+      product: {},
+      externalResourceId: 'ext_store_not_marketplace',
+    },
+    {
+      id: 'store_1',
+      type: 'integration',
+      name: 'store-acme-connected-project',
+      status: null,
+      product: {
+        name: 'Acme',
+        slug: 'acme',
+        integrationConfigurationId: 'acme-1',
+      },
+      projectsMetadata: [
+        {
+          id: 'spc_1',
+          projectId: 'prj_connected',
+          name: 'connected-project',
+          environments: ['production', 'preview', 'development'],
+        },
+      ],
+      externalResourceId: 'ext_store_1',
+    },
+    {
+      id: 'store_2',
+      type: 'integration',
+      name: 'store-acme-other-project',
+      status: 'available',
+      product: {
+        name: 'Acme',
+        slug: 'acme',
+        integrationConfigurationId: 'acme-first',
+      },
+      projectsMetadata: [
+        {
+          id: 'spc_2',
+          projectId: 'prj_otherProject',
+          name: 'other-project',
+          environments: ['production', 'preview', 'development'],
+        },
+      ],
+      externalResourceId: 'ext_store_2',
+    },
+    {
+      id: 'store_3',
+      type: 'integration',
+      name: 'store-foo-bar-both-projects',
+      status: 'initializing',
+      product: { name: 'Foo Bar', slug: 'foo-bar' },
+      projectsMetadata: [
+        {
+          id: 'spc_3',
+          projectId: 'prj_connected',
+          name: 'connected-project',
+          environments: ['production', 'preview', 'development'],
+        },
+        {
+          id: 'spc_4',
+          projectId: 'prj_otherProject',
+          name: 'other-project',
+          environments: ['production', 'preview', 'development'],
+        },
+      ],
+      externalResourceId: 'ext_store_3',
+    },
+    {
+      id: 'store_4',
+      type: 'integration',
+      name: 'store-acme-no-projects',
+      status: 'available',
+      product: {
+        name: 'Acme',
+        slug: 'acme',
+        integrationConfigurationId: 'acme-first',
+      },
+      projectsMetadata: [],
+      externalResourceId: 'ext_store_4',
+    },
+    {
+      id: 'rs_prepayment',
+      type: 'integration',
+      name: 'store-acme-prepayment',
+      status: 'available',
+      product: {
+        name: 'Acme Prepayment',
+        slug: 'acme-prepayment',
+        integrationConfigurationId: 'acme-prepayment',
+      },
+      projectsMetadata: [],
+      externalResourceId: 'store_1',
+      billingPlan: {
+        id: 'bp1',
+        type: 'prepayment',
+        name: 'Acme Prepayment Plan',
+        scope: 'resource',
+        description: 'Acme Prepayment Plan',
+        paymentMethodRequired: true,
+        details: [],
+        minimumAmount: '5',
+        maximumAmount: '10000',
+      },
+    },
+    {
+      id: 'rs_prepayment_installation',
+      type: 'integration',
+      name: 'store-acme-prepayment-installation',
+      status: 'available',
+      product: {
+        name: 'Acme Prepayment',
+        slug: 'acme-prepayment',
+        integrationConfigurationId: 'acme-prepayment',
+      },
+      projectsMetadata: [],
+      externalResourceId: 'store_1',
+      billingPlan: {
+        id: 'bp1',
+        type: 'prepayment',
+        name: 'Acme Prepayment Plan',
+        scope: 'installation',
+        description: 'Acme Prepayment Plan',
+        paymentMethodRequired: true,
+        details: [],
+        minimumAmount: '5',
+        maximumAmount: '10000',
+      },
+    },
+    {
+      id: 'rs_prepayment_min_max_50',
+      type: 'integration',
+      name: 'store-acme-prepayment_min_max_50',
+      status: 'available',
+      product: {
+        name: 'Acme Prepayment',
+        slug: 'acme-prepayment',
+        integrationConfigurationId: 'acme-prepayment',
+      },
+      projectsMetadata: [],
+      externalResourceId: 'store_1',
+      billingPlan: {
+        id: 'bp1',
+        type: 'prepayment',
+        name: 'Acme Prepayment Plan',
+        scope: 'resource',
+        description: 'Acme Prepayment Plan',
+        paymentMethodRequired: true,
+        details: [],
+        minimumAmount: '50',
+        maximumAmount: '50',
+      },
+    },
+  ],
+};
+
+// Auto-provision mock responses
+const autoProvisionIntegration = {
+  id: 'acme',
+  slug: 'acme',
+  name: 'Acme Integration',
+  icon: 'https://example.com/icon.png',
+  policies: {
+    privacy: 'https://example.com/privacy',
+    eula: 'https://example.com/eula',
+  },
+};
+
+const autoProvisionProduct = {
+  id: 'acme-product',
+  slug: 'acme',
+  name: 'Acme Product',
+  icon: 'https://example.com/product-icon.png',
+  metadataSchema: metadataSchema1,
+};
+
+const autoProvisionResponses: Record<
+  string,
+  AutoProvisionedResponse | AutoProvisionFallback
+> = {
+  provisioned: {
+    kind: 'provisioned',
+    integration: autoProvisionIntegration,
+    product: autoProvisionProduct,
+    installation: { id: 'install_123' },
+    resource: {
+      id: 'resource_123',
+      externalResourceId: 'ext_resource_123',
+      name: 'test-resource',
+      status: 'available',
+    },
+    billingPlan: null,
+  },
+  metadata: {
+    kind: 'metadata',
+    reason: 'invalid_metadata_schema',
+    error_message: 'Metadata field "region" is required',
+    url: 'https://vercel.com/acme/~/integrations/checkout/acme?productSlug=acme',
+    integration: autoProvisionIntegration,
+    product: autoProvisionProduct,
+  },
+  unknown: {
+    kind: 'unknown',
+    reason: 'unexpected_error',
+    error_message: 'An unexpected error occurred during provisioning',
+    url: 'https://vercel.com/acme/~/integrations/checkout/acme?productSlug=acme',
+    integration: autoProvisionIntegration,
+    product: autoProvisionProduct,
+  },
+  install: {
+    kind: 'install',
+    url: 'https://vercel.com/acme/~/integrations/checkout/acme?productSlug=acme',
+    integration: autoProvisionIntegration,
+    product: autoProvisionProduct,
+  },
+  multiple_installations: {
+    kind: 'unknown',
+    reason: 'multiple_installations',
+    url: 'https://vercel.com/acme/~/integrations/checkout/acme?productSlug=acme',
+    integration: autoProvisionIntegration,
+    product: autoProvisionProduct,
+    installations: [
+      { id: 'icfg_marketplace_1', type: 'marketplace', status: 'active' },
+      {
+        id: 'icfg_external_1',
+        type: 'external',
+        externalId: 'aws-account-123',
+        status: 'active',
+      },
+    ],
+  },
+};
+
+const discoverIntegrations = [
+  {
+    slug: 'neon',
+    name: 'Neon',
+    shortDescription: 'Serverless Postgres with branching',
+    tagIds: ['tag_databases', 'tag_dev_tools'],
+    isMarketplace: true,
+    canInstall: true,
+    products: [
+      {
+        slug: 'neon',
+        name: 'Neon Postgres',
+        shortDescription: 'Serverless Postgres database',
+        tags: ['postgres'],
+      },
+    ],
+  },
+  {
+    slug: 'acme-multi',
+    name: 'Acme Multi',
+    shortDescription: 'Multi-product integration',
+    tagIds: ['tag_databases'],
+    isMarketplace: true,
+    canInstall: true,
+    products: [
+      {
+        slug: 'acme-kv',
+        name: 'Acme KV',
+        shortDescription: 'Key-value store',
+        tags: ['storage', 'redis'],
+      },
+      {
+        slug: 'acme-db',
+        name: 'Acme DB',
+        shortDescription: 'Relational database',
+        tags: ['postgres'],
+      },
+    ],
+  },
+  {
+    slug: 'acme-two-products',
+    name: 'Acme Integration Two Products',
+    shortDescription: 'Two product integration',
+    tagIds: ['tag_databases'],
+    isMarketplace: true,
+    canInstall: true,
+    products: [
+      {
+        slug: 'acme-a',
+        name: 'Acme Product A',
+        shortDescription: 'The Acme A product',
+        tags: ['kv', 'redis'],
+      },
+      {
+        slug: 'acme-b',
+        name: 'Acme Product B',
+        shortDescription: 'The Acme B product',
+        tags: ['queue'],
+      },
+    ],
+  },
+  {
+    slug: 'acme-hidden',
+    name: 'Acme Hidden',
+    shortDescription: 'Should be filtered out because canInstall is false',
+    tagIds: ['tag_databases'],
+    isMarketplace: true,
+    canInstall: false,
+    products: [{ slug: 'storage', name: 'Storage' }],
+  },
+  {
+    slug: 'acme-external',
+    name: 'Acme External',
+    shortDescription: 'Should be filtered out because isMarketplace is false',
+    tagIds: ['tag_dev_tools'],
+    isMarketplace: false,
+    canInstall: true,
+    products: [{ slug: 'connect', name: 'Connect' }],
+  },
+];
+
+const discoverCategories = [
+  { id: 'tag_databases', slug: 'storage', title: 'Storage' },
+  { id: 'tag_dev_tools', slug: 'dev-tools', title: 'DevTools' },
+];
+
+export function useResources(returnError?: number) {
+  client.scenario.get('/:version/storage/stores', (req, res) => {
+    if (returnError) {
+      res.status(returnError);
+      res.end();
+      return;
+    }
+
+    const { teamId, integrationConfigurationId } = req.query;
+
+    if (!teamId) {
+      res.status(500);
+      res.end();
+      return;
+    }
+
+    if (integrationConfigurationId) {
+      res.json({
+        stores: resources.stores.filter(
+          s =>
+            s.product?.integrationConfigurationId === integrationConfigurationId
+        ),
+      });
+      return;
+    }
+
+    res.json(resources);
+  });
+}
+
+export function useIntegrationCategories(opts?: { status?: number }) {
+  client.scenario.get('/v2/integrations/categories', (_req, res) => {
+    if (opts?.status) {
+      res.status(opts.status);
+      res.end();
+      return;
+    }
+    res.json(discoverCategories);
+  });
+}
+
+export function useIntegrationDiscover(opts?: {
+  integrationsStatus?: number;
+  categoriesStatus?: number;
+}) {
+  const integrationsRequests: { categories?: string[] }[] = [];
+
+  client.scenario.get('/v2/integrations/integrations', (req, res) => {
+    // Express parses repeated query params as either string (single) or string[] (multiple).
+    // Normalize to string[] so tests can always assert array shape.
+    const raw = req.query.category;
+    let categories: string[] | undefined;
+    if (Array.isArray(raw)) {
+      categories = raw.filter((v): v is string => typeof v === 'string');
+    } else if (typeof raw === 'string') {
+      categories = [raw];
+    }
+    integrationsRequests.push({ categories });
+    if (opts?.integrationsStatus) {
+      res.status(opts.integrationsStatus);
+      res.end();
+      return;
+    }
+    res.json(discoverIntegrations);
+  });
+
+  client.scenario.get('/v2/integrations/categories', (_req, res) => {
+    if (opts?.categoriesStatus) {
+      res.status(opts.categoriesStatus);
+      res.end();
+      return;
+    }
+    res.json(discoverCategories);
+  });
+
+  return { integrationsRequests };
+}
+
+export function useConfiguration() {
+  client.scenario.get('/:version/integrations/configurations', (req, res) => {
+    const { integrationIdOrSlug, teamId } = req.query;
+
+    if (!teamId) {
+      res.status(400).json({ error: 'teamId is required' });
+      return;
+    }
+
+    if (integrationIdOrSlug === 'error') {
+      res.status(500);
+      res.end();
+      return;
+    }
+
+    const foundConfigs =
+      configurations[(integrationIdOrSlug ?? 'acme-no-results') as string];
+
+    res.json(foundConfigs ?? []);
+  });
+}
+
+export function usePrepayment(responseKey: string) {
+  client.scenario.get(
+    '/v1/integrations/installations/:installationId/billing/balance',
+    (_req, res) => {
+      if (responseKey === 'error') {
+        res.status(500);
+        res.end();
+        return;
+      }
+
+      const prepaymentInfo = configurationPrepaymentInformation[responseKey];
+
+      if (!prepaymentInfo) {
+        res.status(404);
+        res.end();
+        return;
+      }
+
+      res.json(prepaymentInfo);
+    }
+  );
+}
+
+/** Mocks integration fetch, marketplace installations, and `POST .../marketplace/install` (e.g. `integration accept-terms`). */
+export function useIntegration({
+  withInstallation,
+  ownerId,
+  installShouldFail,
+}: {
+  withInstallation: boolean;
+  ownerId?: string;
+  installShouldFail?: boolean;
+}) {
+  const resolvedOwnerId = ownerId ?? 'team_dummy';
+
+  client.scenario.get(
+    '/:version/integrations/integration/:slug',
+    (req, res) => {
+      const { slug } = req.params;
+      const integration = integrations[slug];
+
+      if (!integration) {
+        res.status(404);
+        res.end();
+        return;
+      }
+
+      res.json(integration);
+    }
+  );
+
+  client.scenario.get('/:version/integrations/configurations', (req, res) => {
+    const { installationType, integrationIdOrSlug } = req.query;
+
+    if (installationType !== 'marketplace') {
+      res.status(500);
+      res.end();
+      return;
+    }
+
+    res.json(
+      withInstallation
+        ? [
+            {
+              id: `${integrationIdOrSlug}-install`,
+              integrationId: integrationIdOrSlug,
+              installationType: 'marketplace',
+              ownerId: resolvedOwnerId,
+            },
+          ]
+        : []
+    );
+  });
+
+  const installRequestBodies: unknown[] = [];
+
+  client.scenario.post(
+    '/v2/integrations/integration/:integrationId/marketplace/install',
+    (req, res) => {
+      installRequestBodies.push(req.body);
+      if (installShouldFail) {
+        res.status(500);
+        res.json({ error: { message: 'Internal Server Error' } });
+        return;
+      }
+      res.json({
+        id: `${req.params.integrationId}-new-install`,
+      });
+    }
+  );
+
+  return { installRequestBodies, connectionRequestBodies: [] };
+}
+
+export function useAutoProvision(opts?: {
+  responseKey?: keyof typeof autoProvisionResponses;
+  withInstallation?: boolean;
+  installationAppearsAfterPolls?: number;
+}) {
+  const withInstallation = opts?.withInstallation ?? true;
+  const storeId = 'resource_123';
+  const requestBodies: unknown[] = [];
+  let installationPollCount = 0;
+
+  // Integration fetch endpoint (needed for auto-provision flow)
+  client.scenario.get(
+    '/:version/integrations/integration/:slug',
+    (req, res) => {
+      const { slug } = req.params;
+      const integration = integrations[slug];
+
+      if (!integration) {
+        res.status(404);
+        res.end();
+        return;
+      }
+
+      res.json(integration);
+    }
+  );
+
+  // Installations endpoint (needed for upfront install check)
+  client.scenario.get('/:version/integrations/configurations', (req, res) => {
+    const { installationType, integrationIdOrSlug } = req.query;
+    if (installationType !== 'marketplace') {
+      res.status(500);
+      res.end();
+      return;
+    }
+
+    // If installationAppearsAfterPolls is set and no initial installation,
+    // simulate delayed installation creation (for browser terms flow tests)
+    if (
+      !withInstallation &&
+      opts?.installationAppearsAfterPolls !== undefined
+    ) {
+      installationPollCount++;
+      if (installationPollCount > opts.installationAppearsAfterPolls) {
+        res.json([
+          {
+            id: 'acme-install',
+            integrationId: integrationIdOrSlug,
+            installationType: 'marketplace',
+            ownerId: 'team_dummy',
+          },
+        ]);
+        return;
+      }
+      res.json([]);
+      return;
+    }
+
+    res.json(
+      withInstallation
+        ? [
+            {
+              id: 'acme-install',
+              integrationId: integrationIdOrSlug,
+              installationType: 'marketplace',
+              ownerId: 'team_dummy',
+            },
+          ]
+        : []
+    );
+  });
+
+  // Auto-provision endpoint
+  client.scenario.post(
+    '/v1/integrations/integration/:integrationSlug/marketplace/auto-provision/:productSlug',
+    (req, res) => {
+      requestBodies.push(req.body);
+
+      // When installationId is provided and responseKey is multiple_installations,
+      // simulate the server accepting the selection and provisioning successfully
+      if (
+        req.body.installationId &&
+        opts?.responseKey === 'multiple_installations'
+      ) {
+        res.status(201);
+        res.json(autoProvisionResponses['provisioned']);
+        return;
+      }
+
+      const response =
+        autoProvisionResponses[opts?.responseKey ?? 'provisioned'];
+
+      if (response.kind !== 'provisioned') {
+        // 422 responses for fallback cases
+        res.status(422);
+        res.json(response);
+      } else {
+        // 201 for successful provisioning
+        res.status(201);
+        res.json(response);
+      }
+    }
+  );
+
+  // Connection endpoint for linking to projects
+  client.scenario.post(
+    '/v1/storage/stores/:storeId/connections',
+    (req, res) => {
+      if (req.params.storeId !== storeId) {
+        res.status(404);
+        res.end();
+        return;
+      }
+
+      res.status(200);
+      res.end();
+    }
+  );
+
+  return { requestBodies };
+}

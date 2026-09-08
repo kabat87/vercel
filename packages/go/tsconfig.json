@@ -1,18 +1,13 @@
 {
   "compilerOptions": {
-    "declaration": false,
-    "esModuleInterop": true,
-    "lib": ["esnext"],
-    "module": "commonjs",
-    "moduleResolution": "node",
-    "noEmitOnError": true,
-    "noFallthroughCasesInSwitch": true,
-    "noImplicitReturns": true,
-    "noUnusedLocals": true,
-    "noUnusedParameters": true,
-    "noImplicitThis": false,
-    "types": ["node"],
-    "strict": true,
-    "target": "es2018"
-  }
+    "outDir": "./dist",
+    "types": ["node", "vitest/globals"],
+    "skipLibCheck": true,
+    "baseUrl": ".",
+    "paths": {
+      "tar": ["./src/tar.d.ts"]
+    }
+  },
+  "extends": "../../tsconfig.base.json",
+  "include": ["src/**/*"]
 }

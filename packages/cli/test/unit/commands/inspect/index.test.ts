@@ -1,0 +1,547 @@
+import { describe, expect, it } from 'vitest';
+import { client } from '../../../mocks/client';
+import { useUser } from '../../../mocks/user';
+import { useTeam } from '../../../mocks/team';
+import { useBuildLogs, useDeployment } from '../../../mocks/deployment';
+import inspect from '../../../../src/commands/inspect';
+import sleep from '../../../../src/util/sleep';
+
+describe('inspect', () => {
+  describe('--help', () => {
+    it('tracks telemetry', async () => {
+      const command = 'inspect';
+
+      client.setArgv(command, '--help');
+      const exitCodePromise = inspect(client);
+      await expect(exitCodePromise).resolves.toEqual(2);
+
+      expect(client.telemetryEventStore).toHaveTelemetryEvents([
+        {
+          key: 'flag:help',
+          value: command,
+        },
+      ]);
+    });
+  });
+
+  describe('[url]', () => {
+    describe('--timeout', async () => {
+      it('tracks --timeout', async () => {
+        const user = useUser();
+        const deployment = useDeployment({ creator: user });
+        client.setArgv('inspect', deployment.url, '--timeout', '0');
+        const exitCode = await inspect(client);
+        expect(exitCode).toEqual(0);
+
+        expect(client.telemetryEventStore).toHaveTelemetryEvents([
+          {
+            key: 'argument:deploymentIdOrHost',
+            value: '[REDACTED]',
+          },
+          {
+            key: 'option:timeout',
+            value: '[REDACTED]',
+          },
+        ]);
+      });
+    });
+
+    describe('--wait', async () => {
+      it('tracks --wait', async () => {
+        const user = useUser();
+        const deployment = useDeployment({ creator: user });
+        client.setArgv('inspect', deployment.url, '--wait');
+        const exitCode = await inspect(client);
+        expect(exitCode).toEqual(0);
+
+        expect(client.telemetryEventStore).toHaveTelemetryEvents([
+          {
+            key: 'argument:deploymentIdOrHost',
+            value: '[REDACTED]',
+          },
+          {
+            key: 'flag:wait',
+            value: 'TRUE',
+          },
+        ]);
+      });
+    });
+
+    describe('--logs', async () => {
+      it('tracks logs', async () => {
+        const user = useUser();
+        const deployment = useDeployment({ creator: user });
+        client.scenario.get(
+          `/v3/now/deployments/${deployment.id}/events`,
+          (req, res) => {
+            res.json([]);
+          }
+        );
+
+        client.setArgv('inspect', deployment.url, '--logs');
+        const exitCode = await inspect(client);
+        expect(exitCode).toEqual(0);
+
+        expect(client.telemetryEventStore).toHaveTelemetryEvents([
+          {
+            key: 'argument:deploymentIdOrHost',
+            value: '[REDACTED]',
+          },
+          {
+            key: 'flag:logs',
+            value: 'TRUE',
+          },
+        ]);
+      });
+    });
+
+    describe('--json', async () => {
+      it('tracks --json flag', async () => {
+        const user = useUser();
+        const deployment = useDeployment({ creator: user });
+        client.setArgv('inspect', deployment.url, '--json');
+        const exitCode = await inspect(client);
+        expect(exitCode).toEqual(0);
+
+        expect(client.telemetryEventStore).toHaveTelemetryEvents([
+          {
+            key: 'argument:deploymentIdOrHost',
+            value: '[REDACTED]',
+          },
+          {
+            key: 'flag:json',
+            value: 'TRUE',
+          },
+        ]);
+      });
+
+      it('outputs deployment information as JSON', async () => {
+        const user = useUser();
+        const deployment = useDeployment({
+          creator: user,
+          state: 'READY',
+        });
+        client.setArgv('inspect', deployment.url, '--json');
+        const exitCode = await inspect(client);
+        expect(exitCode).toEqual(0);
+
+        const output = client.stdout.getFullOutput();
+        const jsonOutput = JSON.parse(output);
+
+        expect(jsonOutput).toMatchObject({
+          id: deployment.id,
+          name: deployment.name,
+          url: deployment.url,
+          target: deployment.target,
+          readyState: deployment.readyState,
+          createdAt: deployment.createdAt,
+          contextName: user.username,
+        });
+      });
+
+      it('includes aliases in JSON output when present', async () => {
+        const user = useUser();
+        const deployment = useDeployment({
+          creator: user,
+        });
+        // Manually set aliases since the mock doesn't accept it as a parameter
+        deployment.alias = ['example.com', 'www.example.com'];
+
+        client.setArgv('inspect', deployment.url, '--json');
+        const exitCode = await inspect(client);
+        expect(exitCode).toEqual(0);
+
+        const output = client.stdout.getFullOutput();
+        const jsonOutput = JSON.parse(output);
+
+        expect(jsonOutput).toHaveProperty('aliases');
+        expect(jsonOutput.aliases).toEqual(['example.com', 'www.example.com']);
+      });
+
+      it('excludes aliases from JSON when not present', async () => {
+        const user = useUser();
+        const deployment = useDeployment({
+          creator: user,
+        });
+        client.setArgv('inspect', deployment.url, '--json');
+        const exitCode = await inspect(client);
+        expect(exitCode).toEqual(0);
+
+        const output = client.stdout.getFullOutput();
+        const jsonOutput = JSON.parse(output);
+
+        // aliases should not be in the output if empty
+        expect(jsonOutput).not.toHaveProperty('aliases');
+      });
+
+      it('works with --wait flag', async () => {
+        const user = useUser();
+        const deployment = useDeployment({ creator: user, state: 'BUILDING' });
+        client.setArgv('inspect', deployment.url, '--json', '--wait');
+
+        let exitCode: number | null = null;
+
+        const runInspect = async () => {
+          exitCode = await inspect(client);
+        };
+
+        const slowlyDeploy = async () => {
+          await sleep(100);
+          expect(exitCode).toBeNull();
+          deployment.readyState = 'READY';
+        };
+
+        await Promise.all<void>([runInspect(), slowlyDeploy()]);
+
+        expect(exitCode).toEqual(0);
+
+        const output = client.stdout.getFullOutput();
+        const jsonOutput = JSON.parse(output);
+
+        expect(jsonOutput).toMatchObject({
+          id: deployment.id,
+          readyState: 'READY',
+        });
+      });
+    });
+
+    describe('--format', async () => {
+      it('tracks telemetry for --format json', async () => {
+        const user = useUser();
+        const deployment = useDeployment({ creator: user });
+        client.setArgv('inspect', deployment.url, '--format', 'json');
+        const exitCode = await inspect(client);
+        expect(exitCode).toEqual(0);
+
+        expect(client.telemetryEventStore).toHaveTelemetryEvents([
+          {
+            key: 'argument:deploymentIdOrHost',
+            value: '[REDACTED]',
+          },
+          {
+            key: 'option:format',
+            value: 'json',
+          },
+        ]);
+      });
+
+      it('outputs deployment as valid JSON that can be piped to jq', async () => {
+        const user = useUser();
+        const deployment = useDeployment({ creator: user });
+        client.setArgv('inspect', deployment.url, '--format', 'json');
+        const exitCode = await inspect(client);
+        expect(exitCode).toEqual(0);
+
+        const output = client.stdout.getFullOutput();
+        // Should be valid JSON - this will throw if not parseable
+        const jsonOutput = JSON.parse(output);
+
+        expect(jsonOutput).toHaveProperty('id');
+        expect(jsonOutput).toHaveProperty('url');
+        expect(jsonOutput).toHaveProperty('readyState');
+      });
+
+      it('outputs build logs as a top-level JSON array without printing logs to stderr', async () => {
+        const user = useUser();
+        const deployment = useDeployment({ creator: user });
+        useBuildLogs({
+          deployment,
+          logProducer: async function* () {
+            yield {
+              created: 1717426870339,
+              date: 1717426870339,
+              deploymentId: deployment.id,
+              id: 'evt_1',
+              info: { type: 'build', name: 'install', step: 'install' },
+              serial: '1',
+              text: '\u001b[31mHello, world!\u001b[39m',
+              type: 'stdout',
+            };
+            yield {
+              created: 1717426870340,
+              date: 1717426870340,
+              deploymentId: deployment.id,
+              id: 'evt_2',
+              info: { type: 'build', name: 'build', step: 'build' },
+              level: 'warning',
+              serial: '2',
+              text: 'Line 1\nLine 2\n',
+              type: 'stderr',
+            };
+          },
+        });
+
+        client.setArgv('inspect', deployment.url, '--logs', '--format', 'json');
+        const exitCode = await inspect(client);
+        expect(exitCode).toEqual(0);
+
+        const stdout = client.stdout.getFullOutput();
+        const logsOutput = JSON.parse(stdout);
+
+        expect(Array.isArray(logsOutput)).toBe(true);
+        expect(logsOutput).toHaveLength(2);
+        expect(logsOutput).not.toHaveProperty('id');
+        expect(logsOutput[0]).toMatchObject({
+          created: 1717426870339,
+          date: 1717426870339,
+          type: 'stdout',
+          text: '\u001b[31mHello, world!\u001b[39m',
+          id: 'evt_1',
+          serial: '1',
+          deploymentId: deployment.id,
+          info: { type: 'build', name: 'install', step: 'install' },
+        });
+        expect(logsOutput[0]).not.toHaveProperty('level');
+        expect(logsOutput[0]).not.toHaveProperty('step');
+        expect(logsOutput[0].text).toContain('\u001b');
+        expect(logsOutput[1]).toMatchObject({
+          created: 1717426870340,
+          date: 1717426870340,
+          level: 'warning',
+          type: 'stderr',
+          text: 'Line 1\nLine 2\n',
+          id: 'evt_2',
+          serial: '2',
+          deploymentId: deployment.id,
+          info: { type: 'build', name: 'build', step: 'build' },
+        });
+        expect(logsOutput[1]).not.toHaveProperty('step');
+
+        const stderr = client.stderr.getFullOutput();
+        expect(stderr).not.toContain('Hello, world!');
+        expect(stderr).not.toContain('Line 1');
+        expect(stderr).not.toContain('Line 2');
+      });
+    });
+
+    it('tracks deplomymentUrl as telemetry', async () => {
+      const user = useUser();
+      const deployment = useDeployment({ creator: user });
+      client.setArgv('inspect', deployment.url);
+      const exitCode = await inspect(client);
+      expect(exitCode).toEqual(0);
+
+      expect(client.telemetryEventStore).toHaveTelemetryEvents([
+        {
+          key: 'argument:deploymentIdOrHost',
+          value: '[REDACTED]',
+        },
+      ]);
+    });
+
+    it('prints error when not providing deployement id or url', async () => {
+      client.setArgv('inspect');
+      const exitCode = await inspect(client);
+      const output = client.getFullOutput();
+      expect(exitCode).toEqual(1);
+      expect(output).toContain(
+        '`vercel inspect <url>` expects exactly one argument'
+      );
+    });
+
+    it('should print out deployment information', async () => {
+      const user = useUser();
+      const deployment = useDeployment({ creator: user });
+      client.setArgv('inspect', deployment.url);
+      const exitCode = await inspect(client);
+      await expect(client.stderr).toOutput(
+        `> Fetched deployment "${deployment.url}" in ${user.username}`
+      );
+      expect(exitCode).toEqual(0);
+    });
+
+    it('should print target information', async () => {
+      const user = useUser();
+      const deployment = useDeployment({ creator: user });
+      client.setArgv('inspect', deployment.url);
+      const exitCode = await inspect(client);
+      await expect(client.stderr).toOutput(`target\tproduction`);
+      expect(exitCode).toEqual(0);
+    });
+
+    it('should print out deployment information for piped URL', async () => {
+      const user = useUser();
+      const deployment = useDeployment({ creator: user });
+      client.stdin.isTTY = false;
+      client.stdin.write(deployment.url);
+      client.stdin.end();
+      const exitCode = await inspect(client);
+      await expect(client.stderr).toOutput(
+        `> Fetched deployment "${deployment.url}" in ${user.username}`
+      );
+      expect(exitCode).toEqual(0);
+    });
+
+    it('should strip the scheme of a url', async () => {
+      const user = useUser();
+      const deployment = useDeployment({ creator: user });
+      client.setArgv('inspect', `http://${deployment.url}`);
+      const exitCode = await inspect(client);
+      expect(exitCode).toEqual(0);
+      await expect(client.stderr).toOutput(
+        `> Fetched deployment "${deployment.url}" in ${user.username}`
+      );
+    });
+
+    it('should print error when deployment not found', async () => {
+      const user = useUser();
+      useDeployment({ creator: user });
+      client.setArgv('inspect', 'bad.com');
+      await expect(inspect(client)).rejects.toThrow(
+        `Can't find the deployment "bad.com" under the context "${user.username}"`
+      );
+    });
+
+    it('should print error if timeout is invalid', async () => {
+      const user = useUser();
+      useDeployment({ creator: user });
+      client.setArgv('inspect', 'foo.com', '--timeout', 'bar');
+      const exitCode = await inspect(client);
+      expect(exitCode).toEqual(1);
+      await expect(client.stderr).toOutput(`Invalid timeout "bar"`);
+    });
+
+    it('should print no build logs for a queued deployment', async () => {
+      const user = useUser();
+      const deployment = useDeployment({ creator: user, state: 'QUEUED' });
+      useBuildLogs({
+        deployment,
+        logProducer: async function* () {},
+      });
+
+      client.setArgv('inspect', deployment.url, '--logs');
+      const exitCode = await inspect(client);
+      await expect(client.stderr).toOutput(
+        `Fetching deployment "${deployment.url}" in ${user.username}`
+      );
+      expect(
+        client.getFullOutput().split('\n').slice(1).join('\n')
+      ).toMatchInlineSnapshot(`
+        "status	● Queued
+        "
+      `);
+      expect(exitCode).toEqual(0);
+    });
+
+    it('should print build logs of a failed deployment', async () => {
+      const user = useUser();
+      const deployment = useDeployment({ creator: user, state: 'ERROR' });
+      useBuildLogs({
+        deployment,
+        logProducer: async function* () {
+          yield { created: 1717426870339, text: 'Hello, world!' };
+          yield { created: 1717426870340, text: 'Bye...' };
+        },
+      });
+
+      client.setArgv('inspect', deployment.url, '--logs');
+      const exitCode = await inspect(client);
+      await expect(client.stderr).toOutput(
+        `Fetching deployment "${deployment.url}" in ${user.username}`
+      );
+      expect(
+        client.getFullOutput().split('\n').slice(1).join('\n')
+      ).toMatchInlineSnapshot(`
+        "2024-06-03T15:01:10.339Z  Hello, world!
+        2024-06-03T15:01:10.340Z  Bye...
+        status	● Error
+        "
+      `);
+      expect(exitCode).toEqual(1);
+    });
+
+    it('should print build logs while waiting for a finished deployment', async () => {
+      let exitCode: number | null = null;
+      const user = useUser();
+      const deployment = useDeployment({ creator: user, state: 'BUILDING' });
+      useBuildLogs({
+        deployment,
+        logProducer: async function* () {
+          yield { created: 1717426870339, text: 'Hello, world!' };
+          await sleep(100);
+          yield { created: 1717426870340, text: 'building...' };
+          await sleep(100);
+          yield { created: 1717426871000, text: 'build complete' };
+          await sleep(100);
+          yield { created: 1717426871235, text: 'Bye...' };
+        },
+      });
+
+      const runInspect = async () => {
+        client.setArgv('inspect', deployment.url, '--logs', '--wait');
+        exitCode = await inspect(client);
+        await expect(client.stderr).toOutput(
+          `Fetching deployment "${deployment.url}" in ${user.username}`
+        );
+      };
+
+      const slowlyDeploy = async () => {
+        await sleep(1234);
+        expect(exitCode).toBeNull();
+        deployment.readyState = 'READY';
+      };
+
+      await Promise.all<void>([runInspect(), slowlyDeploy()]);
+
+      expect(exitCode).toEqual(0);
+      expect(
+        client.getFullOutput().split('\n').slice(1).join('\n')
+      ).toMatchInlineSnapshot(`
+        "2024-06-03T15:01:10.339Z  Hello, world!
+        2024-06-03T15:01:10.340Z  building...
+        2024-06-03T15:01:11.000Z  build complete
+        2024-06-03T15:01:11.235Z  Bye...
+        status	● Ready
+        "
+      `);
+    });
+
+    describe('dashboard URL parsing', () => {
+      it('sets team scope from dashboard URL', async () => {
+        const user = useUser();
+        const team = useTeam();
+        team.slug = 'dashboard-team';
+        const deployment = useDeployment({ creator: user });
+
+        client.setArgv(
+          'inspect',
+          `https://vercel.com/${team.slug}/my-project/${deployment.id}`
+        );
+        const exitCode = await inspect(client);
+        expect(exitCode).toEqual(0);
+        expect(client.config.currentTeam).toEqual(team.id);
+      });
+
+      it('does not override explicit --scope flag', async () => {
+        const user = useUser();
+        const team = useTeam();
+        team.slug = 'dashboard-team';
+        const deployment = useDeployment({ creator: user });
+
+        client.config.currentTeam = team.id;
+        client.setArgv(
+          'inspect',
+          `https://vercel.com/other-team/my-project/${deployment.id}`,
+          '--scope',
+          team.slug
+        );
+        const exitCode = await inspect(client);
+        expect(exitCode).toEqual(0);
+        expect(client.config.currentTeam).toEqual(team.id);
+      });
+
+      it('resolves bare deployment ID with dpl_ prefix', async () => {
+        const user = useUser();
+        const deployment = useDeployment({ creator: user });
+        const bareId = deployment.id.replace('dpl_', '');
+
+        client.setArgv('inspect', bareId);
+        const exitCode = await inspect(client);
+        expect(exitCode).toEqual(0);
+        await expect(client.stderr).toOutput(
+          `Fetched deployment "${deployment.url}"`
+        );
+      });
+    });
+  });
+});

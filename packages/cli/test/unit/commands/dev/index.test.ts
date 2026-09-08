@@ -1,0 +1,591 @@
+import {
+  describe,
+  it,
+  expect,
+  vi,
+  beforeEach,
+  afterEach,
+  type MockInstance,
+} from 'vitest';
+import dev from '../../../../src/commands/dev';
+import { client } from '../../../mocks/client';
+import { type fs, vol } from 'memfs';
+import { useUser } from '../../../mocks/user';
+import { useTeams } from '../../../mocks/team';
+import { useProject } from '../../../mocks/project';
+import * as linkModule from '../../../../src/util/projects/link';
+import { normalize } from 'path';
+
+const {
+  mockStart,
+  mockDetectFramework,
+  mockReadConfig,
+  devServerInstances,
+  mockedRepoRoots,
+} = vi.hoisted(() => ({
+  mockStart: vi.fn<() => void>(),
+  mockDetectFramework: vi.fn<(_options: unknown) => Promise<string | null>>(),
+  mockReadConfig: vi.fn<(_dir: string) => Promise<unknown>>(),
+  devServerInstances: [] as {
+    cwd: string;
+    projectId?: string;
+    orgId?: string;
+    projectSettings?: { framework?: string | null };
+  }[],
+  mockedRepoRoots: new Map<string, string>(),
+}));
+
+vi.mock('@vercel/fs-detectors', async () => {
+  const actual = await vi.importActual<typeof import('@vercel/fs-detectors')>(
+    '@vercel/fs-detectors'
+  );
+  return {
+    ...actual,
+    detectFramework: mockDetectFramework,
+  };
+});
+
+vi.mock('../../../../src/util/config/read-config', () => ({
+  default: mockReadConfig,
+}));
+
+vi.mock('../../../../src/util/dev/server', async () => {
+  const actual = await vi.importActual<
+    typeof import('../../../../src/util/dev/server')
+  >('../../../../src/util/dev/server');
+  class DevServer {
+    devCommand = 'framework dev';
+    constructor(
+      cwd: string,
+      options: {
+        projectId?: string;
+        orgId?: string;
+        projectSettings?: { framework?: string | null };
+      }
+    ) {
+      devServerInstances.push({
+        cwd,
+        projectId: options.projectId,
+        orgId: options.orgId,
+        projectSettings: options.projectSettings,
+      });
+    }
+    feed() {}
+    stop() {
+      return Promise.resolve();
+    }
+    start = mockStart;
+  }
+  return {
+    default: DevServer,
+    DevCommandExitError: actual.DevCommandExitError,
+  };
+});
+
+// `findRepoRoot` uses `git rev-parse` and real filesystem lookups that
+// don't work against memfs in tests. Replace it with a lookup against
+// `mockedRepoRoots`: for each `cwd` we look up the longest registered
+// path that contains it (the same nearest-ancestor semantics findRepoRoot
+// provides via `.git` traversal). Paths are normalized to forward slashes
+// before comparison so the mock works on Windows, where `path.resolve`
+// converts forward slashes to backslashes.
+vi.mock('../../../../src/util/link/repo', async () => {
+  const actual = await vi.importActual<
+    typeof import('../../../../src/util/link/repo')
+  >('../../../../src/util/link/repo');
+  const toPosix = (p: string) => p.replace(/\\/g, '/');
+  return {
+    ...actual,
+    findRepoRoot: async (start: string) => {
+      const normStart = toPosix(start);
+      let best: string | undefined;
+      for (const root of mockedRepoRoots.keys()) {
+        const normRoot = toPosix(root);
+        if (normStart === normRoot || normStart.startsWith(`${normRoot}/`)) {
+          if (!best || root.length > best.length) {
+            best = root;
+          }
+        }
+      }
+      return best;
+    },
+  };
+});
+
+vi.mock('node:fs/promises', async () => {
+  const memfs: { fs: typeof fs } = await vi.importActual('memfs');
+  return memfs.fs.promises;
+});
+
+vi.mock('node:fs', async () => {
+  const memfs: { fs: typeof fs } = await vi.importActual('memfs');
+  return memfs;
+});
+
+afterEach(() => {
+  // __VERCEL_DEV_RUNNING is set when `vercel dev` runs to act as a lock.
+  // It's unset as a side effect of  the process exiting. This won't work under test
+  // where `vercel dev` can be invoked several times in a row.
+  vi.stubEnv('__VERCEL_DEV_RUNNING', undefined);
+  vol.reset();
+  devServerInstances.length = 0;
+  mockedRepoRoots.clear();
+});
+
+describe('dev', () => {
+  const projectId = 'prj_whatever123';
+  const orgId = 'team_123';
+  const projectName = 'project-name';
+  const projectPath = `/user/name/code/${projectName}`;
+
+  beforeEach(() => {
+    mockDetectFramework.mockReset();
+    mockDetectFramework.mockResolvedValue(null);
+    mockReadConfig.mockReset();
+    mockReadConfig.mockResolvedValue(null);
+    useUser();
+    useTeams(orgId);
+    useProject({
+      id: projectId,
+      name: projectName,
+    });
+
+    const json = {
+      '.vercel/project.json': JSON.stringify({
+        projectId,
+        orgId,
+      }),
+    };
+    vol.fromJSON(json, projectPath);
+  });
+
+  describe('--help', () => {
+    it('tracks telemetry', async () => {
+      const command = 'dev';
+
+      client.setArgv(command, '--help');
+      const exitCodePromise = dev(client);
+      await expect(exitCodePromise).resolves.toEqual(2);
+
+      expect(client.telemetryEventStore).toHaveTelemetryEvents([
+        {
+          key: 'flag:help',
+          value: command,
+        },
+      ]);
+    });
+  });
+
+  describe('[dir]', () => {
+    it('tracks the dir if supplied', async () => {
+      client.setArgv('dev', projectPath);
+      const exitCodePromise = dev(client);
+
+      // dev is an odd duck in that normally only exits on SIGTERM
+      await expect(exitCodePromise).resolves.toEqual(undefined);
+      expect(client.telemetryEventStore).toHaveTelemetryEvents([
+        {
+          key: 'argument:dir',
+          value: '[REDACTED]',
+        },
+      ]);
+    });
+  });
+
+  describe('--listen', () => {
+    it('tracks the listen option if supplied', async () => {
+      vi.spyOn(process, 'cwd').mockReturnValue(projectPath);
+
+      client.setArgv('dev', '--listen=9090');
+      const exitCodePromise = dev(client);
+
+      // dev is an odd duck in that normally only exits on SIGTERM
+      await expect(exitCodePromise).resolves.toEqual(undefined);
+      expect(client.telemetryEventStore).toHaveTelemetryEvents([
+        {
+          key: 'option:listen',
+          value: '[REDACTED]',
+        },
+      ]);
+    });
+  });
+
+  describe('--yes', () => {
+    it('tracks the listen option if supplied', async () => {
+      vi.spyOn(process, 'cwd').mockReturnValue(projectPath);
+
+      client.setArgv('dev', '--yes');
+      const exitCodePromise = dev(client);
+
+      // dev is an odd duck in that normally only exits on SIGTERM
+      await expect(exitCodePromise).resolves.toEqual(undefined);
+      expect(client.telemetryEventStore).toHaveTelemetryEvents([
+        {
+          key: 'flag:yes',
+          value: 'TRUE',
+        },
+      ]);
+    });
+  });
+
+  describe('--port', () => {
+    it('tracks the listen option if supplied', async () => {
+      vi.spyOn(process, 'cwd').mockReturnValue(projectPath);
+
+      client.setArgv('dev', '--port=9090');
+      const exitCodePromise = dev(client);
+
+      // dev is an odd duck in that normally only exits on SIGTERM
+      await expect(exitCodePromise).resolves.toEqual(undefined);
+      expect(client.telemetryEventStore).toHaveTelemetryEvents([
+        {
+          key: 'option:port',
+          value: '[REDACTED]',
+        },
+      ]);
+    });
+  });
+
+  describe('--confirm', () => {
+    it('tracks the listen option if supplied', async () => {
+      vi.spyOn(process, 'cwd').mockReturnValue(projectPath);
+
+      client.setArgv('dev', '--confirm');
+      const exitCodePromise = dev(client);
+
+      // dev is an odd duck in that normally only exits on SIGTERM
+      await expect(exitCodePromise).resolves.toEqual(undefined);
+      expect(client.telemetryEventStore).toHaveTelemetryEvents([
+        {
+          key: 'flag:confirm',
+          value: 'TRUE',
+        },
+      ]);
+    });
+  });
+
+  describe('--local', () => {
+    it('shows warning message and starts dev server for unlinked project', async () => {
+      const unlinkedPath = '/user/name/code/unlinked-project';
+      vol.fromJSON({}, unlinkedPath);
+
+      client.setArgv('dev', '--local', unlinkedPath);
+      const exitCodePromise = dev(client);
+
+      await expect(exitCodePromise).resolves.toEqual(undefined);
+      await expect(client.stderr).toOutput('Running dev server in local mode');
+    });
+
+    it.each([
+      {
+        framework: 'vite',
+        files: {
+          'package.json': JSON.stringify({
+            devDependencies: { vite: '7.0.0' },
+          }),
+        },
+      },
+      {
+        framework: 'go',
+        files: {
+          'package.json': '{}',
+          'go.mod': 'module example.com/local-dev',
+          'main.go': 'package main',
+        },
+      },
+    ])('detects the $framework framework for an unlinked zero-config project', async ({
+      framework,
+      files,
+    }) => {
+      const unlinkedPath = `/user/name/code/unlinked-${framework}-project`;
+      vol.fromJSON(files as Record<string, string>, unlinkedPath);
+      mockDetectFramework.mockResolvedValueOnce(framework);
+
+      client.setArgv('dev', '--local', unlinkedPath);
+      await expect(dev(client)).resolves.toEqual(undefined);
+
+      expect(mockDetectFramework).toHaveBeenCalledOnce();
+      expect(devServerInstances).toHaveLength(1);
+      expect(devServerInstances[0].projectSettings).toEqual({ framework });
+    });
+
+    it('does not detect a framework when explicit builds are configured', async () => {
+      const unlinkedPath = '/user/name/code/unlinked-explicit-builds';
+      vol.fromJSON(
+        {
+          'package.json': JSON.stringify({
+            devDependencies: { umi: '4.0.0' },
+          }),
+          'vercel.json': JSON.stringify({
+            builds: [{ src: 'package.json', use: '@vercel/static-build' }],
+          }),
+        },
+        unlinkedPath
+      );
+      mockDetectFramework.mockResolvedValueOnce('umijs');
+      mockReadConfig.mockResolvedValueOnce({
+        builds: [{ src: 'package.json', use: '@vercel/static-build' }],
+      });
+
+      client.setArgv('dev', '--local', unlinkedPath);
+      await expect(dev(client)).resolves.toEqual(undefined);
+
+      expect(mockDetectFramework).not.toHaveBeenCalled();
+      expect(devServerInstances[0].projectSettings).toBeUndefined();
+    });
+
+    it('does not detect a framework when local config explicitly disables it', async () => {
+      const unlinkedPath = '/user/name/code/unlinked-other-framework';
+      vol.fromJSON(
+        {
+          'package.json': '{}',
+          'vercel.json': JSON.stringify({ framework: null }),
+        },
+        unlinkedPath
+      );
+      mockDetectFramework.mockResolvedValueOnce('vite');
+      mockReadConfig.mockResolvedValueOnce({ framework: null });
+
+      client.setArgv('dev', '--local', unlinkedPath);
+      await expect(dev(client)).resolves.toEqual(undefined);
+
+      expect(mockDetectFramework).not.toHaveBeenCalled();
+      expect(devServerInstances[0].projectSettings).toBeUndefined();
+    });
+
+    it('leaves configured services on the services detection path', async () => {
+      const unlinkedPath = '/user/name/code/unlinked-services-project';
+      vol.fromJSON({ 'package.json': '{}' }, unlinkedPath);
+      mockDetectFramework.mockResolvedValueOnce('vite');
+      mockReadConfig.mockResolvedValueOnce({ services: {} });
+
+      client.setArgv('dev', '--local', unlinkedPath);
+      await expect(dev(client)).resolves.toEqual(undefined);
+
+      expect(mockDetectFramework).not.toHaveBeenCalled();
+      expect(devServerInstances[0].projectSettings).toBeUndefined();
+    });
+
+    it('does not show local mode warning for linked projects', async () => {
+      mockDetectFramework.mockResolvedValueOnce('vite');
+      client.setArgv('dev', '--local', projectPath);
+      const exitCodePromise = dev(client);
+
+      await expect(exitCodePromise).resolves.toEqual(undefined);
+      expect(mockDetectFramework).not.toHaveBeenCalled();
+      await expect(client.stderr).not.toOutput(
+        'Running dev server in local mode',
+        100
+      );
+    });
+
+    it('tracks telemetry', async () => {
+      vi.spyOn(process, 'cwd').mockReturnValue(projectPath);
+
+      client.setArgv('dev', '--local');
+      const exitCodePromise = dev(client);
+
+      await expect(exitCodePromise).resolves.toEqual(undefined);
+      expect(client.telemetryEventStore).toHaveTelemetryEvents([
+        {
+          key: 'flag:local',
+          value: 'TRUE',
+        },
+      ]);
+    });
+  });
+
+  describe('dev command failure', () => {
+    let exitSpy: MockInstance<typeof process.exit>;
+
+    beforeEach(() => {
+      exitSpy = vi.spyOn(process, 'exit').mockImplementation(((
+        code?: number
+      ) => {
+        throw new Error(`__exit__:${code ?? ''}`);
+      }) as never);
+    });
+
+    afterEach(() => {
+      exitSpy.mockRestore();
+      mockStart.mockReset();
+    });
+
+    it('prints error and exits with the dev command exit code', async () => {
+      const { DevCommandExitError } = await import(
+        '../../../../src/util/dev/server'
+      );
+
+      mockStart.mockRejectedValueOnce(
+        new DevCommandExitError(
+          'Dev Command “framework dev” exited with code 127',
+          127
+        )
+      );
+
+      client.setArgv('dev', projectPath);
+
+      await expect(dev(client)).rejects.toThrow('__exit__:127');
+      await expect(client.stderr).toOutput(
+        'Error: Dev Command “framework dev” exited with code 127'
+      );
+    });
+
+    it('exits with code 1 on ServiceStartError', async () => {
+      const { ServiceStartError } = await import(
+        '../../../../src/util/dev/services-orchestrator'
+      );
+
+      mockStart.mockRejectedValueOnce(
+        new ServiceStartError([
+          new Error('Service "frontend" exited with code 127'),
+        ])
+      );
+
+      client.setArgv('dev', projectPath);
+
+      await expect(dev(client)).rejects.toThrow('__exit__:1');
+      await expect(client.stderr).toOutput(
+        'Service "frontend" exited with code 127'
+      );
+    });
+  });
+
+  describe('rootDirectory', () => {
+    // Reproduces a bug where running `vercel dev` from inside a project
+    // subdirectory whose name matches the project's `rootDirectory`
+    // setting caused the CLI to append `rootDirectory` again, producing
+    // a non-existent path like `monorepo/project1/project1`. After the
+    // fix, `rootDirectory` is interpreted relative to the resolved repo
+    // root rather than the user's current directory.
+    it('resolves rootDirectory relative to repo root, not cwd', async () => {
+      const monorepoProjectId = 'prj_monorepo123';
+      const monorepoProjectName = 'monorepo-project';
+      const subdir = 'web';
+      const monorepoRoot = `/user/name/code/my-monorepo`;
+      const projectDir = `${monorepoRoot}/${subdir}`;
+
+      mockedRepoRoots.set(monorepoRoot, monorepoRoot);
+
+      useProject({
+        id: monorepoProjectId,
+        name: monorepoProjectName,
+        rootDirectory: subdir,
+      });
+
+      vol.reset();
+      vol.fromJSON(
+        {
+          [`${projectDir}/.vercel/project.json`]: JSON.stringify({
+            projectId: monorepoProjectId,
+            orgId,
+          }),
+        },
+        '/'
+      );
+
+      client.setArgv('dev', projectDir);
+      const exitCodePromise = dev(client);
+      await expect(exitCodePromise).resolves.toEqual(undefined);
+
+      expect(devServerInstances).toHaveLength(1);
+      // Normalize separators so the assertion holds on Windows, where
+      // `path.join` produces backslashes.
+      expect(devServerInstances[0].cwd.replace(/\\/g, '/')).toBe(projectDir);
+    });
+
+    // Edge case: the monorepo folder name happens to match the project's
+    // rootDirectory. e.g. the monorepo is at `/some/path/project-awesome`
+    // and contains a subproject at `/some/path/project-awesome/project-awesome`.
+    // A pure path-based heuristic would incorrectly skip the join here; the
+    // fix uses the repo root so the project path is computed correctly.
+    it('handles a monorepo folder name that matches rootDirectory', async () => {
+      const matchingProjectId = 'prj_matching123';
+      const matchingProjectName = 'matching-name-project';
+      const name = 'project-awesome';
+      const monorepoRoot = `/some/path/${name}`;
+      const projectDir = `${monorepoRoot}/${name}`;
+
+      mockedRepoRoots.set(monorepoRoot, monorepoRoot);
+
+      useProject({
+        id: matchingProjectId,
+        name: matchingProjectName,
+        rootDirectory: name,
+      });
+
+      vol.reset();
+      vol.fromJSON(
+        {
+          [`${monorepoRoot}/.vercel/project.json`]: JSON.stringify({
+            projectId: matchingProjectId,
+            orgId,
+          }),
+        },
+        '/'
+      );
+
+      client.setArgv('dev', monorepoRoot);
+      const exitCodePromise = dev(client);
+      await expect(exitCodePromise).resolves.toEqual(undefined);
+
+      expect(devServerInstances).toHaveLength(1);
+      // Normalize separators so the assertion holds on Windows, where
+      // `path.join` produces backslashes.
+      expect(devServerInstances[0].cwd.replace(/\\/g, '/')).toBe(projectDir);
+    });
+  });
+
+  describe('project/org IDs', () => {
+    it('passes the linked project and org IDs to DevServer', async () => {
+      const getLinkedProjectSpy = vi.spyOn(linkModule, 'getLinkedProject');
+      client.setArgv('dev', projectPath);
+      const exitCodePromise = dev(client);
+
+      await expect(exitCodePromise).resolves.toEqual(undefined);
+      expect(devServerInstances).toHaveLength(1);
+      expect(devServerInstances[0]).toMatchObject({ projectId, orgId });
+      expect(getLinkedProjectSpy).toHaveBeenCalledWith(client, {
+        cwd: normalize(projectPath),
+        projectName: undefined,
+        projectNameIsExplicit: false,
+        scopeIsExplicit: false,
+      });
+      getLinkedProjectSpy.mockRestore();
+    });
+
+    it('omits the IDs for unlinked projects in --local mode', async () => {
+      const unlinkedPath = '/user/name/code/unlinked-project';
+      vol.fromJSON({}, unlinkedPath);
+
+      client.setArgv('dev', '--local', unlinkedPath);
+      const exitCodePromise = dev(client);
+
+      await expect(exitCodePromise).resolves.toEqual(undefined);
+      expect(devServerInstances).toHaveLength(1);
+      expect(devServerInstances[0]).toMatchObject({
+        projectId: undefined,
+        orgId: undefined,
+      });
+    });
+  });
+
+  describe('--project', () => {
+    it('tracks --project telemetry as [REDACTED]', async () => {
+      vi.spyOn(process, 'cwd').mockReturnValue(projectPath);
+
+      client.setArgv('dev', `--project=${projectId}`);
+      const exitCodePromise = dev(client);
+
+      // dev normally only exits on SIGTERM; here it boots the mocked server.
+      await expect(exitCodePromise).resolves.toEqual(undefined);
+
+      expect(client.telemetryEventStore).toHaveTelemetryEvents([
+        {
+          key: 'option:project',
+          value: '[REDACTED]',
+        },
+      ]);
+    });
+  });
+});

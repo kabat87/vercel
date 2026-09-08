@@ -2,12 +2,18 @@
 import { URLSearchParams } from 'url';
 
 // Packages
+import type { DeploymentAliasAssignedEvent } from '@vercel/client';
 import retry from 'async-retry';
 import jsonlines from 'jsonlines';
 import { eraseLines } from 'ansi-escapes';
 
-import Client from './client';
-import { getDeployment } from './get-deployment';
+import type Client from './client';
+import { toNodeReadable } from './fetch';
+import getDeployment from './get-deployment';
+import getScope from './get-scope';
+
+import type { BuildLog } from './logs';
+import output from '../output-manager';
 
 export interface FindOpts {
   direction: 'forward' | 'backward';
@@ -18,25 +24,21 @@ export interface FindOpts {
 }
 
 export interface PrintEventsOptions {
-  mode: string;
-  onEvent: (event: DeploymentEvent) => void;
+  mode: 'deploy' | string;
+  onEvent: (event: BuildLog) => void;
+  onAliasAssigned?: (event: DeploymentAliasAssignedEvent) => void;
   quiet?: boolean;
   findOpts: FindOpts;
 }
 
-export interface DeploymentEvent {
-  id: string;
-  created: number;
-  date?: number;
-  serial?: string;
-}
-
 async function printEvents(
   client: Client,
-  deploymentIdOrURL: string,
-  { mode, onEvent, quiet, findOpts }: PrintEventsOptions
+  urlOrDeploymentId: string,
+  { mode, onEvent, onAliasAssigned, quiet, findOpts }: PrintEventsOptions,
+  abortController?: AbortController
 ) {
-  const { log, debug } = client.output;
+  const { log, debug } = output;
+  const scope = mode === 'deploy' ? await getScope(client) : null;
 
   // we keep track of how much we log in case we
   // drop the connection and have to start over
@@ -57,113 +59,158 @@ async function printEvents(
       if (findOpts.since) query.set('since', String(findOpts.since));
       if (findOpts.until) query.set('until', String(findOpts.until));
 
-      const eventsUrl = `/v1/now/deployments/${deploymentIdOrURL}/events?${query}`;
-      const eventsRes = await client.fetch(eventsUrl, { json: false });
+      const eventsUrl = `/v3/now/deployments/${urlOrDeploymentId}/events?${query}`;
+      try {
+        const eventsRes = await client.fetch(eventsUrl, {
+          json: false,
+          signal: abortController?.signal,
+        });
 
-      if (eventsRes.ok) {
-        const readable = eventsRes.body;
+        if (eventsRes.ok) {
+          const readable = toNodeReadable(eventsRes.body);
 
-        // handle the event stream and make the promise get rejected
-        // if errors occur so we can retry
-        return new Promise<void>((resolve, reject) => {
-          const stream = readable.pipe(jsonlines.parse());
+          // handle the event stream and make the promise get rejected
+          // if errors occur so we can retry
+          return new Promise<void>((resolve, reject) => {
+            const stream = readable.pipe(jsonlines.parse());
 
-          let poller: ReturnType<typeof setTimeout>;
+            let poller: ReturnType<typeof setTimeout>;
 
-          if (mode === 'deploy') {
-            poller = (function startPoller() {
-              return setTimeout(async () => {
-                try {
-                  const json = await getDeployment(client, deploymentIdOrURL);
-                  if (json.readyState === 'READY') {
+            if (mode === 'deploy') {
+              poller = (function startPoller() {
+                return setTimeout(async () => {
+                  try {
+                    const json = await getDeployment(
+                      client,
+                      scope!.contextName,
+                      urlOrDeploymentId
+                    );
+                    if (json.readyState === 'READY') {
+                      stream.end();
+                      finish();
+                      return;
+                    }
+                    poller = startPoller();
+                  } catch (err: unknown) {
                     stream.end();
-                    finish();
-                    return;
+                    finish(err);
                   }
-                  poller = startPoller();
-                } catch (error) {
-                  stream.end();
-                  finish(error);
-                }
-              }, 5000);
-            })();
-          }
-
-          let finishCalled = false;
-          function finish(error?: Error) {
-            if (finishCalled) return;
-            finishCalled = true;
-            clearTimeout(poller);
-            if (error) {
-              reject(error);
-            } else {
-              resolve();
+                }, 5000);
+              })();
             }
-          }
 
-          let latestLogDate = 0;
-
-          const onData = (data: any) => {
-            const { event, payload, date } = data;
-            if (event === 'state' && payload.value === 'READY') {
-              if (mode === 'deploy') {
-                stream.end();
-                finish();
+            let finishCalled = false;
+            function finish(err?: unknown) {
+              if (finishCalled) return;
+              finishCalled = true;
+              clearTimeout(poller);
+              if (err) {
+                reject(err);
+              } else {
+                resolve();
               }
-            } else {
-              latestLogDate = Math.max(latestLogDate, date);
-              onEvent(data);
-            }
-          };
-
-          let onErrorCalled = false;
-          const onError = (err: Error) => {
-            if (finishCalled || onErrorCalled) return;
-            onErrorCalled = true;
-            o++;
-
-            const errorMessage = `Deployment event stream error: ${err.message}`;
-            if (!findOpts.follow) {
-              log(errorMessage);
-              return;
             }
 
-            debug(errorMessage);
-            clearTimeout(poller);
-            stream.destroy(err);
+            let latestLogDate = 0;
 
-            const retryFindOpts = {
-              ...findOpts,
-              since: latestLogDate,
+            const onData = (data: any) => {
+              if (data.type === 'alias-assigned') {
+                if (data.deploymentId === urlOrDeploymentId) {
+                  onAliasAssigned?.(data);
+                }
+                return;
+              }
+
+              const { event, payload, date } = data;
+              if (event === 'state' && payload.value === 'READY') {
+                if (mode === 'deploy') {
+                  stream.end();
+                  finish();
+                }
+              } else {
+                latestLogDate = Math.max(latestLogDate, date);
+                onEvent(data);
+              }
             };
 
-            setTimeout(() => {
-              // retry without maximum amount nor clear past logs etc
-              printEvents(client, deploymentIdOrURL, {
-                mode,
-                onEvent,
-                quiet,
-                findOpts: retryFindOpts,
-              }).then(resolve, reject);
-            }, 2000);
-          };
+            let onErrorCalled = false;
+            const onError = (err: Error) => {
+              if (finishCalled || onErrorCalled) return;
+              if (err.name === 'AbortError') {
+                finish();
+                return;
+              }
+              onErrorCalled = true;
+              o++;
 
-          stream.on('end', finish);
-          stream.on('data', onData);
-          stream.on('error', onError);
-          readable.on('error', onError);
-        });
-      }
-      const err = new Error(`Deployment events status ${eventsRes.status}`);
+              const errorMessage = `Deployment event stream error: ${err.message}`;
+              if (!findOpts.follow) {
+                log(errorMessage);
+                return;
+              }
 
-      if (eventsRes.status < 500) {
-        bail(err);
-      } else {
+              debug(errorMessage);
+              clearTimeout(poller);
+              stream.destroy(err);
+
+              const retryFindOpts = {
+                ...findOpts,
+                since: latestLogDate,
+              };
+
+              const retryTimeout = setTimeout(() => {
+                abortController?.signal.removeEventListener('abort', onAbort);
+                if (abortController?.signal.aborted) return;
+                // retry without maximum amount nor clear past logs etc
+                printEvents(
+                  client,
+                  urlOrDeploymentId,
+                  {
+                    mode,
+                    onEvent,
+                    onAliasAssigned,
+                    quiet,
+                    findOpts: retryFindOpts,
+                  },
+                  abortController
+                ).then(resolve, reject);
+              }, 2000);
+
+              const onAbort = () => {
+                clearTimeout(retryTimeout);
+                finish();
+              };
+              abortController?.signal.addEventListener('abort', onAbort, {
+                once: true,
+              });
+            };
+
+            stream.on('end', finish);
+            stream.on('data', onData);
+            stream.on('error', onError);
+            readable.on('error', onError);
+          });
+        }
+        const err = new Error(`Deployment events status ${eventsRes.status}`);
+
+        if (eventsRes.status < 500) {
+          bail(err);
+        } else {
+          throw err;
+        }
+      } catch (err) {
+        if (err instanceof Error && err.name === 'AbortError') {
+          return;
+        }
         throw err;
       }
     },
     {
       retries: 4,
+      // Don't let deploy stream retry timers keep the CLI alive after polling
+      // wins. Standalone log consumers await these retries, so their timers
+      // must remain referenced.
+      unref: Boolean(onAliasAssigned),
       onRetry: err => {
         // if we are retrying, we clear past logs
         if (!quiet && o) {
@@ -172,7 +219,7 @@ async function printEvents(
           o = 0;
         }
 
-        log(`Deployment state polling error: ${err.message}`);
+        log(`Deployment events polling error: ${err.message}`);
       },
     }
   );

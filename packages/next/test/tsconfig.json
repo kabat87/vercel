@@ -1,0 +1,9 @@
+{
+  "compilerOptions": {
+    "allowJs": true,
+    "sourceMap": true,
+    "types": ["vitest/globals"]
+  },
+  "extends": "../tsconfig.json",
+  "include": ["**/*.test.ts"]
+}

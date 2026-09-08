@@ -1,0 +1,270 @@
+{
+  "$schema": "https://turborepo.org/schema.json",
+  "futureFlags": {
+    "affectedUsingTaskInputs": true,
+    "strictTaskEntrypointSelection": true,
+    "experimentalObservability": true,
+    "experimentalTaskCommand": true,
+    "experimentalCargoWorkspaces": true,
+    "experimentalPythonWorkspaces": true
+  },
+  "envMode": "loose",
+  "experimentalObservability": {
+    "otel": {
+      "enabled": true,
+      "protocol": "http/protobuf",
+      "timeoutMs": 10000,
+      "intervalMs": 15000,
+      "resource": {
+        "service.name": "turborepo"
+      },
+      "metrics": {
+        "runSummary": true,
+        "taskDetails": true
+      }
+    }
+  },
+  "tasks": {
+    "//#format:check": {},
+    "//#generate:cache-keys": {
+      "cache": false,
+      "command": ["node", "utils/gen.js"],
+      "inputs": ["utils/gen.js"],
+      "outputs": [
+        "turbo-native-cache-key.json",
+        "turbo-platform-cache-key.json"
+      ]
+    },
+    "//#lint": {},
+    "//#lint:dependencies": {},
+    "ci:checks": {
+      "dependsOn": ["build", "type-check"]
+    },
+    "//#ci:checks": {
+      "dependsOn": ["format:check", "lint", "lint:dependencies"]
+    },
+    "//#test": {
+      "command": ["node", "-e", "process.exit(0)"],
+      "dependsOn": ["//#test:repo", "//#test:utils"],
+      "inputs": ["turbo.json"]
+    },
+    "//#test:repo": {
+      "command": [
+        "pnpm",
+        "exec",
+        "vitest",
+        "run",
+        "--config",
+        "vitest.config.mts",
+        "--dir",
+        "test"
+      ],
+      "inputs": ["test/utils/**", "vitest.config.mts"]
+    },
+    "//#test:utils": {
+      "command": [
+        "pnpm",
+        "exec",
+        "vitest",
+        "run",
+        "--config",
+        "vitest.config.mts",
+        "--dir",
+        "utils"
+      ],
+      "inputs": ["utils/**", "vitest.config.mts"]
+    },
+    "build": {
+      "dependsOn": ["^build"],
+      "env": ["VERCEL_CLI_BUILD_LABEL"],
+      "inputs": [
+        "$TURBO_DEFAULT$",
+        "$TURBO_ROOT$/utils/build.mjs",
+        "$TURBO_ROOT$/utils/build-builder.mjs"
+      ],
+      "outputLogs": "new-only",
+      "outputs": ["dist/**"]
+    },
+    "build:package": {
+      "dependsOn": ["build", "^build"]
+    },
+    "build:docs": {
+      "dependsOn": ["build", "^build"],
+      "inputs": ["$TURBO_DEFAULT$", "!docs/**"],
+      "outputLogs": "new-only",
+      "outputs": ["docs/**"]
+    },
+    "generate:schemas": {
+      "outputLogs": "new-only"
+    },
+    "build:wasm": {
+      "outputLogs": "new-only"
+    },
+    "test-e2e-node-all-versions": {
+      "dependsOn": ["build", "//#generate:cache-keys"],
+      "inputs": [
+        "$TURBO_DEFAULT$",
+        "$TURBO_ROOT$/test/lib/**",
+        {
+          "mode": "dependencyOutputs",
+          "globs": ["turbo-platform-cache-key.json"],
+          "from": ["//#generate:cache-keys"]
+        },
+        "$TURBO_ROOT$/vitest.config.mts"
+      ],
+      "outputLogs": "new-only"
+    },
+    "test-unit": {
+      "dependsOn": ["^build", "//#generate:cache-keys"],
+      "env": ["NODE_VERSION", "VITEST_SHARD"],
+      "inputs": [
+        "$TURBO_DEFAULT$",
+        {
+          "mode": "dependencyOutputs",
+          "globs": ["turbo-platform-cache-key.json"],
+          "from": ["//#generate:cache-keys"]
+        },
+        "$TURBO_ROOT$/vitest.config.mts"
+      ],
+      "outputLogs": "new-only"
+    },
+    "test-dev": {
+      "dependsOn": ["build", "//#generate:cache-keys"],
+      "inputs": [
+        "$TURBO_DEFAULT$",
+        "$TURBO_ROOT$/test/lib/**",
+        {
+          "mode": "dependencyOutputs",
+          "globs": ["turbo-platform-cache-key.json"],
+          "from": ["//#generate:cache-keys"]
+        },
+        "$TURBO_ROOT$/vitest.config.mts"
+      ],
+      "outputLogs": "new-only"
+    },
+    "test-dev-artifacts": {
+      "dependsOn": ["build", "//#generate:cache-keys"],
+      "inputs": [
+        "$TURBO_DEFAULT$",
+        "$TURBO_ROOT$/test/lib/**",
+        {
+          "mode": "dependencyOutputs",
+          "globs": ["turbo-platform-cache-key.json"],
+          "from": ["//#generate:cache-keys"]
+        },
+        "$TURBO_ROOT$/vitest.config.mts"
+      ],
+      "outputLogs": "new-only"
+    },
+    "test-e2e": {
+      "dependsOn": ["^build", "//#generate:cache-keys"],
+      "inputs": [
+        "$TURBO_DEFAULT$",
+        "$TURBO_ROOT$/test/lib/**",
+        {
+          "mode": "dependencyOutputs",
+          "globs": ["turbo-platform-cache-key.json"],
+          "from": ["//#generate:cache-keys"]
+        },
+        "$TURBO_ROOT$/vitest.config.mts"
+      ],
+      "outputLogs": "new-only"
+    },
+    "test-e2e-artifacts": {
+      "dependsOn": ["^build", "//#generate:cache-keys"],
+      "inputs": [
+        "$TURBO_DEFAULT$",
+        "$TURBO_ROOT$/test/lib/**",
+        {
+          "mode": "dependencyOutputs",
+          "globs": ["turbo-platform-cache-key.json"],
+          "from": ["//#generate:cache-keys"]
+        },
+        "$TURBO_ROOT$/vitest.config.mts"
+      ],
+      "outputLogs": "new-only"
+    },
+    "test-e2e-builder": {
+      "dependsOn": [
+        "^build",
+        "@vercel-internals/cli-builder-integration#build",
+        "//#generate:cache-keys"
+      ],
+      "inputs": [
+        "$TURBO_DEFAULT$",
+        "$TURBO_ROOT$/test/lib/**",
+        {
+          "mode": "dependencyOutputs",
+          "globs": ["turbo-platform-cache-key.json"],
+          "from": ["//#generate:cache-keys"]
+        },
+        "$TURBO_ROOT$/vitest.config.mts"
+      ],
+      "outputLogs": "new-only"
+    },
+    "test-e2e-independent": {
+      "dependsOn": ["^build", "//#generate:cache-keys"],
+      "inputs": [
+        "$TURBO_DEFAULT$",
+        "$TURBO_ROOT$/test/lib/**",
+        {
+          "mode": "dependencyOutputs",
+          "globs": ["turbo-platform-cache-key.json"],
+          "from": ["//#generate:cache-keys"]
+        },
+        "$TURBO_ROOT$/vitest.config.mts"
+      ],
+      "outputLogs": "new-only"
+    },
+    "test-next-local": {
+      "dependsOn": ["build", "//#generate:cache-keys"],
+      "inputs": [
+        "$TURBO_DEFAULT$",
+        "$TURBO_ROOT$/test/lib/**",
+        {
+          "mode": "dependencyOutputs",
+          "globs": ["turbo-platform-cache-key.json"],
+          "from": ["//#generate:cache-keys"]
+        },
+        "$TURBO_ROOT$/vitest.config.mts"
+      ],
+      "outputLogs": "new-only"
+    },
+    "test-next-local-windows": {
+      "dependsOn": ["build", "//#generate:cache-keys"],
+      "inputs": [
+        "$TURBO_DEFAULT$",
+        "$TURBO_ROOT$/test/lib/**",
+        {
+          "mode": "dependencyOutputs",
+          "globs": ["turbo-platform-cache-key.json"],
+          "from": ["//#generate:cache-keys"]
+        },
+        "$TURBO_ROOT$/vitest.config.mts"
+      ],
+      "outputLogs": "new-only"
+    },
+    "test": {
+      "dependsOn": ["^build", "//#generate:cache-keys"],
+      "env": ["NODE_VERSION", "VITEST_SHARD", "VITEST_TEST_FILES"],
+      "inputs": [
+        "$TURBO_DEFAULT$",
+        "$TURBO_ROOT$/test/lib/**",
+        {
+          "mode": "dependencyOutputs",
+          "globs": ["turbo-platform-cache-key.json"],
+          "from": ["//#generate:cache-keys"]
+        },
+        "$TURBO_ROOT$/vitest.config.mts"
+      ],
+      "outputLogs": "new-only"
+    },
+    "type-check": {
+      "dependsOn": ["^build", "source"],
+      "inputs": ["$TURBO_DEFAULT$", "$TURBO_ROOT$/tsconfig.base.json"]
+    },
+    "source": {
+      "dependsOn": ["^source"]
+    }
+  }
+}

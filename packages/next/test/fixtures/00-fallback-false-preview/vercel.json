@@ -1,0 +1,37 @@
+{
+  "builds": [
+    {
+      "src": "package.json",
+      "use": "@vercel/next"
+    }
+  ],
+  "probes": [
+    {
+      "path": "/",
+      "status": 200,
+      "mustContain": "pages/index.js"
+    },
+    {
+      "path": "/",
+      "status": 200,
+      "mustContain": "pages/index.js"
+    },
+    {
+      "path": "/_next/image?url=%2Fvercel.png&w=256&q=75",
+      "status": 200,
+      "responseHeaders": {
+        "cache-control": "public, max-age=0, must-revalidate"
+      }
+    },
+    {
+      "path": "/blog/test-123",
+      "status": 200,
+      "mustContain": "blog fallback rewrite"
+    }
+  ],
+  "build": {
+    "env": {
+      "NEXT_BUILDER_INTEGRATION": "1"
+    }
+  }
+}

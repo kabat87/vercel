@@ -1,0 +1,243 @@
+import chalk from 'chalk';
+import type Client from '../../util/client';
+import getScope from '../../util/get-scope';
+import { getLinkedProject } from '../../util/projects/link';
+import type { Resource } from '../../util/integration-resource/types';
+import { getResources } from '../../util/integration-resource/get-resources';
+import { isSandboxResource } from '../../util/integration-resource/claim-status';
+import { packageName } from '../../util/pkg-name';
+import { listSubcommand } from './command';
+import { getFlagsSpecification } from '../../util/get-flags-specification';
+import { parseArguments } from '../../util/get-args';
+import { printError } from '../../util/error';
+import { validateJsonOutput } from '../../util/output-format';
+import { validateLsArgs } from '../../util/validate-ls-args';
+import table from '../../util/output/table';
+import type { Team } from '@vercel-internals/types';
+import { buildSSOLink } from '../../util/integration/build-sso-link';
+import {
+  resourceLink,
+  resourceStatus,
+} from '../../util/integration-resource/format';
+import { IntegrationListTelemetryClient } from '../../util/telemetry/commands/integration/list';
+import output from '../../output-manager';
+
+export async function list(client: Client) {
+  let parsedArguments = null;
+  const flagsSpecification = getFlagsSpecification(listSubcommand.options);
+
+  try {
+    parsedArguments = parseArguments(client.argv.slice(3), flagsSpecification);
+  } catch (error) {
+    printError(error);
+    return 1;
+  }
+
+  const telemetry = new IntegrationListTelemetryClient({
+    opts: {
+      store: client.telemetryEventStore,
+    },
+  });
+
+  telemetry.trackCliArgumentProject(parsedArguments.args[1]);
+  telemetry.trackCliFlagAll(parsedArguments.flags['--all']);
+  telemetry.trackCliOptionFormat(parsedArguments.flags['--format']);
+  // Note: the `--integration` flag is tracked later, after validating
+  // whether the value is a known integration name or not.
+
+  const formatResult = validateJsonOutput(parsedArguments.flags);
+  if (!formatResult.valid) {
+    output.error(formatResult.error);
+    return 1;
+  }
+  const asJson = formatResult.jsonOutput;
+
+  const validationResult = validateLsArgs({
+    commandName: 'integration list [project]',
+    args: parsedArguments.args,
+    maxArgs: 2,
+    exitCode: 1,
+  });
+  if (validationResult !== 0) {
+    return validationResult;
+  }
+
+  let project: { id?: string; name?: string } | undefined;
+
+  if (parsedArguments.args.length === 2) {
+    if (parsedArguments.flags['--all']) {
+      output.error('Cannot specify a project when using the `--all` flag.');
+      return 1;
+    }
+
+    project = { name: parsedArguments.args[1] };
+  }
+
+  const { contextName, team } = await getScope(client);
+
+  if (!team) {
+    output.error('Team not found.');
+    return 1;
+  }
+  client.config.currentTeam = team.id;
+
+  if (!project && !parsedArguments.flags['--all']) {
+    project = await getLinkedProject(client).then(result => {
+      if (result.status === 'linked') {
+        return result.project;
+      }
+      return;
+    });
+    if (!project) {
+      output.error(
+        'No project linked. Either use `vc link` to link a project, or the `--all` flag to list all resources.'
+      );
+      return 1;
+    }
+  }
+
+  let resources: Resource[] | undefined;
+
+  try {
+    output.spinner('Retrieving resources…', 500);
+    resources = await getResources(client);
+  } catch (error) {
+    output.error(`Failed to fetch resources: ${(error as Error).message}`);
+    return 1;
+  }
+
+  const filterIntegration =
+    parsedArguments.flags['--integration']?.toLocaleLowerCase();
+
+  function resourceIsFromMarketplace(resource: Resource): boolean {
+    return resource.type === 'integration';
+  }
+
+  let knownIntegration = false;
+
+  function filterOnIntegration(resource: Resource): boolean {
+    if (!filterIntegration) return true;
+    const match = filterIntegration === resource.product?.slug;
+    if (match) knownIntegration = true;
+    return match;
+  }
+
+  function filterOnProject(resource: Resource): boolean {
+    return (
+      !project ||
+      !!resource.projectsMetadata?.find(
+        metadata =>
+          metadata.projectId === project?.id || metadata.name === project?.name
+      )
+    );
+  }
+
+  function filterOnFlags(resource: Resource): boolean {
+    return filterOnIntegration(resource) && filterOnProject(resource);
+  }
+
+  const results = resources
+    .filter(resourceIsFromMarketplace)
+    .filter(filterOnFlags)
+    .map(resource => {
+      return {
+        id: resource.id,
+        name: resource.name,
+        status: resource.status,
+        product: resource.product?.name,
+        integration: resource.product?.slug,
+        configurationId: resource.product?.integrationConfigurationId,
+        projects: resource.projectsMetadata?.map(project => project.name),
+        isSandbox: isSandboxResource(resource),
+      };
+    });
+
+  const sandboxCount = results.filter(r => r.isSandbox).length;
+
+  telemetry.trackCliOptionIntegration(
+    parsedArguments.flags['--integration'],
+    knownIntegration
+  );
+
+  if (asJson) {
+    output.stopSpinner();
+    const jsonResources = results.map(result => {
+      const obj: Record<string, unknown> = {
+        id: result.id,
+        name: result.name,
+        status: result.status,
+        product: result.product,
+        installationId: result.configurationId,
+        projects: result.projects,
+      };
+      if (result.isSandbox) {
+        obj.claim_status = 'sandbox';
+      }
+      return obj;
+    });
+    client.stdout.write(
+      `${JSON.stringify({ resources: jsonResources }, null, 2)}\n`
+    );
+    return 0;
+  }
+
+  if (results.length === 0) {
+    output.log('No resources found.');
+    return 0;
+  }
+
+  const headerMessage = project
+    ? `Integration resources for project ${chalk.bold(project.name)} in ${chalk.bold(contextName)}:`
+    : `Integrations in ${chalk.bold(contextName)}:`;
+
+  output.log(
+    `${headerMessage}\n${table(
+      [
+        ['Name', 'Status', 'Product', 'Integration', 'Projects'].map(header =>
+          chalk.bold(chalk.cyan(header))
+        ),
+        ...results.map(result => [
+          resourceLink(contextName, result) ?? chalk.gray('–'),
+          resourceStatus(result.status ?? '–', result.isSandbox),
+          result.product ?? chalk.gray('–'),
+          integrationLink(result, team) ?? chalk.gray('–'),
+          chalk.grey(
+            result.projects?.length ? result.projects.join(', ') : '–'
+          ),
+        ]),
+      ],
+      { hsep: 8 }
+    )}`
+  );
+
+  if (sandboxCount > 0) {
+    const noun = sandboxCount === 1 ? 'resource' : 'resources';
+    output.log(`${sandboxCount} sandbox ${noun} can be claimed.`);
+    output.print(
+      `  Run \`${packageName} integration resource claim <name>\` to claim one.\n`
+    );
+  }
+
+  return 0;
+}
+
+// Builds a deep link to the integration dashboard
+function integrationLink(
+  integration: { integration?: string; configurationId?: string },
+  team: Team
+): string | undefined {
+  if (!integration.integration) {
+    return;
+  }
+
+  if (!integration.configurationId) {
+    return integration.integration;
+  }
+
+  const boldName = chalk.bold(integration.integration);
+  const integrationDeepLink = buildSSOLink(team, integration.configurationId);
+  return output.link(boldName, integrationDeepLink, {
+    fallback: () => boldName,
+    color: false,
+  });
+}

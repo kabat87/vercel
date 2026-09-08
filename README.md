@@ -3,36 +3,218 @@
     <img src="https://assets.vercel.com/image/upload/v1588805858/repositories/vercel/logo.png" height="96">
     <h3 align="center">Vercel</h3>
   </a>
-  <p align="center">Develop. Preview. Ship.</p>
 </p>
 
-[![CI Status](https://github.com/vercel/vercel/actions/workflows/test-unit.yml/badge.svg)](https://github.com/vercel/vercel/actions/workflows/test-unit.yml)
-[![Join the community on GitHub Discussions](https://badgen.net/badge/join%20the%20discussion/on%20github/black?icon=github)](https://github.com/vercel/vercel/discussions)
+<p align="center">
+  Develop. Preview. Ship.
+</p>
 
-## Usage
+<p align="center">
+  <a href="https://vercel.com/docs"><strong>Documentation</strong></a> ·
+  <a href="https://vercel.com/changelog"><strong>Changelog</strong></a> ·
+  <a href="https://vercel.com/templates"><strong>Templates</strong></a> ·
+  <a href="https://vercel.com/docs/cli"><strong>CLI</strong></a>
+</p>
+<br/>
 
-Vercel is a platform for **static sites and frontend frameworks**, built to integrate with your headless content, commerce, or database.
+## Vercel
 
-We provide a **frictionless developer experience** to take care of the hard things: deploy instantly, scale automatically, and serve personalized content around the globe.
+Vercel’s AI Cloud is a unified platform for building modern applications, giving teams the tools to be flexible, move fast, and stay secure while focusing on their products instead of infrastructure.
 
-We make it easy for frontend teams to **develop, preview, and ship** delightful user experiences, where performance is the default.
+## Deploy
 
-Get started by [Importing a Git Project](https://vercel.com/new) and use `git push` to deploy. Alternatively, you can [install Vercel CLI](https://vercel.com/cli).
+Get started by [importing a project](https://vercel.com/new), [choosing a template](https://vercel.com/templates), or using the [Vercel CLI](https://vercel.com/docs/cli). Then, `git push` to deploy.
+
+## Native CLI binaries
+
+The standard npm installation remains unchanged:
+
+```bash
+npm i -g vercel
+```
+
+Native CLI binaries are distributed separately and do not affect the `vercel` npm package. To opt into the native binary and replace existing global `vercel` and `vc` commands, install the native package explicitly:
+
+```bash
+npm i -g @vercel/vc-native --force
+```
+
+The `--force` flag allows npm to replace existing global `vercel` and `vc` bin links. Users who do not install `@vercel/vc-native` continue using the regular Node.js-based CLI from `npm i -g vercel`.
+
+Platform-specific packages are also available for direct installation when a specific binary is needed:
+
+```bash
+npm i -g @vercel/vc-native-darwin-x64 --force
+```
 
 ## Documentation
 
 For details on how to use Vercel, check out our [documentation](https://vercel.com/docs).
 
-## Caught a Bug?
+## Contributing
 
-1. [Fork](https://help.github.com/articles/fork-a-repo/) this repository to your own GitHub account and then [clone](https://help.github.com/articles/cloning-a-repository/) it to your local device
-2. Install dependencies with `yarn install`
-3. Compile the code: `yarn build`
-4. Link the package to the global module directory: `cd ./packages/cli && yarn link`
-5. You can start using `vercel` anywhere inside the command line
+This project uses [pnpm](https://pnpm.io/) to install dependencies and run scripts.
 
-As always, you should use `yarn test-unit` to run the tests and see if your changes have broken anything.
+You can use the `vercel` script to run local changes as if you were invoking Vercel CLI. For example, `vercel deploy --cwd=/path/to/project` could be run with local changes with `pnpm vercel deploy --cwd=/path/to/project`.
 
-## How to Create a Release
+When contributing to this repository, please first discuss the change you wish to make via [Vercel Community](https://community.vercel.com/tags/c/community/4/cli) with the owners of this repository before submitting a Pull Request.
 
-If you have write access to this repository, you can read more about how to publish a release [here](https://github.com/vercel/vercel/wiki/Creating-a-Release).
+Please read our [Code of Conduct](./.github/CODE_OF_CONDUCT.md) and follow it in all your interactions with the project.
+
+### Local development
+
+This project is configured in a monorepo, where one repository contains multiple npm packages. Dependencies are installed and managed with `pnpm`, not `npm` CLI.
+
+To get started, execute the following:
+
+```bash
+git clone https://github.com/vercel/vercel
+cd vercel
+corepack enable
+pnpm install
+pnpm build
+pnpm lint
+pnpm test-unit
+```
+
+Make sure all the tests pass before making changes.
+
+#### Running Vercel CLI Changes
+
+You can use `pnpm vercel` from the `cli` package to invoke Vercel CLI with local changes:
+
+```bash
+cd ./packages/cli
+pnpm vercel <cli-commands...>
+```
+
+See [CLI Local Development](./packages/cli#local-development) for more details.
+
+### Verifying your change
+
+Once you are done with your changes (we even suggest doing it along the way), make sure all the tests still pass by running:
+
+```bash
+pnpm test-unit
+```
+
+from the root of the project.
+
+If any test fails, make sure to fix it along with your changes. See [Interpreting test errors](#Interpreting-test-errors) for more information about how the tests are executed, especially the integration tests.
+
+#### Reproducing affected builds and type-checks
+
+CI compares the pull request head with the base and head commits recorded by GitHub. To inspect the same affected Turborepo task plan locally, commit your changes, check out the pull request head, and set the explicit SCM range:
+
+```bash
+export TURBO_SCM_BASE=$(gh pr view --json baseRefOid --jq .baseRefOid)
+export TURBO_SCM_HEAD=$(gh pr view --json headRefOid --jq .headRefOid)
+git fetch origin "$TURBO_SCM_BASE" "$TURBO_SCM_HEAD"
+test "$(git rev-parse HEAD)" = "$TURBO_SCM_HEAD"
+node utils/gen.js
+pnpm exec turbo run ci:checks --affected --dry=json
+```
+
+To execute the selected tasks as CI does, replace the final command with:
+
+```bash
+pnpm exec turbo run ci:checks --affected --output-logs=errors-only --summarize --continue
+```
+
+Both commits must be available in the local clone; CI uses a full-history checkout and fails rather than treating a missing commit as an empty change. Lint, formatting, dependency checks, and generated asset validation remain repository-wide.
+
+### Pull Request Process
+
+Once you are confident that your changes work properly, open a pull request on the main repository.
+
+The pull request will be reviewed by the maintainers and the tests will be checked by our continuous integration platform.
+
+### Interpreting test errors
+
+There are two primary kinds of tests in this repository: unit tests and end-to-end (E2E) tests.
+
+Unit tests are primarily run with Vitest and execute quickly because they test isolated behavior.
+
+#### End-to-end tests
+
+Integration tests create deployments to your Vercel account using the `test` project name. After each test is deployed, the `probes` key is used to check if the response is the expected value. If the value doesn't match, you'll see a message explaining the difference. If the deployment failed to build, you'll see a more generic message like the following:
+
+```log
+[Error: Fetched page https://test-8ashcdlew.vercel.app/root.js does not contain hello Root!. Instead it contains An error occurred with this application.
+
+    NO_STATUS_CODE_FRO Response headers:
+       cache-control=s-maxage=0
+      connection=close
+      content-type=text/plain; charset=utf-8
+      date=Wed, 19 Jun 2019 18:01:37 GMT
+      server=now
+      strict-transport-security=max-age=63072000
+      transfer-encoding=chunked
+      x-now-id=iad1:hgtzj-1560967297876-44ae12559f95
+      x-now-trace=iad1]
+```
+
+In such cases, you can visit the URL of the failed deployment and append `/_logs` to see the build error. In the case above, that would be https://test-8ashcdlew.vercel.app/_logs
+
+The logs of this deployment will contain the actual error which may help you to understand what went wrong.
+
+##### Running integration tests locally
+
+While running the full integration suite locally is not recommended, it's sometimes useful to isolate a failing test by running it on your machine. To do so, you'll need to ensure you have the appropriate credentials sourced in your shell:
+
+1. Create an access token. Follow the instructions here https://vercel.com/docs/rest-api#creating-an-access-token. Ensure the token scope is for your personal
+   account.
+2. Grab the team ID from the Vercel dashboard at `https://vercel.com/<MY-TEAM>/~/settings`.
+3. Source these into your shell rc file: `echo 'export VERCEL_TOKEN=<MY-TOKEN> VERCEL_TEAM_ID=<MY-TEAM-ID>' >> ~/.zshrc`
+
+From there, you should be able to trigger an integration test. Choose one
+that's already isolated to check that things work:
+
+```bash
+cd packages/next
+```
+
+Run the test:
+
+```bash
+pnpm test test/fixtures/00-server-build/index.test.js
+```
+
+> [!NOTE]
+> If you receive a `401` status code while fetching the deployment, you need to disable [Deployment Protection](https://vercel.com/docs/security/deployment-protection) on the project.
+
+#### @vercel/nft
+
+Some of the Builders use `@vercel/nft` to tree-shake files before deployment. If you suspect an error with this tree-shaking mechanism, you can create the following script in your project:
+
+```js
+const { nodeFileTrace } = require('@vercel/nft');
+nodeFileTrace(['path/to/entrypoint.js'], {
+  ts: true,
+  mixedModules: true,
+})
+  .then(o => console.log(o.fileList))
+  .then(e => console.error(e));
+```
+
+When you run this script, you'll see all the imported files. If files are missing, the bug is in [@vercel/nft](https://github.com/vercel/nft) and not the Builder.
+
+### Deploy a Builder with existing project
+
+Sometimes you want to test changes to a Builder against an existing project, maybe with `vercel dev` or actual deployment. You can avoid publishing every Builder change to npm by uploading the Builder as a tarball.
+
+1. Change directory to the desired Builder `cd ./packages/node`
+2. Run `pnpm build` to compile typescript and other build steps
+3. Run `npm pack` to create a tarball file. It is imporant to not use `pnpm pack` because it will not preserve the file permissions
+4. Move the resulting tarball to a directory
+5. Run `vercel <directory>` to upload the tarball file and get a URL. Remember to append `/<tarball name>` to then end of your URL
+6. Edit any existing `vercel.json` project and replace `use` with the URL
+7. Run `vercel` or `vercel dev` to deploy with the experimental Builder
+
+**Note:** You will need to turn off vercel authentication in settings -> deployment protection so the builder can be downloaded
+
+## Reference
+
+- [Code of Conduct](./.github/CODE_OF_CONDUCT.md)
+- [Contributing Guidelines](./.github/CONTRIBUTING.md)
+- [Apache 2.0 License](./LICENSE)

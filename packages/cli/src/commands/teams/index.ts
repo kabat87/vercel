@@ -1,114 +1,172 @@
-import chalk from 'chalk';
-import error from '../../util/output/error';
-import logo from '../../util/output/logo';
 import list from './list';
 import add from './add';
 import change from './switch';
 import invite from './invite';
-import { getPkgName } from '../../util/pkg-name';
-import getArgs from '../../util/get-args';
-import Client from '../../util/client';
+import request from './request';
+import members from './members';
+import sso from './sso';
+import { parseArguments } from '../../util/get-args';
+import {
+  addSubcommand,
+  inviteSubcommand,
+  listSubcommand,
+  requestSubcommand,
+  membersSubcommand,
+  ssoSubcommand,
+  switchSubcommand,
+  teamsCommand,
+} from './command';
+import { type Command, help } from '../help';
+import { getFlagsSpecification } from '../../util/get-flags-specification';
+import { printError } from '../../util/error';
+import { outputAgentError } from '../../util/agent-output';
+import { TeamsTelemetryClient } from '../../util/telemetry/commands/teams';
+import output from '../../output-manager';
+import getSubcommand from '../../util/get-subcommand';
+import type Client from '../../util/client';
+import { tryOpenApiFallback } from '../../util/openapi';
+import { resolveOpenApiTagForTeamsCli } from '../../util/openapi/matches-cli-api-tag';
 
-const help = () => {
-  console.log(`
-  ${chalk.bold(`${logo} ${getPkgName()} teams`)} [options] <command>
-
-  ${chalk.dim('Commands:')}
-
-    add                Create a new team
-    ls                 Show all teams you're a part of
-    switch   [name]    Switch to a different team
-    invite   [email]   Invite a new member to a team
-
-  ${chalk.dim('Options:')}
-
-    -h, --help                     Output usage information
-    -A ${chalk.bold.underline('FILE')}, --local-config=${chalk.bold.underline(
-    'FILE'
-  )}   Path to the local ${'`vercel.json`'} file
-    -Q ${chalk.bold.underline('DIR')}, --global-config=${chalk.bold.underline(
-    'DIR'
-  )}    Path to the global ${'`.vercel`'} directory
-    -d, --debug                    Debug mode [off]
-    -N, --next                     Show next page of results
-
-  ${chalk.dim('Examples:')}
-
-  ${chalk.gray('–')} Switch to a team
-
-      ${chalk.cyan(`$ ${getPkgName()} switch <slug>`)}
-
-      ${chalk.gray(
-        '–'
-      )} If your team's url is 'vercel.com/teams/name', 'name' is the slug
-      ${chalk.gray('–')} If the slug is omitted, you can choose interactively
-
-      ${chalk.yellow(
-        'NOTE:'
-      )} When you switch, everything you add, list or remove will be scoped that team!
-
-  ${chalk.gray('–')} Invite new members (interactively)
-
-      ${chalk.cyan(`$ ${getPkgName()} teams invite`)}
-
-  ${chalk.gray('–')} Paginate results, where ${chalk.dim(
-    '`1584722256178`'
-  )} is the time in milliseconds since the UNIX epoch.
-
-      ${chalk.cyan(`$ ${getPkgName()} teams ls --next 1584722256178`)}
-  `);
+const COMMAND_CONFIG = {
+  list: ['ls', 'list'],
+  switch: ['switch', 'change'],
+  add: ['create', 'add'],
+  invite: ['invite'],
+  request: ['request', 'access-request'],
+  sso: ['sso'],
+  members: ['members', 'member'],
 };
 
-export default async (client: Client) => {
-  let subcommand;
+export default async function teams(client: Client) {
+  const telemetry = new TeamsTelemetryClient({
+    opts: {
+      store: client.telemetryEventStore,
+    },
+  });
 
-  const argv = getArgs(client.argv.slice(2), undefined, { permissive: true });
-  const isSwitch = argv._[0] === 'switch';
-
-  argv._ = argv._.slice(1);
-
-  if (isSwitch) {
-    subcommand = 'switch';
-  } else {
-    subcommand = argv._.shift();
+  let parsedArgs;
+  const flagsSpecification = getFlagsSpecification(teamsCommand.options);
+  try {
+    parsedArgs = parseArguments(client.argv.slice(2), flagsSpecification, {
+      permissive: true,
+    });
+  } catch (error) {
+    if (client.nonInteractive) {
+      outputAgentError(
+        client,
+        {
+          status: 'error',
+          reason: 'invalid_arguments',
+          message: error instanceof Error ? error.message : String(error),
+        },
+        1
+      );
+    }
+    printError(error);
+    return 1;
   }
 
-  if (argv['--help'] || !subcommand) {
-    help();
+  if (parsedArgs.args[0] === 'switch') {
+    parsedArgs.args.unshift('teams');
+  }
+
+  const { subcommand, args, subcommandOriginal } = getSubcommand(
+    parsedArgs.args.slice(1),
+    COMMAND_CONFIG
+  );
+
+  const needHelp = parsedArgs.flags['--help'];
+
+  if (!subcommand && needHelp) {
+    telemetry.trackCliFlagHelp('teams', subcommand);
+    output.print(help(teamsCommand, { columns: client.stderr.columns }));
     return 2;
   }
 
-  let exitCode = 0;
-  switch (subcommand) {
-    case 'list':
-    case 'ls': {
-      exitCode = await list(client);
-      break;
-    }
-    case 'switch':
-    case 'change': {
-      exitCode = await change(client, argv._[0]);
-      break;
-    }
-    case 'add':
-    case 'create': {
-      exitCode = await add(client);
-      break;
-    }
+  function printHelp(command: Command) {
+    output.print(
+      help(command, { parent: teamsCommand, columns: client.stderr.columns })
+    );
+  }
 
+  switch (subcommand) {
+    case 'list': {
+      if (needHelp) {
+        telemetry.trackCliFlagHelp('teams', subcommandOriginal);
+        printHelp(listSubcommand);
+        return 2;
+      }
+      telemetry.trackCliSubcommandList(subcommandOriginal);
+      return list(client, args);
+    }
+    case 'switch': {
+      if (needHelp) {
+        telemetry.trackCliFlagHelp('teams', subcommandOriginal);
+        printHelp(switchSubcommand);
+        return 2;
+      }
+      telemetry.trackCliSubcommandSwitch(subcommandOriginal);
+      return change(client, args);
+    }
+    case 'add': {
+      if (needHelp) {
+        telemetry.trackCliFlagHelp('teams', subcommandOriginal);
+        printHelp(addSubcommand);
+        return 2;
+      }
+      telemetry.trackCliSubcommandAdd(subcommandOriginal);
+      return add(client, args);
+    }
     case 'invite': {
-      exitCode = await invite(client, argv._);
-      break;
+      if (needHelp) {
+        telemetry.trackCliFlagHelp('teams', subcommandOriginal);
+        printHelp(inviteSubcommand);
+        return 2;
+      }
+      telemetry.trackCliSubcommandInvite(subcommandOriginal);
+      return invite(client, args);
+    }
+    case 'request': {
+      if (needHelp) {
+        telemetry.trackCliFlagHelp('teams', subcommandOriginal);
+        printHelp(requestSubcommand);
+        return 2;
+      }
+      telemetry.trackCliSubcommandRequest(subcommandOriginal);
+      return request(client, args);
+    }
+    case 'sso': {
+      if (needHelp) {
+        telemetry.trackCliFlagHelp('teams', subcommandOriginal);
+        printHelp(ssoSubcommand);
+        return 2;
+      }
+      telemetry.trackCliSubcommandSso(subcommandOriginal);
+      return sso(client, args);
+    }
+    case 'members': {
+      if (needHelp) {
+        telemetry.trackCliFlagHelp('teams', subcommandOriginal);
+        printHelp(membersSubcommand);
+        return 2;
+      }
+      telemetry.trackCliSubcommandMembers(subcommandOriginal);
+      return members(client, args);
     }
     default: {
-      if (subcommand !== 'help') {
-        console.error(
-          error('Please specify a valid subcommand: add | ls | switch | invite')
-        );
+      const fallback = await tryOpenApiFallback(
+        client,
+        parsedArgs.args.slice(1),
+        resolveOpenApiTagForTeamsCli
+      );
+      if (fallback !== null) {
+        return fallback;
       }
-      exitCode = 2;
-      help();
+      output.error(
+        'Please specify a valid subcommand: add | ls | switch | invite | request | sso | members'
+      );
+      output.print(help(teamsCommand, { columns: client.stderr.columns }));
+      return 2;
     }
   }
-  return exitCode;
-};
+}

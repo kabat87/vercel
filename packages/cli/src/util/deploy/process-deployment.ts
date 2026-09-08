@@ -1,191 +1,411 @@
-import bytes from 'bytes';
-import Progress from 'progress';
-import chalk from 'chalk';
+import type {
+  Deployment,
+  Org,
+  Project,
+  ProjectRollingRelease,
+} from '@vercel-internals/types';
 import {
+  type ArchiveFormat,
+  type DeploymentAliasAssignedEvent,
+  type DeploymentOptions,
+  type VercelClientOptions,
   createDeployment,
-  DeploymentOptions,
-  VercelClientOptions,
 } from '@vercel/client';
-import { Output } from '../output';
-// @ts-ignore
-import Now from '../../util';
-import { VercelConfig } from '../dev/types';
-import { Org } from '../../types';
+import { isErrorLike } from '@vercel/error-utils';
+import bytes from 'bytes';
+import chalk from 'chalk';
+import { getFetchDispatcher } from '../fetch';
+import type Now from '../../util';
+import { displayBuildLogs, type BuildLog, parseLogLines } from '../logs';
+import { progress } from '../output/progress';
 import ua from '../ua';
-import { linkFolderToProject } from '../projects/link';
-import { prependEmoji, emoji } from '../emoji';
+import output from '../../output-manager';
+import eraseLines from '../output/erase-lines';
+import getProjectByNameOrId from '../projects/get-project-by-id-or-name';
+import type { ProjectNotFound } from '../errors-ts';
+import printEvents from '../events';
+import { printAlignedLabel } from '../output/print-aligned-label';
 
-function printInspectUrl(
-  output: Output,
-  inspectorUrl: string,
-  deployStamp: () => string
-) {
-  output.print(
-    prependEmoji(
-      `Inspect: ${chalk.bold(inspectorUrl)} ${deployStamp()}`,
-      emoji('inspect')
-    ) + `\n`
-  );
+function printInspectUrl(inspectorUrl: string | null | undefined) {
+  if (!inspectorUrl) {
+    return;
+  }
+
+  // Timing belongs on the Build/Ready line, not on the URL line which is instant.
+  printAlignedLabel('Inspect', chalk.cyan(inspectorUrl));
 }
 
 export default async function processDeployment({
   org,
-  cwd,
   projectName,
   isSettingUpProject,
+  archive,
   skipAutoDetectionConfirmation,
+  noWait,
+  withFullLogs,
+  anonymous,
+  manual,
+  jsonOutput,
+  linkedProject,
+  linkedProjectIsPartial,
   ...args
 }: {
   now: Now;
-  output: Output;
-  paths: string[];
+  path: string;
   requestBody: DeploymentOptions;
-  uploadStamp: () => string;
-  deployStamp: () => string;
   quiet: boolean;
-  nowConfig?: VercelConfig;
   force?: boolean;
   withCache?: boolean;
   org: Org;
+  prebuilt: boolean;
+  vercelOutputDir?: string;
   projectName: string;
   isSettingUpProject: boolean;
+  archive?: ArchiveFormat;
   skipAutoDetectionConfirmation?: boolean;
-  cwd?: string;
+  rootDirectory?: string | null;
+  noWait?: boolean;
+  withFullLogs?: boolean;
+  anonymous?: boolean;
+  bulkRedirectsPath?: string | null;
+  manual?: boolean;
+  jsonOutput?: boolean;
+  linkedProject?: Project;
+  linkedProjectIsPartial?: boolean;
 }) {
-  let {
+  const {
     now,
-    output,
-    paths,
+    path,
     requestBody,
-    deployStamp,
     force,
     withCache,
-    nowConfig,
     quiet,
+    prebuilt,
+    vercelOutputDir,
+    rootDirectory,
+    bulkRedirectsPath,
   } = args;
 
-  const { debug } = output;
-  let bar: Progress | null = null;
+  const client = now._client;
+
+  // The ▲ gutter belongs on the Aliased row, which only prints when we wait
+  // for alias assignment and domains are auto-assigned. When that row won't
+  // print (--no-wait, --skip-domain), fall back to ▲ on the Production row.
+  const aliasedRowWillPrint =
+    !noWait && requestBody.autoAssignCustomDomains !== false;
 
   const { env = {} } = requestBody;
-
   const token = now._token;
   if (!token) {
     throw new Error('Missing authentication token');
   }
 
-  const clientOptions: VercelClientOptions = {
-    teamId: org.type === 'team' ? org.id : undefined,
-    apiUrl: now._apiUrl,
-    token,
-    debug: now._debug,
-    userAgent: ua,
-    path: paths[0],
-    force,
-    withCache,
-    skipAutoDetectionConfirmation,
+  const aliasAssignedController = new AbortController();
+  const onAliasAssigned = (event: DeploymentAliasAssignedEvent) => {
+    aliasAssignedController.abort(event);
   };
 
-  output.spinner(
-    isSettingUpProject
-      ? 'Setting up project'
-      : `Deploying ${chalk.bold(`${org.slug}/${projectName}`)}`,
-    0
-  );
+  const clientOptions: VercelClientOptions = {
+    teamId: now.currentTeam ?? undefined,
+    apiUrl: now._apiUrl,
+    token,
+    debug: output.isDebugEnabled(),
+    userAgent: ua,
+    path,
+    force,
+    withCache,
+    prebuilt,
+    vercelOutputDir,
+    rootDirectory,
+    skipAutoDetectionConfirmation,
+    archive,
+    dispatcher: getFetchDispatcher(),
+    projectName,
+    bulkRedirectsPath,
+    manual,
+    aliasAssignedSignal: aliasAssignedController.signal,
+  };
+
+  const deployingSpinnerVal = isSettingUpProject
+    ? 'Setting up project'
+    : `Deploying ${chalk.bold(
+        org.slug ? `${org.slug}/${projectName}` : projectName
+      )}`;
+  output.spinner(deployingSpinnerVal, 0);
 
   // collect indications to show the user once
   // the deployment is done
   const indications = [];
 
+  let abortController: AbortController | undefined;
+
+  function stopSpinner(): void {
+    abortController?.abort();
+    output.stopSpinner();
+  }
+
+  const linkedProjectLookup =
+    linkedProjectIsPartial && linkedProject && !noWait
+      ? getProjectByNameOrId(
+          client,
+          linkedProject.id,
+          linkedProject.accountId
+        ).then(
+          project => ({ project }) as const,
+          error => ({ error }) as const
+        )
+      : undefined;
+  let rollingRelease: ProjectRollingRelease | undefined =
+    linkedProject?.rollingRelease;
+  let project: Project | ProjectNotFound | undefined = linkedProjectLookup
+    ? undefined
+    : linkedProject;
+  let latestLogMessage = '';
+
+  async function resolveProject(): Promise<Project | ProjectNotFound> {
+    if (!linkedProjectLookup) {
+      return getProjectByNameOrId(client, projectName);
+    }
+
+    const result = await linkedProjectLookup;
+    if ('error' in result) {
+      throw result.error;
+    }
+    return result.project;
+  }
+
   try {
-    for await (const event of createDeployment(
-      clientOptions,
-      requestBody,
-      nowConfig
-    )) {
+    for await (const event of createDeployment(clientOptions, requestBody)) {
       if (['tip', 'notice', 'warning'].includes(event.type)) {
         indications.push(event);
       }
 
       if (event.type === 'file-count') {
-        debug(
-          `Total files ${event.payload.total.size}, ${event.payload.missing.length} changed`
-        );
+        const { total, missing, uploads } = event.payload;
+        output.debug(`Total files ${total.size}, ${missing.length} changed`);
 
-        const missingSize = event.payload.missing
-          .map((sha: string) => event.payload.total.get(sha).data.length)
+        const missingSize = missing
+          .map((sha: string) => {
+            const file = total.get(sha);
+            // Large files are streamed and have no in-memory `data`; fall back
+            // to the recorded `size`.
+            return file?.data?.length ?? file?.size ?? 0;
+          })
           .reduce((a: number, b: number) => a + b, 0);
+        const totalSizeHuman = bytes.format(missingSize, { decimalPlaces: 1 });
 
-        output.stopSpinner();
-        bar = new Progress(`${chalk.gray('>')} Upload [:bar] :percent :etas`, {
-          width: 20,
-          complete: '=',
-          incomplete: '',
-          total: missingSize,
-          clear: true,
-        });
+        // When stderr is not a TTY then we only want to
+        // print upload progress in 25% increments
+        let nextStep = 0;
+        const stepSize = now._client.stderr.isTTY ? 0 : 0.25;
+
+        const updateProgress = () => {
+          const uploadedBytes = uploads.reduce((acc: number, e: any) => {
+            return acc + e.bytesUploaded;
+          }, 0);
+
+          const bar = progress(uploadedBytes, missingSize);
+          if (!bar) {
+            output.spinner(deployingSpinnerVal, 0);
+          } else {
+            const uploadedHuman = bytes.format(uploadedBytes, {
+              decimalPlaces: 1,
+              fixedDecimals: true,
+            });
+            const percent = uploadedBytes / missingSize;
+            if (percent >= nextStep) {
+              output.spinner(
+                `Uploading ${chalk.reset(
+                  `[${bar}] (${uploadedHuman}/${totalSizeHuman})`
+                )}`,
+                0
+              );
+              nextStep += stepSize;
+            }
+          }
+        };
+
+        uploads.forEach((e: any) => e.on('progress', updateProgress));
+        updateProgress();
       }
 
       if (event.type === 'file-uploaded') {
-        debug(
-          `Uploaded: ${event.payload.file.names.join(' ')} (${bytes(
-            event.payload.file.data.length
+        const { file } = event.payload;
+        output.debug(
+          `Uploaded: ${file.names.join(' ')} (${bytes(
+            file.data?.length ?? file.size ?? 0
           )})`
         );
-
-        if (bar) {
-          bar.tick(event.payload.file.data.length);
-        }
       }
 
       if (event.type === 'created') {
-        if (bar && !bar.complete) {
-          bar.tick(bar.total + 1);
+        const deployment: Deployment = event.payload;
+
+        now.url = deployment.url;
+
+        stopSpinner();
+
+        // Anonymous deployment URLs sit behind the pool team's auth wall;
+        // the production alias printed on `alias-assigned` is the only
+        // reachable URL.
+        if (!anonymous) {
+          printInspectUrl(deployment.inspectorUrl);
+
+          const isProdDeployment = deployment.target === 'production';
+          const previewUrl = `https://${deployment.url}`;
+
+          // When the user did not explicitly request a production deployment
+          // (no `--prod` / `--target=production`) but the API returned one
+          // anyway, surface a notice. This happens on a project's first
+          // deployment because the API assigns it to production when no prior
+          // production deployment exists.
+          if (isProdDeployment && !requestBody.target) {
+            indications.push({
+              type: 'notice',
+              payload:
+                'This is your project\u2019s first deployment, so it was assigned to production. Future deployments will be preview deployments unless you use --prod.',
+              link: 'https://vercel.com/docs/deployments/environments',
+            });
+          }
+
+          printAlignedLabel(
+            isProdDeployment ? 'Production' : 'Preview',
+            chalk.cyan(previewUrl),
+            isProdDeployment && !aliasedRowWillPrint ? { gutter: '▲' } : {}
+          );
+
+          if (!jsonOutput && (quiet || process.env.FORCE_TTY === '1')) {
+            process.stdout.write(`https://${event.payload.url}`);
+          }
         }
 
-        await linkFolderToProject(
-          output,
-          cwd || paths[0],
-          {
-            orgId: org.id,
-            projectId: event.payload.projectId,
-          },
-          projectName,
-          org.slug
-        );
-
-        now.url = event.payload.url;
-
-        output.stopSpinner();
-
-        printInspectUrl(output, event.payload.inspectorUrl, deployStamp);
-
-        if (quiet) {
-          process.stdout.write(`https://${event.payload.url}`);
+        if (noWait) {
+          (
+            deployment as Deployment & { indications: typeof indications }
+          ).indications = indications;
+          return deployment;
         }
 
-        output.spinner(
-          event.payload.readyState === 'QUEUED' ? 'Queued' : 'Building',
-          0
-        );
+        latestLogMessage =
+          deployment.readyState === 'QUEUED' ? 'Queued…' : 'Building…';
+
+        if (withFullLogs && !anonymous) {
+          let promise: Promise<void>;
+          ({ abortController, promise } = displayBuildLogs(
+            client,
+            deployment,
+            true,
+            onAliasAssigned
+          ));
+          promise.catch(error =>
+            output.warn(`Failed to read build logs: ${error}`)
+          );
+        } else if (!anonymous) {
+          abortController = new AbortController();
+          const promise = printEvents(
+            client,
+            deployment.id,
+            {
+              mode: 'logs',
+              onAliasAssigned,
+              onEvent: (event: BuildLog) => {
+                if (!event.created) return;
+                const lines = parseLogLines(event);
+                const message = lines[0];
+                if (message) {
+                  latestLogMessage = message;
+                  output.spinner(latestLogMessage, 0);
+                }
+              },
+              quiet: false,
+              findOpts: { direction: 'forward', follow: true },
+            },
+            abortController
+          );
+          promise.catch(error =>
+            output.warn(`Failed to read build logs: ${error}`)
+          );
+        }
+        output.spinner(latestLogMessage, 0);
       }
 
-      if (event.type === 'building') {
-        output.spinner('Building', 0);
+      if (event.type === 'building' && !withFullLogs) {
+        output.spinner(latestLogMessage || 'Building…', 0);
       }
 
       if (event.type === 'canceled') {
-        output.stopSpinner();
+        stopSpinner();
         return event.payload;
       }
 
-      if (event.type === 'ready') {
-        output.spinner('Completing', 0);
+      if (
+        project === undefined &&
+        (!linkedProjectLookup || event.type === 'ready')
+      ) {
+        project = await resolveProject();
+        rollingRelease = (project as Project)?.rollingRelease;
+      }
+
+      if (event.type === 'ready' && rollingRelease) {
+        output.spinner('Releasing…', 0);
+        stopSpinner();
+        event.payload.indications = indications;
+        return event.payload;
+      }
+
+      if (event.type === 'ready' && !withFullLogs) {
+        const v1ChecksPending =
+          event.payload.checksState &&
+          event.payload.checksState !== 'completed';
+        const v2ChecksPending =
+          event.payload.checks?.['deployment-alias']?.state === 'pending';
+
+        // Keep the event stream open while polling waits for alias assignment.
+        output.stopSpinner();
+        if (!anonymous) {
+          process.stderr.write(eraseLines(2));
+          const isProdDeployment = event.payload.target === 'production';
+          const previewUrl = `https://${event.payload.url}`;
+          printAlignedLabel(
+            isProdDeployment ? 'Production' : 'Preview',
+            chalk.cyan(previewUrl),
+            isProdDeployment && !aliasedRowWillPrint ? { gutter: '▲' } : {}
+          );
+        }
+
+        if (v1ChecksPending || v2ChecksPending) {
+          output.spinner('Running Checks…', 0);
+        } else {
+          output.spinner('Completing…', 0);
+        }
+      }
+
+      // v1 checks running
+      if (event.type === 'checks-running' && !withFullLogs) {
+        output.spinner('Running Checks…', 0);
+      }
+
+      // v1 checks failed
+      if (event.type === 'checks-conclusion-failed') {
+        stopSpinner();
+        return event.payload;
+      }
+
+      if (event.type === 'checks-v2-failed') {
+        stopSpinner();
+        return event.payload;
       }
 
       // Handle error events
       if (event.type === 'error') {
-        output.stopSpinner();
+        stopSpinner();
+
+        if (!archive) {
+          const maybeError = handleErrorSolvableWithArchive(event.payload);
+          if (maybeError) {
+            throw maybeError;
+          }
+        }
 
         const error = await now.handleDeploymentError(event.payload, {
           env,
@@ -195,17 +415,80 @@ export default async function processDeployment({
           return error;
         }
 
+        if (error.code === 'forbidden') {
+          return error;
+        }
+
         throw error;
       }
 
       // Handle alias-assigned event
       if (event.type === 'alias-assigned') {
+        stopSpinner();
+
+        if (
+          event.payload.target === 'production' &&
+          event.payload.alias &&
+          event.payload.alias.length > 0
+        ) {
+          const primaryDomain = event.payload.alias[0];
+          const prodUrl = `https://${primaryDomain}`;
+          if (anonymous) {
+            // Separates the URL from whatever the local build just printed.
+            output.print('\n');
+          }
+          printAlignedLabel(
+            anonymous ? 'Temporary' : 'Aliased',
+            chalk.cyan(prodUrl),
+            {
+              gutter: '▲',
+            }
+          );
+          if (
+            anonymous &&
+            !jsonOutput &&
+            (quiet || process.env.FORCE_TTY === '1')
+          ) {
+            process.stdout.write(prodUrl);
+          }
+        }
+
         event.payload.indications = indications;
         return event.payload;
       }
     }
   } catch (err) {
-    output.stopSpinner();
+    stopSpinner();
     throw err;
+  }
+}
+
+export const archiveSuggestionText =
+  'Try using `--archive=tgz` to limit the amount of files you upload.';
+
+export class UploadErrorMissingArchive extends Error {
+  link = 'https://vercel.com/docs/cli/deploy#archive';
+}
+
+export function handleErrorSolvableWithArchive(error: unknown) {
+  if (isErrorLike(error)) {
+    const isUploadRateLimit =
+      'errorName' in error &&
+      typeof error.errorName === 'string' &&
+      error.errorName.startsWith('api-upload-');
+    const isTooManyFilesLimit =
+      'code' in error && error.code === 'too_many_files';
+    // A file that exceeds the server's per-request upload limit is rejected
+    // with HTTP 413 "Request Entity Too Large". Archiving uploads the
+    // deployment in smaller chunks, which stays under that limit.
+    const isEntityTooLarge = /entity too large|payload too large/i.test(
+      error.message
+    );
+
+    if (isUploadRateLimit || isTooManyFilesLimit || isEntityTooLarge) {
+      return new UploadErrorMissingArchive(
+        `${error.message}\n${archiveSuggestionText}`
+      );
+    }
   }
 }

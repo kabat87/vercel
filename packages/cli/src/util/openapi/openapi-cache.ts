@@ -1,0 +1,444 @@
+import { join } from 'path';
+import { readFile, writeFile, mkdir } from 'fs/promises';
+import getGlobalPathConfig from '../config/global-path';
+import output from '../../output-manager';
+import {
+  OPENAPI_URL,
+  CACHE_FILE,
+  CACHE_TTL_MS,
+  FETCH_TIMEOUT_MS,
+} from './constants';
+import { readSpecResponse } from './read-spec-response';
+import { assertAllowedSpecUrl } from './spec-url-allowlist';
+import type {
+  OpenApiSpec,
+  CachedSpec,
+  EndpointInfo,
+  Schema,
+  BodyField,
+} from './types';
+
+/**
+ * Manages OpenAPI spec fetching, caching, and parsing.
+ *
+ * Usage:
+ * ```typescript
+ * const cache = new OpenApiCache();
+ * await cache.load();
+ * const endpoints = cache.getEndpoints();
+ * const bodyFields = cache.getBodyFields(endpoint);
+ * ```
+ */
+export interface OpenApiCacheOptions {
+  /**
+   * Custom OpenAPI spec URL. When provided, this spec replaces the default
+   * public spec entirely and is fetched fresh for each process run.
+   */
+  specUrl?: string;
+  fetchSpecUrl?: (url: string) => Promise<OpenApiSpec | null>;
+}
+
+export class OpenApiCache {
+  private readonly cachePath: string;
+  private readonly specUrl: string | undefined;
+  private readonly fetchSpecUrl:
+    | ((url: string) => Promise<OpenApiSpec | null>)
+    | undefined;
+  private spec: OpenApiSpec | null = null;
+  private error: string | null = null;
+
+  constructor(options?: OpenApiCacheOptions) {
+    this.cachePath = join(getGlobalPathConfig(), CACHE_FILE);
+    this.specUrl = options?.specUrl;
+    this.fetchSpecUrl = options?.fetchSpecUrl;
+  }
+
+  /**
+   * Check if the spec has been loaded
+   */
+  get isLoaded(): boolean {
+    return this.spec !== null;
+  }
+
+  get loadError(): string | null {
+    return this.error;
+  }
+
+  /**
+   * Load the OpenAPI spec, using cache if available and fresh.
+   * Returns true if successful, false otherwise.
+   */
+  async load(forceRefresh = false): Promise<boolean> {
+    return this.loadSpec(forceRefresh);
+  }
+
+  async loadSpec(forceRefresh = false): Promise<boolean> {
+    this.error = null;
+
+    if (this.specUrl) {
+      return this.loadCustomSpec(this.specUrl);
+    }
+
+    // Try to read from cache
+    if (!forceRefresh) {
+      const cached = await this.readCache(this.cachePath);
+      if (cached && !this.isExpired(cached.fetchedAt)) {
+        output.debug('Using cached OpenAPI spec');
+        this.spec = cached.spec;
+        return true;
+      }
+    }
+
+    // Fetch fresh spec
+    try {
+      output.debug('Fetching OpenAPI spec from ' + OPENAPI_URL);
+      this.spec = await this.fetchSpec(OPENAPI_URL);
+      await this.saveCache(this.cachePath, this.spec);
+      return true;
+    } catch (err) {
+      output.debug(`Failed to fetch OpenAPI spec: ${err}`);
+      // If fetch fails, try to use stale cache
+      const stale = await this.readCache(this.cachePath);
+      if (stale) {
+        output.debug('Using stale cached OpenAPI spec');
+        this.spec = stale.spec;
+        return true;
+      }
+      return false;
+    }
+  }
+
+  private async loadCustomSpec(specUrl: string): Promise<boolean> {
+    try {
+      assertAllowedSpecUrl(specUrl);
+      output.debug('Fetching OpenAPI spec from ' + specUrl);
+      const spec = this.fetchSpecUrl
+        ? await this.fetchSpecUrl(specUrl)
+        : await this.fetchSpec(specUrl);
+      if (!spec) {
+        this.error = `Could not load OpenAPI spec from ${specUrl}.`;
+        return false;
+      }
+      this.validateSpec(spec, specUrl);
+      this.spec = spec;
+      return Boolean(this.spec);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      this.error = message;
+      output.debug(`Failed to fetch OpenAPI spec from ${specUrl}: ${message}`);
+      return false;
+    }
+  }
+
+  /**
+   * Load the OpenAPI spec with spinner UI.
+   * Returns true if successful, false otherwise.
+   */
+  async loadWithSpinner(forceRefresh = false): Promise<boolean> {
+    output.spinner(
+      forceRefresh ? 'Refreshing API endpoints...' : 'Loading API endpoints...'
+    );
+    const success = await this.load(forceRefresh);
+    output.stopSpinner();
+    return success;
+  }
+
+  /**
+   * Get all available endpoints from the loaded spec, sorted by path then method.
+   * Throws if spec hasn't been loaded yet.
+   */
+  getEndpoints(): EndpointInfo[] {
+    this.ensureLoaded();
+    const endpoints = this.extractEndpoints();
+    return this.sortEndpoints(endpoints);
+  }
+
+  /**
+   * Extract body fields from a requestBody schema.
+   * Throws if spec hasn't been loaded yet.
+   */
+  getBodyFields(endpoint: EndpointInfo): BodyField[] {
+    this.ensureLoaded();
+
+    if (!endpoint.requestBody?.content) return [];
+
+    // Get the JSON content schema
+    const jsonContent = endpoint.requestBody.content['application/json'];
+    if (!jsonContent?.schema) return [];
+
+    const schema = this.resolveSchemaRef(jsonContent.schema);
+    if (!schema?.properties) return [];
+
+    const requiredFields = new Set(schema.required || []);
+    const fields: BodyField[] = [];
+
+    for (const [name, propSchema] of Object.entries(schema.properties) as [
+      string,
+      Schema,
+    ][]) {
+      const resolvedProp = this.resolveSchemaRef(propSchema);
+
+      // Get enum values from the schema, handling array items
+      let enumValues = resolvedProp?.enum || propSchema.enum;
+      if (
+        !enumValues &&
+        (resolvedProp?.type === 'array' || propSchema.type === 'array')
+      ) {
+        const items = resolvedProp?.items || propSchema.items;
+        if (items) {
+          const resolvedItems = this.resolveSchemaRef(items);
+          enumValues = resolvedItems?.enum || items.enum;
+        }
+      }
+
+      fields.push({
+        name,
+        required: requiredFields.has(name),
+        description: resolvedProp?.description || propSchema.description,
+        type: resolvedProp?.type || propSchema.type,
+        enumValues,
+      });
+    }
+
+    // Sort by required first, then alphabetically
+    fields.sort((a, b) => {
+      if (a.required !== b.required) {
+        return a.required ? -1 : 1;
+      }
+      return a.name.localeCompare(b.name);
+    });
+
+    return fields;
+  }
+
+  /**
+   * Extract `x-vercel-cli.displayColumns` from the 200 response schema of an
+   * endpoint.  Returns `null` when the spec has no display hint.
+   */
+  getDisplayColumns(endpoint: EndpointInfo): Record<string, string> | null {
+    this.ensureLoaded();
+
+    const pathItem = this.spec!.paths[endpoint.path];
+    if (!pathItem) return null;
+
+    const operation = pathItem[endpoint.method.toLowerCase() as 'get'];
+    if (!operation?.responses) return null;
+
+    const ok = operation.responses['200'] || operation.responses['201'];
+    if (!ok) return null;
+
+    const jsonContent = ok.content?.['application/json'];
+    if (!jsonContent?.schema) return null;
+
+    return this.findDisplayColumns(jsonContent.schema);
+  }
+
+  private findDisplayColumns(schema: Schema): Record<string, string> | null {
+    const xCli = (schema as Record<string, unknown>)['x-vercel-cli'] as
+      | { displayColumns?: Record<string, string> }
+      | undefined;
+    if (xCli?.displayColumns) return xCli.displayColumns;
+
+    for (const key of ['oneOf', 'allOf', 'anyOf'] as const) {
+      const variants = (schema as Record<string, Schema[]>)[key];
+      if (variants) {
+        for (const sub of variants) {
+          const found = this.findDisplayColumns(sub);
+          if (found) return found;
+        }
+      }
+    }
+
+    return null;
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────────
+  // Private methods
+  // ─────────────────────────────────────────────────────────────────────────────
+
+  /**
+   * Ensure the spec is loaded before accessing it
+   */
+  private ensureLoaded(): void {
+    if (!this.spec) {
+      throw new Error(
+        'OpenAPI spec not loaded. Call load() or loadWithSpinner() first.'
+      );
+    }
+  }
+
+  /**
+   * Read cached spec from disk
+   */
+  private async readCache(cachePath: string): Promise<CachedSpec | null> {
+    try {
+      const content = await readFile(cachePath, 'utf-8');
+      return JSON.parse(content) as CachedSpec;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Save public spec to disk cache
+   */
+  private async saveCache(cachePath: string, spec: OpenApiSpec): Promise<void> {
+    const cached: CachedSpec = {
+      fetchedAt: Date.now(),
+      spec,
+    };
+
+    // Ensure directory exists
+    const dir = join(cachePath, '..');
+    await mkdir(dir, { recursive: true });
+
+    await writeFile(cachePath, JSON.stringify(cached));
+    output.debug('Saved OpenAPI spec to cache');
+  }
+
+  /**
+   * Fetch OpenAPI spec from remote with timeout
+   */
+  private async fetchSpec(url: string): Promise<OpenApiSpec> {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+
+    try {
+      const response = await fetch(url, { signal: controller.signal });
+      if (!response.ok) {
+        throw new Error(`Failed to fetch OpenAPI spec: ${response.status}`);
+      }
+      const spec = await readSpecResponse<OpenApiSpec>(response, url);
+      this.validateSpec(spec, url);
+      return spec;
+    } finally {
+      clearTimeout(timeoutId);
+    }
+  }
+
+  private validateSpec(spec: OpenApiSpec | null, url: string): void {
+    if (!spec || typeof spec !== 'object') {
+      throw new Error(
+        `Invalid OpenAPI spec from ${url}: expected a JSON object.`
+      );
+    }
+
+    if (typeof spec.openapi !== 'string' || !spec.openapi.startsWith('3.')) {
+      throw new Error(
+        `Invalid OpenAPI spec from ${url}: expected an OpenAPI 3.x document with an "openapi" field.`
+      );
+    }
+
+    if (!spec.paths || typeof spec.paths !== 'object') {
+      throw new Error(
+        `Invalid OpenAPI spec from ${url}: expected a "paths" object.`
+      );
+    }
+
+    for (const path of Object.keys(spec.paths)) {
+      if (!path.startsWith('/') || path.startsWith('//')) {
+        throw new Error(
+          `Invalid OpenAPI spec from ${url}: path "${path}" must be a relative API path.`
+        );
+      }
+    }
+  }
+
+  /**
+   * Check if cached spec is expired
+   */
+  private isExpired(fetchedAt: number): boolean {
+    return Date.now() - fetchedAt > CACHE_TTL_MS;
+  }
+
+  /**
+   * Sort endpoints by path, then by method.
+   */
+  private sortEndpoints(endpoints: EndpointInfo[]): EndpointInfo[] {
+    return endpoints.sort((a, b) => {
+      const pathCompare = a.path.localeCompare(b.path);
+      if (pathCompare !== 0) return pathCompare;
+      return a.method.localeCompare(b.method);
+    });
+  }
+
+  /**
+   * Extract all available endpoints from the loaded spec.
+   */
+  private extractEndpoints(): EndpointInfo[] {
+    const endpoints: EndpointInfo[] = [];
+
+    for (const [path, pathItem] of Object.entries(this.spec!.paths)) {
+      const methods = ['get', 'post', 'put', 'patch', 'delete'] as const;
+
+      for (const method of methods) {
+        const operation = pathItem[method];
+        if (operation) {
+          // Merge path-level and operation-level parameters
+          const pathParams = pathItem.parameters || [];
+          const opParams = operation.parameters || [];
+          const allParams = [...pathParams, ...opParams];
+
+          endpoints.push({
+            path,
+            method: method.toUpperCase(),
+            summary: operation.summary || pathItem.summary || '',
+            description: operation.description || pathItem.description || '',
+            operationId: operation.operationId || '',
+            tags: operation.tags || [],
+            parameters: allParams,
+            requestBody: operation.requestBody,
+          });
+        }
+      }
+    }
+
+    return endpoints;
+  }
+
+  /**
+   * Resolve a $ref to its actual schema
+   */
+  private resolveSchemaRef(
+    schema: Schema | undefined,
+    spec: OpenApiSpec = this.spec!
+  ): Schema | undefined {
+    if (!schema) return undefined;
+
+    if (schema.$ref) {
+      // Parse $ref like "#/components/schemas/SchemaName"
+      const match = schema.$ref.match(/^#\/components\/schemas\/(.+)$/);
+      if (match && spec.components?.schemas) {
+        const resolved = spec.components.schemas[match[1]];
+        // Recursively resolve if the resolved schema also has a $ref
+        return this.resolveSchemaRef(resolved, spec);
+      }
+      return undefined;
+    }
+
+    // Handle allOf by merging schemas
+    if (schema.allOf && schema.allOf.length > 0) {
+      const merged: Schema = { type: 'object', properties: {}, required: [] };
+      for (const subSchema of schema.allOf) {
+        const resolved = this.resolveSchemaRef(subSchema, spec);
+        if (resolved) {
+          if (resolved.properties) {
+            merged.properties = {
+              ...merged.properties,
+              ...resolved.properties,
+            };
+          }
+          if (resolved.required) {
+            merged.required = [
+              ...(merged.required || []),
+              ...resolved.required,
+            ];
+          }
+        }
+      }
+      return merged;
+    }
+
+    return schema;
+  }
+}

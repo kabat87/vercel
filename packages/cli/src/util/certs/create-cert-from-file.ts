@@ -1,7 +1,10 @@
 import { readFileSync } from 'fs';
 import { resolve } from 'path';
-import Client from '../client';
-import { Cert } from '../../types';
+import type Client from '../client';
+import type { Cert } from '@vercel-internals/types';
+import { isErrnoException } from '@vercel/error-utils';
+import { isAPIError } from '../errors-ts';
+import output from '../../output-manager';
 
 export default async function createCertFromFile(
   client: Client,
@@ -9,14 +12,14 @@ export default async function createCertFromFile(
   certPath: string,
   caPath: string
 ) {
-  client.output.spinner('Adding your custom certificate');
+  output.spinner('Adding your custom certificate');
 
   try {
     const cert = readFileSync(resolve(certPath), 'utf8');
     const key = readFileSync(resolve(keyPath), 'utf8');
     const ca = readFileSync(resolve(caPath), 'utf8');
 
-    const certificate = await client.fetch<Cert>('/v3/now/certs', {
+    const certificate = await client.fetch<Cert>('/v3/certs', {
       method: 'PUT',
       body: {
         ca,
@@ -25,15 +28,15 @@ export default async function createCertFromFile(
       },
     });
     return certificate;
-  } catch (error) {
-    if (error.code === 'ENOENT') {
-      return new Error(`The specified file "${error.path}" doesn't exist.`);
+  } catch (err: unknown) {
+    if (isErrnoException(err) && err.code === 'ENOENT') {
+      return new Error(`The specified file "${err.path}" doesn't exist.`);
     }
 
-    if (error.status < 500) {
-      return error;
+    if (isAPIError(err) && err.status < 500) {
+      return err;
     }
 
-    throw error;
+    throw err;
   }
 }

@@ -1,37 +1,121 @@
-import FileBlob from './file-blob';
-import FileFsRef from './file-fs-ref';
-import FileRef from './file-ref';
+import type { File, HasField, Chain } from './types';
 import { Lambda } from './lambda';
+
+/**
+ * The framework's own description of what it prerendered at build time,
+ * rather than re-deriving it from build artifacts. These are *initial*
+ * values: revalidation can regenerate a route's output over the lifetime of
+ * a deployment, so readers must treat them as the state as of the build,
+ * not as live state.
+ */
+export interface PrerenderInitialMetadata {
+  /**
+   * What has to happen at request time to finish the response, as of build
+   * time: `static` needs no server compute, `resuming` streams the static
+   * response while the server resumes postponed work, and `blocking` cannot
+   * start the response until request-time compute starts.
+   */
+  compute: 'blocking' | 'resuming' | 'static';
+  /**
+   * Byte size of the prerendered HTML shell, when the entry has one. `0` is
+   * a real size — a shell that postponed everything — and `undefined` means
+   * there is no HTML shell to measure (route handlers, Pages Router).
+   */
+  htmlSize?: number;
+}
 
 interface PrerenderOptions {
   expiration: number | false;
-  lambda: Lambda;
-  fallback: FileBlob | FileFsRef | FileRef | null;
+  staleExpiration?: number;
+  lambda?: Lambda;
+  fallback: File | null;
   group?: number;
   bypassToken?: string | null /* optional to be non-breaking change */;
   allowQuery?: string[];
+  allowHeader?: string[];
+  initialHeaders?: Record<string, string>;
+  initialStatus?: number;
+  passQuery?: boolean;
+  sourcePath?: string;
+  experimentalBypassFor?: HasField;
+  experimentalStreamingLambdaPath?: string;
+  chain?: Chain;
+  exposeErrBody?: boolean;
+  partialFallback?: boolean;
+  initialMetadata?: PrerenderInitialMetadata;
 }
 
 export class Prerender {
   public type: 'Prerender';
+  /**
+   * `expiration` is `revalidate` in Next.js terms, and `s-maxage` in
+   * `cache-control` terms.
+   */
   public expiration: number | false;
-  public lambda: Lambda;
-  public fallback: FileBlob | FileFsRef | FileRef | null;
+  /**
+   * `staleExpiration` is `expire` in Next.js terms, and
+   * `stale-while-revalidate` + `s-maxage` in `cache-control` terms. It's
+   * expected to be undefined if `expiration` is `false`.
+   */
+  public staleExpiration?: number;
+  public lambda?: Lambda;
+  public fallback: File | null;
   public group?: number;
   public bypassToken: string | null;
   public allowQuery?: string[];
+  public allowHeader?: string[];
+  public initialHeaders?: Record<string, string>;
+  public initialStatus?: number;
+  public passQuery?: boolean;
+  public sourcePath?: string;
+  public experimentalBypassFor?: HasField;
+  public experimentalStreamingLambdaPath?: string;
+  public chain?: Chain;
+  public exposeErrBody?: boolean;
+  public partialFallback?: boolean;
+  /**
+   * The framework's build-time serving metadata for this prerender.
+   * `undefined` when the framework did not provide it, which is legitimate:
+   * not-found routes, Pages Router `fallback: false` templates, and builds
+   * from frameworks that predate the field carry none.
+   */
+  public initialMetadata?: PrerenderInitialMetadata;
 
   constructor({
     expiration,
+    staleExpiration,
     lambda,
     fallback,
     group,
     bypassToken,
     allowQuery,
+    allowHeader,
+    initialHeaders,
+    initialStatus,
+    passQuery,
+    sourcePath,
+    experimentalBypassFor,
+    experimentalStreamingLambdaPath,
+    chain,
+    exposeErrBody,
+    partialFallback,
+    initialMetadata,
   }: PrerenderOptions) {
     this.type = 'Prerender';
     this.expiration = expiration;
+    this.staleExpiration = staleExpiration;
+    this.sourcePath = sourcePath;
+    // Deliberately unvalidated: producers in this repo are trusted, and a
+    // compute mode added by a future framework release must not hard-fail a
+    // deploy. Untrusted input — a `.prerender-config.json` supplied by
+    // `vercel deploy --prebuilt` — is sanitized by the platform instead.
+    this.initialMetadata = initialMetadata;
+
     this.lambda = lambda;
+    if (this.lambda) {
+      // "ISR" is the platform default lambda label for prerender functions
+      this.lambda.operationType = this.lambda.operationType || 'ISR';
+    }
 
     if (
       typeof group !== 'undefined' &&
@@ -42,6 +126,17 @@ export class Prerender {
       );
     }
     this.group = group;
+
+    if (passQuery === true) {
+      this.passQuery = true;
+    } else if (
+      typeof passQuery !== 'boolean' &&
+      typeof passQuery !== 'undefined'
+    ) {
+      throw new Error(
+        `The \`passQuery\` argument for \`Prerender\` must be a boolean.`
+      );
+    }
 
     if (bypassToken == null) {
       this.bypassToken = null;
@@ -59,12 +154,60 @@ export class Prerender {
       );
     }
 
+    if (experimentalBypassFor !== undefined) {
+      if (
+        !Array.isArray(experimentalBypassFor) ||
+        experimentalBypassFor.some(
+          field =>
+            typeof field !== 'object' ||
+            typeof field.type !== 'string' ||
+            (field.type === 'host' && 'key' in field) ||
+            (field.type !== 'host' && typeof field.key !== 'string') ||
+            (field.value !== undefined &&
+              typeof field.value !== 'string' &&
+              (typeof field.value !== 'object' ||
+                field.value === null ||
+                Array.isArray(field.value)))
+        )
+      ) {
+        throw new Error(
+          'The `experimentalBypassFor` argument for `Prerender` must be Array of objects with fields `type`, `key` and optionally `value`.'
+        );
+      }
+
+      this.experimentalBypassFor = experimentalBypassFor;
+    }
+
     if (typeof fallback === 'undefined') {
       throw new Error(
         'The `fallback` argument for `Prerender` needs to be a `FileBlob`, `FileFsRef`, `FileRef`, or null.'
       );
     }
     this.fallback = fallback;
+
+    if (initialHeaders !== undefined) {
+      if (
+        !initialHeaders ||
+        typeof initialHeaders !== 'object' ||
+        Object.entries(initialHeaders).some(
+          ([key, value]) => typeof key !== 'string' || typeof value !== 'string'
+        )
+      ) {
+        throw new Error(
+          `The \`initialHeaders\` argument for \`Prerender\` must be an object with string key/values`
+        );
+      }
+      this.initialHeaders = initialHeaders;
+    }
+
+    if (initialStatus !== undefined) {
+      if (initialStatus <= 0 || !Number.isInteger(initialStatus)) {
+        throw new Error(
+          `The \`initialStatus\` argument for \`Prerender\` must be a natural number.`
+        );
+      }
+      this.initialStatus = initialStatus;
+    }
 
     if (allowQuery !== undefined) {
       if (!Array.isArray(allowQuery)) {
@@ -78,6 +221,79 @@ export class Prerender {
         );
       }
       this.allowQuery = allowQuery;
+    }
+
+    if (allowHeader !== undefined) {
+      if (!Array.isArray(allowHeader)) {
+        throw new Error(
+          'The `allowHeader` argument for `Prerender` must be Array.'
+        );
+      }
+      if (!allowHeader.every(q => typeof q === 'string')) {
+        throw new Error(
+          'The `allowHeader` argument for `Prerender` must be Array of strings.'
+        );
+      }
+      this.allowHeader = allowHeader;
+    }
+
+    if (experimentalStreamingLambdaPath !== undefined) {
+      if (typeof experimentalStreamingLambdaPath !== 'string') {
+        throw new Error(
+          'The `experimentalStreamingLambdaPath` argument for `Prerender` must be a string.'
+        );
+      }
+      this.experimentalStreamingLambdaPath = experimentalStreamingLambdaPath;
+    }
+
+    if (chain !== undefined) {
+      if (typeof chain !== 'object') {
+        throw new Error(
+          'The `chain` argument for `Prerender` must be an object.'
+        );
+      }
+
+      if (
+        !chain.headers ||
+        typeof chain.headers !== 'object' ||
+        Object.entries(chain.headers).some(
+          ([key, value]) => typeof key !== 'string' || typeof value !== 'string'
+        )
+      ) {
+        throw new Error(
+          `The \`chain.headers\` argument for \`Prerender\` must be an object with string key/values`
+        );
+      }
+
+      if (!chain.outputPath || typeof chain.outputPath !== 'string') {
+        throw new Error(
+          'The `chain.outputPath` argument for `Prerender` must be a string.'
+        );
+      }
+
+      this.chain = chain;
+    }
+
+    if (exposeErrBody === true) {
+      this.exposeErrBody = true;
+    } else if (
+      typeof exposeErrBody !== 'boolean' &&
+      typeof exposeErrBody !== 'undefined'
+    ) {
+      throw new Error(
+        `The \`exposeErrBody\` argument for \`Prerender\` must be a boolean.`
+      );
+    }
+
+    if (partialFallback === true) {
+      this.partialFallback = true;
+    } else if (
+      typeof partialFallback !== 'boolean' &&
+      typeof partialFallback !== 'undefined'
+    ) {
+      throw new Error(
+        `The \`partialFallback\` argument for \`Prerender\` must be a boolean.`
+      );
     }
   }
 }

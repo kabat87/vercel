@@ -1,0 +1,48 @@
+const fs = require('fs');
+const path = require('path');
+const { intoChunks } = require('../../../../utils/chunk-tests');
+
+const {
+  testDeployment,
+} = require('../../../../test/lib/deployment/test-deployment.js');
+
+vi.setConfig({ testTimeout: 12 * 60 * 1000, hookTimeout: 12 * 60 * 1000 });
+
+module.exports = function setupTests(groupIndex) {
+  const fixturesPath = path.resolve(__dirname, '../fixtures');
+  const testsThatFailToBuild = new Map([
+    [
+      '45-noEmitOnError-true',
+      `index.ts(3,19): error TS2339: Property 'thisDoesNotExist' does not exist on type 'IncomingMessage'.\n`,
+    ],
+  ]);
+
+  let fixtures = fs.readdirSync(fixturesPath);
+
+  if (typeof groupIndex !== 'undefined') {
+    fixtures = intoChunks(1, 5, fixtures)[groupIndex - 1];
+
+    console.log('testing group', groupIndex, fixtures);
+  }
+
+  for (const fixture of fixtures) {
+    const errMsg = testsThatFailToBuild.get(fixture);
+    if (errMsg) {
+      it.concurrent(`should fail to build ${fixture}`, async () => {
+        try {
+          await testDeployment(path.join(fixturesPath, fixture));
+        } catch (err) {
+          expect(err).toBeTruthy();
+          expect(err.deployment).toBeTruthy();
+          expect(err.deployment.errorMessage).toBe(errMsg);
+        }
+      });
+      continue;
+    }
+    it.concurrent(`should build ${fixture}`, async () => {
+      await expect(
+        testDeployment(path.join(fixturesPath, fixture))
+      ).resolves.toBeDefined();
+    });
+  }
+};

@@ -1,0 +1,6 @@
+{
+  "name": "marketing",
+  "scripts": {
+    "build": "node -e \"require('node:fs').mkdirSync('dist', { recursive: true })\" && echo marketing > dist/index.txt"
+  }
+}

@@ -1,81 +1,200 @@
+import type Client from '../../util/client';
 import chalk from 'chalk';
-import Client from '../../util/client';
-import getArgs from '../../util/get-args';
-import logo from '../../util/output/logo';
-import { getPkgName } from '../../util/pkg-name';
-import setupAndLink from '../../util/link/setup-and-link';
+import { parseArguments } from '../../util/get-args';
+import getSubcommand from '../../util/get-subcommand';
+import cmd from '../../util/output/cmd';
+import { ensureLink } from '../../util/link/ensure-link';
+import { addRepoLink, ensureRepoLink } from '../../util/link/repo';
+import { type Command, help } from '../help';
+import { addSubcommand, linkCommand } from './command';
+import { getFlagsSpecification } from '../../util/get-flags-specification';
+import { printError } from '../../util/error';
+import output from '../../output-manager';
+import { LinkTelemetryClient } from '../../util/telemetry/commands/link';
+import { getCommandAliases } from '..';
+import getScope, { detectExplicitScope } from '../../util/get-scope';
+import { isPromptCanceledError } from '../../util/input/prompt-cancellation';
+import pull from '../env/pull';
+import { resolveProjectCwd } from '../../util/projects/find-project-root';
 
-const help = () => {
-  console.log(`
-  ${chalk.bold(`${logo} ${getPkgName()} link`)} [options]
-
-  ${chalk.dim('Options:')}
-
-    -h, --help                     Output usage information
-    -A ${chalk.bold.underline('FILE')}, --local-config=${chalk.bold.underline(
-    'FILE'
-  )}   Path to the local ${'`vercel.json`'} file
-    -Q ${chalk.bold.underline('DIR')}, --global-config=${chalk.bold.underline(
-    'DIR'
-  )}    Path to the global ${'`.vercel`'} directory
-    -d, --debug                    Debug mode [off]
-    -t ${chalk.bold.underline('TOKEN')}, --token=${chalk.bold.underline(
-    'TOKEN'
-  )}        Login token
-    -p ${chalk.bold.underline('NAME')}, --project=${chalk.bold.underline(
-    'NAME'
-  )}        Project name
-    --confirm                      Confirm default options and skip questions
-
-  ${chalk.dim('Examples:')}
-
-  ${chalk.gray('–')} Link current directory to a Vercel Project
-
-      ${chalk.cyan(`$ ${getPkgName()} link`)}
-
-  ${chalk.gray(
-    '–'
-  )} Link current directory with default options and skip questions
-
-      ${chalk.cyan(`$ ${getPkgName()} link --confirm`)}
-
-  ${chalk.gray('–')} Link a specific directory to a Vercel Project
-
-      ${chalk.cyan(`$ ${getPkgName()} link /usr/src/project`)}
-`);
+const COMMAND_CONFIG = {
+  add: getCommandAliases(addSubcommand),
 };
 
-export default async function main(client: Client) {
-  const argv = getArgs(client.argv.slice(2), {
-    '--confirm': Boolean,
-    '--project': String,
-    '-p': '--project',
+function warnOidcRefreshFailed(): void {
+  output.print(
+    `${chalk.yellow('!')} Linked project, but failed to refresh VERCEL_OIDC_TOKEN in .env.local. Rerun the link command to retry.\n`
+  );
+}
+
+async function refreshOidcTokenAfterLink(
+  client: Client,
+  cwd: string
+): Promise<void> {
+  const originalCwd = client.cwd;
+  try {
+    client.cwd = await resolveProjectCwd(cwd);
+    output.print('\n');
+    const exitCode = await pull(client, ['--yes'], 'vercel-cli:link', {
+      oidcTokenOnly: true,
+    });
+
+    if (exitCode !== 0) {
+      warnOidcRefreshFailed();
+    }
+  } catch (_error) {
+    warnOidcRefreshFailed();
+  } finally {
+    client.cwd = originalCwd;
+  }
+}
+
+export default async function link(client: Client) {
+  try {
+    return await client.withEscapePromptCancellation(() => linkProject(client));
+  } catch (error) {
+    if (isPromptCanceledError(error)) {
+      output.print('  Canceled.\n');
+      return 0;
+    }
+    throw error;
+  }
+}
+
+async function linkProject(client: Client) {
+  let parsedArgs = null;
+
+  const flagsSpecification = getFlagsSpecification(linkCommand.options);
+
+  // Parse CLI args (permissive to allow subcommand flags to pass through)
+  try {
+    parsedArgs = parseArguments(client.argv.slice(2), flagsSpecification, {
+      permissive: true,
+    });
+  } catch (error) {
+    printError(error);
+    return 1;
+  }
+
+  const { subcommand, subcommandOriginal } = getSubcommand(
+    parsedArgs.args.slice(1),
+    COMMAND_CONFIG
+  );
+
+  const telemetry = new LinkTelemetryClient({
+    opts: {
+      store: client.telemetryEventStore,
+    },
   });
 
-  if (argv['--help']) {
-    help();
+  function printHelp(command: Command) {
+    output.print(
+      help(command, { parent: linkCommand, columns: client.stderr.columns })
+    );
+  }
+
+  if (subcommand === 'add') {
+    // `vc link add` subcommand
+    // `--yes` is shared with the parent and already parsed by the permissive parse
+    if (parsedArgs.flags['--help']) {
+      telemetry.trackCliFlagHelp('link', subcommandOriginal);
+      printHelp(addSubcommand);
+      return 2;
+    }
+
+    telemetry.trackCliSubcommandAdd(subcommandOriginal);
+
+    const yes = !!parsedArgs.flags['--yes'];
+
+    try {
+      await addRepoLink(client, client.cwd, { yes });
+    } catch (err) {
+      if (isPromptCanceledError(err)) {
+        throw err;
+      }
+      output.prettyError(err);
+      return 1;
+    }
+
+    return 0;
+  }
+
+  // Default behavior (no subcommand) - original `vc link` flow
+  // Re-parse strictly now that we know there's no subcommand
+  try {
+    parsedArgs = parseArguments(client.argv.slice(2), flagsSpecification);
+  } catch (error) {
+    printError(error);
+    return 1;
+  }
+
+  if (parsedArgs.flags['--help']) {
+    telemetry.trackCliFlagHelp('link');
+    output.print(help(linkCommand, { columns: client.stderr.columns }));
     return 2;
   }
 
-  const cwd = argv._[1] || process.cwd();
-  const link = await setupAndLink(client, cwd, {
-    forceDelete: true,
-    autoConfirm: argv['--confirm'],
-    projectName: argv['--project'],
-    successEmoji: 'success',
-    setupMsg: 'Set up',
-  });
+  telemetry.trackCliFlagRepo(parsedArgs.flags['--repo']);
+  telemetry.trackCliFlagYes(parsedArgs.flags['--yes']);
+  telemetry.trackCliOptionProject(parsedArgs.flags['--project']);
 
-  if (link.status === 'error') {
-    return link.exitCode;
-  } else if (link.status === 'not_linked') {
-    // User aborted project linking questions
-    return 0;
-  } else if (link.status === 'linked') {
-    // Successfully linked
-    return 0;
-  } else {
-    const err: never = link;
-    throw new Error('Unknown link status: ' + err);
+  if ('--confirm' in parsedArgs.flags) {
+    telemetry.trackCliFlagConfirm(parsedArgs.flags['--confirm']);
+    output.warn('`--confirm` is deprecated, please use `--yes` instead');
+    parsedArgs.flags['--yes'] = parsedArgs.flags['--confirm'];
   }
+
+  const yes = !!parsedArgs.flags['--yes'];
+
+  let cwd = parsedArgs.args[1];
+  if (cwd) {
+    telemetry.trackCliArgumentCwd();
+    output.warn(
+      `The ${cmd('vc link <directory>')} syntax is deprecated, please use ${cmd(
+        `vc link --cwd ${cwd}`
+      )} instead`
+    );
+  } else {
+    cwd = client.cwd;
+  }
+
+  if (parsedArgs.flags['--repo']) {
+    output.warn(`The ${cmd('--repo')} flag is in alpha, please report issues`);
+    try {
+      await ensureRepoLink(client, cwd, { yes, overwrite: true });
+    } catch (err) {
+      if (isPromptCanceledError(err)) {
+        throw err;
+      }
+      output.prettyError(err);
+      return 1;
+    }
+  } else {
+    const explicitScopeProvided = detectExplicitScope(client);
+    const selectedOrg = explicitScopeProvided
+      ? (await getScope(client, { resolveLocalScope: true })).org
+      : undefined;
+
+    // Non-interactive when flag is passed or when agent (e.g. no TTY) so JSON is output when confirmation needed
+    const linkNonInteractive =
+      client.nonInteractive || client.argv.includes('--non-interactive');
+
+    const link = await ensureLink('link', client, cwd, {
+      autoConfirm: yes,
+      forceDelete: true,
+      selectedOrg,
+      projectName: parsedArgs.flags['--project'],
+      successEmoji: 'success',
+      nonInteractive: linkNonInteractive,
+      pullEnv: false,
+    });
+
+    if (typeof link === 'number') {
+      return link;
+    }
+
+    await refreshOidcTokenAfterLink(client, cwd);
+  }
+
+  return 0;
 }

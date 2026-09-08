@@ -1,3 +1,133 @@
+const mitigateSchema = {
+  description: 'Mitigation action to take on a route',
+  type: 'object',
+  additionalProperties: false,
+  required: ['action'],
+  properties: {
+    action: {
+      description: 'The mitigation action to take',
+      type: 'string',
+      enum: ['challenge', 'deny'],
+    },
+  },
+} as const;
+
+const serviceNameSchema = {
+  description: 'A service name identifier.',
+  type: 'string',
+  minLength: 1,
+  maxLength: 64,
+  pattern: '^[a-zA-Z]([a-zA-Z0-9_-]*[a-zA-Z0-9])?$',
+} as const;
+
+const serviceDestinationSchema = {
+  description:
+    'A service-targeted destination that delegates routing into a named service from `services`. Identified by the presence of `service`.',
+  type: 'object',
+  additionalProperties: false,
+  required: ['service'],
+  properties: {
+    type: {
+      description:
+        'Optional explicit format marker. The destination shape is identified by the `service` property, so `type` is no longer required. When present it must be `service`.',
+      type: 'string',
+      enum: ['service'],
+    },
+    service: serviceNameSchema,
+    path: {
+      description:
+        'Routing-only path used to select a route inside the target service. It does not mutate the URL observed by user code.',
+      type: 'string',
+      maxLength: 4096,
+    },
+  },
+} as const;
+
+const matchableValueSchema = {
+  description:
+    'A value to match against. Can be a string (regex) or a condition operation object',
+  anyOf: [
+    {
+      description:
+        'A regular expression used to match thev value. Named groups can be used in the destination.',
+      type: 'string',
+      maxLength: 4096,
+    },
+    {
+      description: 'A condition operation object',
+      type: 'object',
+      additionalProperties: false,
+      minProperties: 1,
+      properties: {
+        eq: {
+          description: 'Equal to',
+          anyOf: [
+            {
+              type: 'string',
+              maxLength: 4096,
+            },
+            {
+              type: 'number',
+            },
+          ],
+        },
+        neq: {
+          description: 'Not equal',
+          type: 'string',
+          maxLength: 4096,
+        },
+        inc: {
+          description: 'In array',
+          type: 'array',
+          items: {
+            type: 'string',
+            maxLength: 4096,
+          },
+        },
+        ninc: {
+          description: 'Not in array',
+          type: 'array',
+          items: {
+            type: 'string',
+            maxLength: 4096,
+          },
+        },
+        pre: {
+          description: 'Starts with',
+          type: 'string',
+          maxLength: 4096,
+        },
+        suf: {
+          description: 'Ends with',
+          type: 'string',
+          maxLength: 4096,
+        },
+        re: {
+          description: 'Regex',
+          type: 'string',
+          maxLength: 4096,
+        },
+        gt: {
+          description: 'Greater than',
+          type: 'number',
+        },
+        gte: {
+          description: 'Greater than or equal to',
+          type: 'number',
+        },
+        lt: {
+          description: 'Less than',
+          type: 'number',
+        },
+        lte: {
+          description: 'Less than or equal to',
+          type: 'number',
+        },
+      },
+    },
+  ],
+} as const;
+
 export const hasSchema = {
   description: 'An array of requirements that are needed to match',
   type: 'array',
@@ -14,12 +144,7 @@ export const hasSchema = {
             type: 'string',
             enum: ['host'],
           },
-          value: {
-            description:
-              'A regular expression used to match the value. Named groups can be used in the destination',
-            type: 'string',
-            maxLength: 4096,
-          },
+          value: matchableValueSchema,
         },
       },
       {
@@ -38,15 +163,309 @@ export const hasSchema = {
             type: 'string',
             maxLength: 4096,
           },
-          value: {
+          value: matchableValueSchema,
+        },
+      },
+    ],
+  },
+} as const;
+
+export const transformsSchema = {
+  description:
+    'A list of transform rules to adjust a request path, request query parameters, or request/response headers',
+  type: 'array',
+  minItems: 1,
+  items: {
+    type: 'object',
+    additionalProperties: false,
+    required: ['type', 'op'],
+    properties: {
+      type: {
+        description: 'The scope of the transform to apply',
+        type: 'string',
+        enum: [
+          'request.headers',
+          'request.query',
+          'response.headers',
+          'request.path',
+        ],
+      },
+      op: {
+        description: 'The operation to perform on the target',
+        type: 'string',
+        enum: ['append', 'set', 'delete'],
+      },
+      target: {
+        description: 'The target of the transform',
+        type: 'object',
+        required: ['key'],
+        properties: {
+          // re is not supported for transforms. Once supported, replace target.key with matchableValueSchema
+          key: {
             description:
-              'A regular expression used to match the value. Named groups can be used in the destination',
+              'A value to match against. Can be a string or a condition operation object (without regex support)',
+            anyOf: [
+              {
+                description:
+                  'A valid header name (letters, numbers, hyphens, underscores)',
+                type: 'string',
+                maxLength: 4096,
+              },
+              {
+                description: 'A condition operation object',
+                type: 'object',
+                additionalProperties: false,
+                minProperties: 1,
+                properties: {
+                  eq: {
+                    description: 'Equal to',
+                    anyOf: [
+                      {
+                        type: 'string',
+                        maxLength: 4096,
+                      },
+                      {
+                        type: 'number',
+                      },
+                    ],
+                  },
+                  neq: {
+                    description: 'Not equal',
+                    type: 'string',
+                    maxLength: 4096,
+                  },
+                  inc: {
+                    description: 'In array',
+                    type: 'array',
+                    items: {
+                      type: 'string',
+                      maxLength: 4096,
+                    },
+                  },
+                  ninc: {
+                    description: 'Not in array',
+                    type: 'array',
+                    items: {
+                      type: 'string',
+                      maxLength: 4096,
+                    },
+                  },
+                  pre: {
+                    description: 'Starts with',
+                    type: 'string',
+                    maxLength: 4096,
+                  },
+                  suf: {
+                    description: 'Ends with',
+                    type: 'string',
+                    maxLength: 4096,
+                  },
+                  gt: {
+                    description: 'Greater than',
+                    type: 'number',
+                  },
+                  gte: {
+                    description: 'Greater than or equal to',
+                    type: 'number',
+                  },
+                  lt: {
+                    description: 'Less than',
+                    type: 'number',
+                  },
+                  lte: {
+                    description: 'Less than or equal to',
+                    type: 'number',
+                  },
+                },
+              },
+            ],
+          },
+        },
+      },
+      args: {
+        description: 'The arguments to the operation',
+        anyOf: [
+          {
             type: 'string',
             maxLength: 4096,
+          },
+          {
+            type: 'array',
+            minItems: 1,
+            items: {
+              type: 'string',
+              maxLength: 4096,
+            },
+          },
+        ],
+      },
+      env: {
+        description:
+          'An array of environment variable names that should be replaced at runtime in the args value',
+        type: 'array',
+        minItems: 1,
+        maxItems: 64,
+        items: {
+          type: 'string',
+          maxLength: 256,
+        },
+      },
+    },
+    allOf: [
+      {
+        if: {
+          properties: {
+            op: {
+              enum: ['append', 'set'],
+            },
+          },
+        },
+        // biome-ignore lint/suspicious/noThenProperty: JSON Schema if/then keyword
+        then: {
+          required: ['args'],
+        },
+      },
+      {
+        if: {
+          allOf: [
+            {
+              properties: {
+                type: {
+                  enum: ['request.headers', 'response.headers'],
+                },
+              },
+            },
+            {
+              properties: {
+                op: {
+                  enum: ['set', 'append'],
+                },
+              },
+            },
+          ],
+        },
+        // biome-ignore lint/suspicious/noThenProperty: JSON Schema if/then keyword
+        then: {
+          properties: {
+            target: {
+              properties: {
+                key: {
+                  if: {
+                    type: 'string',
+                  },
+                  // biome-ignore lint/suspicious/noThenProperty: JSON Schema if/then keyword
+                  then: {
+                    pattern: '^[a-zA-Z0-9_-]+$',
+                  },
+                },
+              },
+            },
+            args: {
+              anyOf: [
+                {
+                  type: 'string',
+                  pattern:
+                    '^[a-zA-Z0-9_ :;.,"\'?!(){}\\[\\]@<>=+*#$&`|~\\^%/-]+$',
+                },
+                {
+                  type: 'array',
+                  items: {
+                    type: 'string',
+                    pattern:
+                      '^[a-zA-Z0-9_ :;.,"\'?!(){}\\[\\]@<>=+*#$&`|~\\^%/-]+$',
+                  },
+                },
+              ],
+            },
+          },
+        },
+      },
+      {
+        if: {
+          required: ['type'],
+          properties: {
+            type: {
+              enum: ['request.headers', 'request.query', 'response.headers'],
+            },
+          },
+        },
+        // biome-ignore lint/suspicious/noThenProperty: JSON Schema if/then keyword
+        then: {
+          required: ['target'],
+        },
+      },
+      {
+        if: {
+          required: ['type'],
+          properties: {
+            type: {
+              enum: ['request.path'],
+            },
+          },
+        },
+        // biome-ignore lint/suspicious/noThenProperty: JSON Schema if/then keyword
+        then: {
+          required: ['args'],
+          not: {
+            required: ['target'],
+          },
+          properties: {
+            op: {
+              enum: ['set'],
+            },
+            args: {
+              description:
+                'The runtime-visible request path. Must be an origin-form path without query or fragment.',
+              type: 'string',
+              maxLength: 2048,
+              pattern: '^/(?!/)(?!.*[?#\\s\\x00-\\x1F\\x7F]).*$',
+            },
           },
         },
       },
     ],
+  },
+} as const;
+
+const rewriteTransformsSchema = {
+  description:
+    'A list of request path transforms using path-to-regexp parameters.',
+  type: 'array',
+  minItems: 1,
+  items: {
+    type: 'object',
+    additionalProperties: false,
+    required: ['type', 'op', 'args'],
+    properties: {
+      type: {
+        description: 'The request path to expose to the target runtime',
+        type: 'string',
+        enum: ['request.path'],
+      },
+      op: {
+        description: 'Replace the runtime-visible request path',
+        type: 'string',
+        enum: ['set'],
+      },
+      args: {
+        description:
+          'An origin-form request path. Route parameters use path-to-regexp syntax such as `/:path*`.',
+        type: 'string',
+        maxLength: 2048,
+        pattern: '^/(?!/)(?!.*[?#\\s\\x00-\\x1F\\x7F]).*$',
+      },
+      env: {
+        description:
+          'An array of environment variable names that should be replaced at runtime in the args value',
+        type: 'array',
+        minItems: 1,
+        maxItems: 64,
+        items: {
+          type: 'string',
+          maxLength: 256,
+        },
+      },
+    },
   },
 } as const;
 
@@ -55,8 +474,6 @@ export const hasSchema = {
  */
 export const routesSchema = {
   type: 'array',
-  maxItems: 1024,
-  deprecated: true,
   description:
     'A list of routes objects used to rewrite paths to point towards other internal or external paths',
   example: [{ dest: 'https://docs.example.com', src: '/docs' }],
@@ -64,16 +481,26 @@ export const routesSchema = {
     anyOf: [
       {
         type: 'object',
-        required: ['src'],
+        anyOf: [{ required: ['src'] }, { required: ['source'] }],
         additionalProperties: false,
         properties: {
           src: {
             type: 'string',
             maxLength: 4096,
           },
+          source: {
+            type: 'string',
+            maxLength: 4096,
+          },
           dest: {
             type: 'string',
             maxLength: 4096,
+          },
+          destination: {
+            anyOf: [
+              { type: 'string', maxLength: 4096 },
+              serviceDestinationSchema,
+            ],
           },
           headers: {
             type: 'object',
@@ -83,7 +510,7 @@ export const routesSchema = {
             patternProperties: {
               '^.{1,256}$': {
                 type: 'string',
-                maxLength: 4096,
+                maxLength: 32768,
               },
             },
           },
@@ -95,7 +522,11 @@ export const routesSchema = {
               maxLength: 32,
             },
           },
+          caseSensitive: {
+            type: 'boolean',
+          },
           important: {
+            deprecated: true,
             type: 'boolean',
           },
           user: {
@@ -105,12 +536,21 @@ export const routesSchema = {
             type: 'boolean',
           },
           override: {
+            deprecated: true,
             type: 'boolean',
           },
           check: {
             type: 'boolean',
           },
+          isInternal: {
+            type: 'boolean',
+          },
           status: {
+            type: 'integer',
+            minimum: 100,
+            maximum: 999,
+          },
+          statusCode: {
             type: 'integer',
             minimum: 100,
             maximum: 999,
@@ -150,11 +590,39 @@ export const routesSchema = {
               },
             },
           },
+          middleware: { type: 'number' },
+          middlewarePath: { type: 'string' },
+          middlewareRawSrc: {
+            type: 'array',
+            items: {
+              type: 'string',
+            },
+          },
           has: hasSchema,
+          missing: hasSchema,
+          mitigate: mitigateSchema,
+          transforms: transformsSchema,
+          env: {
+            description:
+              'An array of environment variable names that should be replaced at runtime in the destination or headers',
+            type: 'array',
+            minItems: 1,
+            maxItems: 64,
+            items: {
+              type: 'string',
+              maxLength: 256,
+            },
+          },
+          respectOriginCacheControl: {
+            description:
+              'When set to true (default), external rewrites will respect the Cache-Control header from the origin. When false, caching is disabled for this rewrite.',
+            type: 'boolean',
+          },
         },
       },
       {
         type: 'object',
+        deprecated: true,
         required: ['handle'],
         additionalProperties: false,
         properties: {
@@ -171,7 +639,7 @@ export const routesSchema = {
 
 export const rewritesSchema = {
   type: 'array',
-  maxItems: 1024,
+  maxItems: 2048,
   description: 'A list of rewrite definitions.',
   items: {
     type: 'object',
@@ -186,11 +654,35 @@ export const rewritesSchema = {
       },
       destination: {
         description:
-          'An absolute pathname to an existing resource or an external URL.',
-        type: 'string',
-        maxLength: 4096,
+          'An absolute pathname to an existing resource, an external URL, or a service-targeted destination object.',
+        anyOf: [{ type: 'string', maxLength: 4096 }, serviceDestinationSchema],
       },
+      transforms: rewriteTransformsSchema,
       has: hasSchema,
+      missing: hasSchema,
+      statusCode: {
+        description:
+          'An optional integer to override the status code of the response.',
+        type: 'integer',
+        minimum: 100,
+        maximum: 999,
+      },
+      env: {
+        description:
+          'An array of environment variable names that should be replaced at runtime in the destination',
+        type: 'array',
+        minItems: 1,
+        maxItems: 64,
+        items: {
+          type: 'string',
+          maxLength: 256,
+        },
+      },
+      respectOriginCacheControl: {
+        description:
+          'When set to true (default), external rewrites will respect the Cache-Control header from the origin. When false, caching is disabled for this rewrite.',
+        type: 'boolean',
+      },
     },
   },
 } as const;
@@ -198,7 +690,7 @@ export const rewritesSchema = {
 export const redirectsSchema = {
   title: 'Redirects',
   type: 'array',
-  maxItems: 1024,
+  maxItems: 2048,
   description: 'A list of redirect definitions.',
   items: {
     type: 'object',
@@ -207,7 +699,7 @@ export const redirectsSchema = {
     properties: {
       source: {
         description:
-          'A pattern that matches each incoming pathname (excluding querystring).',
+          'A pattern that matches each incoming pathname (excluding querystring) or a full URL including domain.',
         type: 'string',
         maxLength: 4096,
       },
@@ -223,19 +715,33 @@ export const redirectsSchema = {
         type: 'boolean',
       },
       statusCode: {
+        description:
+          'An optional integer to define the status code of the redirect.',
         private: true,
         type: 'integer',
         minimum: 100,
         maximum: 999,
       },
       has: hasSchema,
+      missing: hasSchema,
+      env: {
+        description:
+          'An array of environment variable names that should be replaced at runtime in the destination',
+        type: 'array',
+        minItems: 1,
+        maxItems: 64,
+        items: {
+          type: 'string',
+          maxLength: 256,
+        },
+      },
     },
   },
 } as const;
 
 export const headersSchema = {
   type: 'array',
-  maxItems: 1024,
+  maxItems: 2048,
   description: 'A list of header definitions.',
   items: {
     type: 'object',
@@ -264,12 +770,13 @@ export const headersSchema = {
             },
             value: {
               type: 'string',
-              maxLength: 4096,
+              maxLength: 32768,
             },
           },
         },
       },
       has: hasSchema,
+      missing: hasSchema,
     },
   },
 } as const;

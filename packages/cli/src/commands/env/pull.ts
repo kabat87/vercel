@@ -1,31 +1,70 @@
 import chalk from 'chalk';
-import { Project } from '../../types';
-import { Output } from '../../util/output';
-import confirm from '../../util/input/confirm';
-import Client from '../../util/client';
-import stamp from '../../util/output/stamp';
-import getDecryptedEnvRecords from '../../util/get-decrypted-env-records';
+import { outputFile, readFile } from 'fs-extra';
+import { closeSync, openSync, readSync } from 'fs';
+import { resolve } from 'path';
+import type Client from '../../util/client';
 import param from '../../util/output/param';
-import { join } from 'path';
-import { promises, openSync, closeSync, readSync } from 'fs';
-import { emoji, prependEmoji } from '../../util/emoji';
-import { getCommandName } from '../../util/pkg-name';
-const { writeFile } = promises;
-import exposeSystemEnvs from '../../util/dev/expose-system-envs';
-import getSystemEnvValues from '../../util/env/get-system-env-values';
+import { getCommandName, getCommandNamePlain } from '../../util/pkg-name';
+import getEnvRecords, {
+  type EnvRecordsSource,
+  pullEnvRecords,
+} from '../../util/env/get-env-records';
+import {
+  buildDeltaString,
+  createEnvObject,
+} from '../../util/env/diff-env-files';
+import {
+  SENSITIVE_ENV_VALUE_PLACEHOLDER,
+  VERCEL_OIDC_TOKEN,
+} from '../../util/env/constants';
+import { isSecretEnvVar } from '../../util/env/env-var-config-secret-ui';
+import { getUnavailableSecretValuesMessage } from '../../util/env/secret-read-guidance';
+import { updateOidcTokenContents } from '../../util/env/update-oidc-token-contents';
+import { isErrnoException } from '@vercel/error-utils';
+import { addToGitIgnore } from '../../util/link/add-to-gitignore';
+import { ensureLink } from '../../util/link/ensure-link';
+import JSONparse from 'json-parse-better-errors';
+import { formatProject } from '../../util/projects/format-project';
+import type { ProjectLinked } from '@vercel-internals/types';
+import output from '../../output-manager';
+import { EnvPullTelemetryClient } from '../../util/telemetry/commands/env/pull';
+import { pullSubcommand } from './command';
+import { parseArguments } from '../../util/get-args';
+import { getFlagsSpecification } from '../../util/get-flags-specification';
+import { printError } from '../../util/error';
+import parseTarget from '../../util/parse-target';
+import { resolveProjectContext } from '../../util/projects/resolve-project-context';
+import getDeployment from '../../util/get-deployment';
+import {
+  buildCommandWithYes,
+  getPreservedArgsForEnvPull,
+  outputActionRequired,
+  outputAgentError,
+} from '../../util/agent-output';
+import { printAlignedLabel } from '../../util/output/print-aligned-label';
 
 const CONTENTS_PREFIX = '# Created by Vercel CLI\n';
 
-type Options = {
-  '--debug': boolean;
-  '--yes': boolean;
-};
+function printEnvPullWarning(message: string): void {
+  output.print(`${chalk.yellow('!')} ${message}\n`);
+}
+
+export interface EnvPullOptions {
+  /** Refresh only VERCEL_OIDC_TOKEN while preserving all other file content. */
+  oidcTokenOnly?: boolean;
+}
 
 function readHeadSync(path: string, length: number) {
   const buffer = Buffer.alloc(length);
   const fd = openSync(path, 'r');
   try {
-    readSync(fd, buffer, 0, buffer.length, null);
+    readSync(
+      fd,
+      buffer as unknown as NodeJS.ArrayBufferView,
+      0,
+      buffer.length,
+      null
+    );
   } finally {
     closeSync(fd);
   }
@@ -35,20 +74,70 @@ function readHeadSync(path: string, length: number) {
 function tryReadHeadSync(path: string, length: number) {
   try {
     return readHeadSync(path, length);
-  } catch (err) {
-    if (err.code !== 'ENOENT') {
+  } catch (err: unknown) {
+    if (!isErrnoException(err) || err.code !== 'ENOENT') {
       throw err;
     }
   }
 }
 
+const VARIABLES_TO_IGNORE = [
+  'VERCEL_ANALYTICS_ID',
+  'VERCEL_SPEED_INSIGHTS_ID',
+  'VERCEL_WEB_ANALYTICS_ID',
+];
+
+export const SENSITIVE_PLACEHOLDER = SENSITIVE_ENV_VALUE_PLACEHOLDER;
+
+async function getRedactedSensitiveKeys(
+  client: Client,
+  projectId: string | undefined,
+  source: EnvRecordsSource,
+  target: string,
+  gitBranch: string | undefined,
+  records: Record<string, string>
+): Promise<Set<string>> {
+  const emptyKeys = Object.keys(records).filter(key => !records[key]);
+  if (!projectId || emptyKeys.length === 0) {
+    return new Set();
+  }
+  try {
+    const { envs } = await getEnvRecords(client, projectId, source, {
+      target,
+      gitBranch,
+    });
+    const sensitiveKeys = new Set(
+      envs.filter(isSecretEnvVar).map(env => env.key)
+    );
+    return new Set(emptyKeys.filter(key => sensitiveKeys.has(key)));
+  } catch {
+    return new Set();
+  }
+}
+
 export default async function pull(
   client: Client,
-  project: Project,
-  opts: Partial<Options>,
-  args: string[],
-  output: Output
+  argv: string[],
+  source: EnvRecordsSource = 'vercel-cli:env:pull',
+  options: EnvPullOptions = {}
 ) {
+  const telemetryClient = new EnvPullTelemetryClient({
+    opts: {
+      store: client.telemetryEventStore,
+    },
+  });
+
+  let parsedArgs;
+  const flagsSpecification = getFlagsSpecification(pullSubcommand.options);
+  try {
+    parsedArgs = parseArguments(argv, flagsSpecification);
+  } catch (err) {
+    printError(err);
+    return 1;
+  }
+
+  const { args, flags: opts } = parsedArgs;
+
   if (args.length > 1) {
     output.error(
       `Invalid number of arguments. Usage: ${getCommandName(`env pull <file>`)}`
@@ -56,68 +145,337 @@ export default async function pull(
     return 1;
   }
 
-  const [filename = '.env'] = args;
-  const fullPath = join(process.cwd(), filename);
+  // handle relative or absolute filename
+  const [rawFilename] = args;
+  const filename = rawFilename || '.env.local';
   const skipConfirmation = opts['--yes'];
+  const gitBranch = opts['--git-branch'];
 
-  const head = tryReadHeadSync(fullPath, Buffer.byteLength(CONTENTS_PREFIX));
-  const exists = typeof head !== 'undefined';
+  telemetryClient.trackCliArgumentFilename(args[0]);
+  telemetryClient.trackCliFlagYes(skipConfirmation);
+  telemetryClient.trackCliOptionGitBranch(gitBranch);
+  telemetryClient.trackCliOptionEnvironment(opts['--environment']);
+  telemetryClient.trackCliOptionId(opts['--id']);
+  telemetryClient.trackCliOptionProject(opts['--project']);
 
-  if (head === CONTENTS_PREFIX) {
-    output.print(`Overwriting existing ${chalk.bold(filename)} file\n`);
-  } else if (
-    exists &&
-    !skipConfirmation &&
-    !(await confirm(
-      `Found existing file ${param(filename)}. Do you want to overwrite?`,
-      false
-    ))
-  ) {
-    output.log('Aborted');
-    return 0;
+  let link = await resolveProjectContext({
+    client,
+    projectNameOrId: opts['--project'],
+  });
+  if (link.status === 'error') {
+    return link.exitCode;
+  } else if (link.status === 'not_linked') {
+    if (client.nonInteractive) {
+      const preserved = getPreservedArgsForEnvPull(client.argv);
+      const linkArgv = [
+        ...client.argv.slice(0, 2),
+        'link',
+        '--scope',
+        '<scope>',
+        ...preserved,
+      ];
+      outputAgentError(
+        client,
+        {
+          status: 'error',
+          reason: 'not_linked',
+          message: `Your codebase isn't linked to a project on Vercel. Run \`${getCommandNamePlain(
+            'link'
+          )}\` to begin. Use \`--yes\` for non-interactive; use \`--scope\` or \`--project\` to specify team or project.`,
+          next: [
+            { command: buildCommandWithYes(linkArgv) },
+            { command: buildCommandWithYes(client.argv) },
+          ],
+        },
+        1
+      );
+    }
+
+    // In an interactive session, offer the shared linking flow inline instead
+    // of requiring a separate `vercel link` run followed by `vercel env pull`.
+    if (!client.nonInteractive && client.stdin.isTTY && !skipConfirmation) {
+      const ensuredLink = await ensureLink('env pull', client, client.cwd, {
+        link,
+        // The env vars are pulled below, so don't offer to pull them twice.
+        pullEnv: false,
+      });
+      if (typeof ensuredLink === 'number') {
+        return ensuredLink;
+      }
+      link = ensuredLink;
+    } else {
+      output.error(
+        `Your codebase isn’t linked to a project on Vercel. Run ${getCommandName(
+          'link'
+        )} to begin.`
+      );
+      return 1;
+    }
+  }
+  client.config.currentTeam =
+    link.org.type === 'team' ? link.org.id : undefined;
+
+  const deploymentId = opts['--id'];
+
+  if (deploymentId && opts['--project']) {
+    const deployment = await getDeployment(client, link.org.slug, deploymentId);
+    if (deployment.projectId && deployment.projectId !== link.project.id) {
+      output.error(
+        `Deployment ${chalk.bold(deploymentId)} does not belong to project ${chalk.bold(link.project.name)}.`
+      );
+      return 1;
+    }
   }
 
-  output.print(
-    `Downloading Development Environment Variables for Project ${chalk.bold(
-      project.name
-    )}\n`
-  );
+  const environment =
+    parseTarget({
+      flagName: 'environment',
+      flags: opts,
+    }) || 'development';
 
-  const pullStamp = stamp();
-  output.spinner('Downloading');
-
-  const [{ envs: projectEnvs }, { systemEnvValues }] = await Promise.all([
-    getDecryptedEnvRecords(output, client, project.id),
-    project.autoExposeSystemEnvs
-      ? getSystemEnvValues(output, client, project.id)
-      : { systemEnvValues: [] },
-  ]);
-
-  const records = exposeSystemEnvs(
-    projectEnvs,
-    systemEnvValues,
-    project.autoExposeSystemEnvs
-  );
-
-  const contents =
-    CONTENTS_PREFIX +
-    Object.entries(records)
-      .map(([key, value]) => `${key}="${escapeValue(value)}"`)
-      .join('\n') +
-    '\n';
-
-  await writeFile(fullPath, contents, 'utf8');
-
-  output.print(
-    `${prependEmoji(
-      `${exists ? 'Updated' : 'Created'} ${chalk.bold(
-        filename
-      )} file ${chalk.gray(pullStamp())}`,
-      emoji('success')
-    )}\n`
+  await envPullCommandLogic(
+    client,
+    filename,
+    !!skipConfirmation,
+    environment,
+    link,
+    gitBranch,
+    client.cwd,
+    source,
+    deploymentId,
+    options
   );
 
   return 0;
+}
+
+export async function envPullCommandLogic(
+  client: Client,
+  filename: string,
+  skipConfirmation: boolean,
+  environment: string,
+  link: ProjectLinked,
+  gitBranch: string | undefined,
+  cwd: string,
+  source: EnvRecordsSource,
+  deploymentId?: string,
+  { oidcTokenOnly = false }: EnvPullOptions = {}
+) {
+  const fullPath = resolve(cwd, filename);
+  const head = tryReadHeadSync(fullPath, Buffer.byteLength(CONTENTS_PREFIX));
+  const exists = typeof head !== 'undefined';
+
+  if (head === CONTENTS_PREFIX && !oidcTokenOnly) {
+    output.log(`Overwriting existing ${chalk.bold(filename)} file`);
+  } else if (exists && !skipConfirmation && !oidcTokenOnly) {
+    if (client.nonInteractive) {
+      const preserved = getPreservedArgsForEnvPull(client.argv).filter(
+        arg => arg !== '--yes' && arg !== '-y'
+      );
+      const suffix = preserved.length > 0 ? ` ${preserved.join(' ')}` : '';
+      outputActionRequired(client, {
+        status: 'action_required',
+        reason: 'env_file_exists',
+        message: `File ${param(filename)} already exists and was not created by Vercel CLI. Use --yes to overwrite or specify a different filename.`,
+        next: [
+          {
+            command: getCommandNamePlain(`env pull ${filename} --yes${suffix}`),
+            when: 'Overwrite this file',
+          },
+          {
+            command: getCommandNamePlain(`env pull <filename>${suffix}`),
+            when: 'Use a different filename',
+          },
+        ],
+      });
+    }
+    if (
+      !(await client.input.confirm(
+        `Found existing file ${param(filename)}. Do you want to overwrite?`,
+        false
+      ))
+    ) {
+      output.log('Canceled');
+      return;
+    }
+  }
+
+  const projectSlugLink = formatProject(link.org.slug, link.project.name);
+
+  const downloadMessage = oidcTokenOnly
+    ? `Downloading a fresh \`${chalk.cyan(
+        VERCEL_OIDC_TOKEN
+      )}\` for ${projectSlugLink}`
+    : gitBranch
+      ? `Downloading \`${chalk.cyan(
+          environment
+        )}\` environment variables for ${projectSlugLink} and any overrides for branch ${chalk.cyan(
+          gitBranch
+        )}`
+      : `Downloading \`${chalk.cyan(
+          environment
+        )}\` environment variables for ${projectSlugLink}`;
+
+  output.log(downloadMessage);
+
+  output.spinner('Downloading');
+
+  const pullId = deploymentId || link.project.id;
+  const pullResult = await pullEnvRecords(client, pullId, source, {
+    target: environment || 'development',
+    gitBranch,
+  });
+  // When pulling by deployment ID, use buildEnv which always contains the full
+  // set of env vars. The `env` dict may only contain decryption keys when large
+  // env encryption is active (the actual values are in an encrypted blob for
+  // Lambda runtime use).
+  const records = deploymentId ? pullResult.buildEnv : pullResult.env;
+
+  let deltaString = '';
+  let oldEnv;
+  if (exists && !oidcTokenOnly) {
+    oldEnv = await createEnvObject(fullPath);
+  }
+
+  let contents: string;
+  let fileChanged = true;
+  const keptLocalKeys: string[] = [];
+  const preservedLocalSecretKeys: string[] = [];
+  let redactedSecretCount = 0;
+  let placeholderSecretCount = 0;
+
+  if (oidcTokenOnly) {
+    const existingContents = exists ? await readFile(fullPath, 'utf8') : '';
+    contents = updateOidcTokenContents(
+      existingContents,
+      records[VERCEL_OIDC_TOKEN] || undefined
+    );
+    fileChanged = contents !== existingContents;
+  } else {
+    const sensitiveKeys = await getRedactedSensitiveKeys(
+      client,
+      deploymentId ? undefined : link.project.id,
+      source,
+      environment,
+      gitBranch,
+      records
+    );
+    redactedSecretCount = sensitiveKeys.size;
+
+    const mergedRecords: Record<string, string | undefined> = { ...records };
+    for (const key of sensitiveKeys) {
+      const localValue = oldEnv?.[key];
+      if (localValue && localValue !== SENSITIVE_PLACEHOLDER) {
+        mergedRecords[key] = localValue;
+        preservedLocalSecretKeys.push(key);
+      } else {
+        mergedRecords[key] = SENSITIVE_PLACEHOLDER;
+        placeholderSecretCount++;
+      }
+    }
+    if (oldEnv) {
+      for (const [key, value] of Object.entries(oldEnv)) {
+        if (
+          !(key in mergedRecords) &&
+          key !== VERCEL_OIDC_TOKEN &&
+          !VARIABLES_TO_IGNORE.includes(key)
+        ) {
+          mergedRecords[key] = value;
+          keptLocalKeys.push(key);
+        }
+      }
+    }
+
+    contents =
+      CONTENTS_PREFIX +
+      Object.keys(mergedRecords)
+        .sort()
+        .filter(key => !VARIABLES_TO_IGNORE.includes(key))
+        .map(key => `${key}="${escapeValue(mergedRecords[key])}"`)
+        .join('\n') +
+      '\n';
+
+    if (oldEnv) {
+      const newEnv = JSONparse(
+        JSON.stringify(mergedRecords).replace(/\\"/g, '')
+      );
+      deltaString = buildDeltaString(oldEnv, newEnv);
+    }
+  }
+
+  if (fileChanged) {
+    await outputFile(fullPath, contents, 'utf8');
+  }
+
+  if (deltaString) {
+    output.print('\n' + deltaString);
+  } else if (oldEnv && exists) {
+    output.log('No changes found.');
+  }
+
+  if (keptLocalKeys.length > 0) {
+    output.log(
+      `Kept ${keptLocalKeys
+        .sort()
+        .map(key => chalk.bold(key))
+        .join(', ')} (defined locally, not found in the ${chalk.cyan(
+        environment
+      )} Environment)`
+    );
+  }
+
+  if (redactedSecretCount > 0) {
+    const preservedMessage =
+      preservedLocalSecretKeys.length > 0
+        ? ` Kept ${preservedLocalSecretKeys.length} existing local ${
+            preservedLocalSecretKeys.length === 1 ? 'value' : 'values'
+          }.`
+        : '';
+    const placeholderMessage =
+      placeholderSecretCount > 0
+        ? ` Wrote "${SENSITIVE_PLACEHOLDER}" ${
+            placeholderSecretCount === 1
+              ? 'as a placeholder'
+              : 'as placeholders'
+          } for the remaining ${
+            placeholderSecretCount === 1 ? 'value' : 'values'
+          }; replace ${placeholderSecretCount === 1 ? 'it' : 'them'} with local-only values.`
+        : '';
+    printEnvPullWarning(
+      `${getUnavailableSecretValuesMessage(
+        environment,
+        redactedSecretCount
+      )}${preservedMessage}${placeholderMessage}`
+    );
+  }
+
+  let isGitIgnoreUpdated = false;
+  const fileExistsAfterPull = exists || contents.length > 0;
+  if (filename === '.env.local' && fileExistsAfterPull) {
+    // When the file is `.env.local`, we also add it to `.gitignore`
+    // to avoid accidentally committing it to git.
+    // We use '.env*' to match the default .gitignore from
+    // create-next-app template. See:
+    // https://github.com/vercel/next.js/commit/09a385669b3757ef59065138901eb3084d35d418
+    const rootPath = link.repoRoot ?? cwd;
+    isGitIgnoreUpdated = await addToGitIgnore(rootPath, '.env*');
+  }
+
+  if (!fileChanged && !isGitIgnoreUpdated) {
+    output.stopSpinner();
+    return;
+  }
+
+  output.print('\n');
+  if (!fileChanged) {
+    printAlignedLabel('Updated', `.gitignore for ${filename}`, { gutter: '✓' });
+    return;
+  }
+  printAlignedLabel(
+    exists ? 'Updated' : 'Created',
+    `${filename} file${isGitIgnoreUpdated ? ' and added it to .gitignore' : ''}`,
+    { gutter: '✓' }
+  );
 }
 
 function escapeValue(value: string | undefined) {

@@ -1,10 +1,57 @@
-import { Builder, BuilderFunctions } from '@vercel/build-utils';
-import { Header, Route, Redirect, Rewrite } from '@vercel/routing-utils';
+import type {
+  Builder,
+  BuilderFunctions,
+  Images,
+  ProjectSettings,
+  Cron,
+  Schedule,
+  ExperimentalServices,
+  ExperimentalServiceGroups,
+  ExperimentalServicesV2,
+  Services,
+} from '@vercel/build-utils';
+import type { Header, Route, Redirect, Rewrite } from '@vercel/routing-utils';
 
 export { DeploymentEventType } from './utils';
 
+/**
+ * Minimal interface of an undici `Dispatcher` (e.g. `undici.ProxyAgent`),
+ * passed to `fetch` as the non-standard `dispatcher` init option to customize
+ * connection handling, such as routing requests through an HTTP(S) proxy.
+ */
+export interface FetchDispatcher {
+  dispatch(options: unknown, handler: unknown): boolean;
+}
+
 export interface Dictionary<T> {
   [key: string]: T;
+}
+
+export interface ProxyConfig {
+  entrypoint: string;
+  matcher?: string | string[];
+}
+
+export const VALID_ARCHIVE_FORMATS = ['tgz'] as const;
+export type ArchiveFormat = (typeof VALID_ARCHIVE_FORMATS)[number];
+
+export interface DeploymentAliasError {
+  code: string;
+  message: string;
+}
+
+export interface DeploymentAliasWarning extends DeploymentAliasError {
+  link?: string;
+  action?: string;
+}
+
+export interface DeploymentAliasAssignedEvent {
+  type: 'alias-assigned';
+  deploymentId: string;
+  date: number;
+  alias: string[];
+  aliasError: DeploymentAliasError | null;
+  aliasWarning: DeploymentAliasWarning | null;
 }
 
 export interface VercelClientOptions {
@@ -14,11 +61,32 @@ export interface VercelClientOptions {
   teamId?: string;
   apiUrl?: string;
   force?: boolean;
+  prebuilt?: boolean;
+  vercelOutputDir?: string;
+  rootDirectory?: string | null;
   withCache?: boolean;
   userAgent?: string;
   defaultName?: string;
   isDirectory?: boolean;
   skipAutoDetectionConfirmation?: boolean;
+  archive?: ArchiveFormat;
+  dispatcher?: FetchDispatcher;
+  projectName?: string;
+  /**
+   * Path to a file containing bulk redirects (relative to the project root).
+   * This file will be included in prebuilt deployments.
+   */
+  bulkRedirectsPath?: string | null;
+  /**
+   * When true, creates an experimental manual deployment. This mode requires
+   * that the user later continues the deployment with an API call.
+   */
+  manual?: boolean;
+  /**
+   * Aborted with a `DeploymentAliasAssignedEvent` when an existing deployment
+   * event stream observes alias assignment.
+   */
+  aliasAssignedSignal?: AbortSignal;
 }
 
 /** @deprecated Use VercelClientOptions instead. */
@@ -31,6 +99,7 @@ export interface Deployment {
   id: string;
   deploymentId?: string;
   url: string;
+  inspectorUrl: string;
   name: string;
   meta: Dictionary<string | number | boolean>;
   version: 2;
@@ -47,6 +116,8 @@ export interface Deployment {
     | 'BUILDING'
     | 'DEPLOYING'
     | 'READY'
+    | 'QUEUED'
+    | 'CANCELED'
     | 'ERROR';
   state?:
     | 'INITIALIZING'
@@ -54,17 +125,39 @@ export interface Deployment {
     | 'BUILDING'
     | 'DEPLOYING'
     | 'READY'
+    | 'QUEUED'
+    | 'CANCELED'
     | 'ERROR';
+  ready?: number;
   createdAt: number;
   createdIn: string;
+  buildingAt?: number;
+  creator?: {
+    uid?: string;
+    email?: string;
+    name?: string;
+    username?: string;
+  };
   env: Dictionary<string>;
   build: {
     env: Dictionary<string>;
   };
   target: string;
   alias: string[];
-  aliasAssigned: boolean;
-  aliasError: string | null;
+  aliasAssigned: boolean | number | null;
+  aliasError: string | DeploymentAliasError | null;
+  aliasWarning?: DeploymentAliasWarning | null;
+  checks?: Record<
+    string,
+    {
+      state: 'pending' | 'succeeded' | 'failed';
+      startedAt?: string;
+      completedAt?: string;
+    }
+  >;
+  expiration?: number;
+  proposedExpiration?: number;
+  undeletedAt?: number;
 }
 
 export interface DeploymentBuild {
@@ -104,7 +197,6 @@ export interface VercelConfig {
   name?: string;
   meta?: string[];
   version?: number;
-  public?: boolean;
   env?: Dictionary<string>;
   build?: {
     env?: Dictionary<string>;
@@ -122,12 +214,53 @@ export interface VercelConfig {
   scope?: string;
   alias?: string | string[];
   regions?: string[];
-  projectSettings?: {
-    devCommand?: string | null;
-    buildCommand?: string | null;
-    outputDirectory?: string | null;
-    framework?: string | null;
-  };
+  projectSettings?: ProjectSettings;
+  buildCommand?: string | null;
+  ignoreCommand?: string | null;
+  devCommand?: string | null;
+  installCommand?: string | null;
+  framework?: string | null;
+  outputDirectory?: string | null;
+  images?: Images;
+  crons?: Cron[];
+  schedules?: Schedule[];
+  bunVersion?: string;
+  proxy?: ProxyConfig;
+  /**
+   * Path to a file containing bulk redirects (relative to the project root).
+   * This file will be included in prebuilt deployments.
+   */
+  bulkRedirectsPath?: string | null;
+  /**
+   * @experimental This feature is experimental and may change.
+   */
+  experimentalServices?: ExperimentalServices;
+  /**
+   * @experimental This feature is experimental and may change.
+   */
+  experimentalServiceGroups?: ExperimentalServiceGroups;
+  /**
+   * Configures multiple services in this project.
+   */
+  services?: Services;
+  /**
+   * @deprecated Use `services` instead.
+   */
+  experimentalServicesV2?: ExperimentalServicesV2;
+}
+
+export interface GitMetadata {
+  commitAuthorName?: string | undefined;
+  commitMessage?: string | undefined;
+  commitRef?: string | undefined;
+  commitSha?: string | undefined;
+  dirty?: boolean | undefined;
+  remoteUrl?: string;
+  /**
+   * Path of the deployed directory relative to the detected git repository
+   * root. Empty string when deploying from the repository root.
+   */
+  rootDirectory?: string;
 }
 
 /**
@@ -151,11 +284,10 @@ export interface DeploymentOptions {
   source?: string;
   target?: string;
   name?: string;
-  public?: boolean;
   meta?: Dictionary<string>;
-  projectSettings?: {
-    devCommand?: string | null;
-    buildCommand?: string | null;
-    outputDirectory?: string | null;
-  };
+  projectSettings?: ProjectSettings;
+  gitMetadata?: GitMetadata;
+  actor?: string;
+  autoAssignCustomDomains?: boolean;
+  customEnvironmentSlugOrId?: string;
 }

@@ -1,19 +1,24 @@
-import { DeploymentFile } from './hashes';
-import { FetchOptions } from '@zeit/fetch';
-import { nodeFetch, zeitFetch } from './fetch';
-import { join, sep, relative } from 'path';
+import { FilesMap } from './hashes';
+import { join, sep, relative, basename, isAbsolute } from 'path';
+import { Readable } from 'stream';
 import { URL } from 'url';
 import ignore from 'ignore';
-type Ignore = ReturnType<typeof ignore>;
 import { pkgVersion } from '../pkg';
 import { NowBuildError } from '@vercel/build-utils';
-import { VercelClientOptions, DeploymentOptions, NowConfig } from '../types';
+import { FetchDispatcher, VercelClientOptions, VercelConfig } from '../types';
 import { Sema } from 'async-sema';
-import { readFile } from 'fs-extra';
-import readdir from 'recursive-readdir';
+import { pathExists, readFile, stat } from 'fs-extra';
+import readdir from './readdir-recursive';
+import {
+  findConfig as findMicrofrontendsConfig,
+  inferMicrofrontendsLocation,
+} from '@vercel/microfrontends/microfrontends/utils';
+
+type Ignore = ReturnType<typeof ignore>;
+
 const semaphore = new Sema(10);
 
-export const API_FILES = '/v2/now/files';
+export const API_FILES = '/v2/files';
 
 const EVENTS_ARRAY = [
   // File events
@@ -31,22 +36,28 @@ const EVENTS_ARRAY = [
   'notice',
   'tip',
   'canceled',
+  // v1 Checks events
+  'checks-registered',
+  'checks-completed',
+  'checks-running',
+  'checks-conclusion-succeeded',
+  'checks-conclusion-failed',
+  'checks-conclusion-skipped',
+  'checks-conclusion-canceled',
+  // v2 Checks events
+  'checks-v2-failed',
 ] as const;
 
-export type DeploymentEventType = typeof EVENTS_ARRAY[number];
+export type DeploymentEventType = (typeof EVENTS_ARRAY)[number];
 export const EVENTS = new Set(EVENTS_ARRAY);
 
-export function getApiDeploymentsUrl(
-  metadata?: Pick<DeploymentOptions, 'builds' | 'functions'>
-) {
-  if (metadata && metadata.builds && !metadata.functions) {
-    return '/v10/now/deployments';
-  }
-
-  return '/v13/now/deployments';
+export function getApiDeploymentsUrl() {
+  return '/v13/deployments';
 }
 
-export async function parseVercelConfig(filePath?: string): Promise<NowConfig> {
+export async function parseVercelConfig(
+  filePath?: string
+): Promise<VercelConfig> {
   if (!filePath) {
     return {};
   }
@@ -56,7 +67,6 @@ export async function parseVercelConfig(filePath?: string): Promise<NowConfig> {
 
     return JSON.parse(jsonString);
   } catch (e) {
-    // eslint-disable-next-line no-console
     console.error(e);
 
     return {};
@@ -66,19 +76,85 @@ export async function parseVercelConfig(filePath?: string): Promise<NowConfig> {
 const maybeRead = async function <T>(path: string, default_: T) {
   try {
     return await readFile(path, 'utf8');
-  } catch (err) {
+  } catch (_err) {
     return default_;
   }
 };
 
+/**
+ * Reads the project's `.vercelignore` / `.nowignore` file (if any) and
+ * returns an `Ignore` instance containing only the user-provided rules.
+ * Returns `null` when no ignore file is present.
+ */
+async function getUserIgnore(cwd: string): Promise<Ignore | null> {
+  const [vercelignore, nowignore] = await Promise.all([
+    maybeRead(join(cwd, '.vercelignore'), ''),
+    maybeRead(join(cwd, '.nowignore'), ''),
+  ]);
+  if (vercelignore && nowignore) {
+    throw new NowBuildError({
+      code: 'CONFLICTING_IGNORE_FILES',
+      message:
+        'Cannot use both a `.vercelignore` and `.nowignore` file. Please delete the `.nowignore` file.',
+      link: 'https://vercel.link/combining-old-and-new-config',
+    });
+  }
+  const ignoreFile = vercelignore || nowignore;
+  if (!ignoreFile) {
+    return null;
+  }
+  return ignore().add(clearRelative(ignoreFile));
+}
+
+/**
+ * Source-upload defaults that `--prebuilt` `filePathMap` may re-add even when
+ * the user also listed them in `.vercelignore`. These are dependency / framework
+ * output trees the CLI already skips on a normal deploy; NFT traces files inside
+ * them that hydrate still needs. Secrets (`.env*`), VCS, and `.vercel` are
+ * intentionally not in this list — see `getVercelIgnore`.
+ */
+const FILEPATHMAP_VERCELIGNORE_EXCEPTIONS = [
+  'node_modules',
+  '.next',
+  '.yarn/cache',
+  '.pnp*',
+  '.venv',
+  'venv',
+  '__pycache__',
+  '/target',
+];
+
+const filePathMapVercelignoreExceptions = ignore().add(
+  FILEPATHMAP_VERCELIGNORE_EXCEPTIONS.join('\n')
+);
+
+function isFilePathMapIgnoreException(posixRel: string): boolean {
+  return filePathMapVercelignoreExceptions.ignores(posixRel);
+}
+
 export async function buildFileTree(
   path: string | string[],
-  isDirectory: boolean,
+  {
+    isDirectory,
+    prebuilt,
+    vercelOutputDir,
+    rootDirectory,
+    projectName,
+    bulkRedirectsPath,
+  }: Pick<
+    VercelClientOptions,
+    | 'isDirectory'
+    | 'prebuilt'
+    | 'vercelOutputDir'
+    | 'rootDirectory'
+    | 'projectName'
+    | 'bulkRedirectsPath'
+  >,
   debug: Debug
 ): Promise<{ fileList: string[]; ignoreList: string[] }> {
   const ignoreList: string[] = [];
   let fileList: string[];
-  let { ig, ignores } = await getVercelIgnore(path);
+  let { ig, ignores } = await getVercelIgnore(path, prebuilt, vercelOutputDir);
 
   debug(`Found ${ignores.length} rules in .vercelignore`);
   debug('Building file tree...');
@@ -94,6 +170,141 @@ export async function buildFileTree(
       return ignored;
     };
     fileList = await readdir(path, [ignores]);
+
+    // Check for special files that should be included even if ignored
+    const refs = new Set<string>();
+
+    if (prebuilt) {
+      // Traverse over the `.vc-config.json` files and include
+      // the files referenced by the "filePathMap" properties
+      const vcConfigFilePaths = fileList.filter(
+        file => basename(file) === '.vc-config.json'
+      );
+      // `filePathMap` values come from the `.vercel/output` build artifact,
+      // which in split build/deploy workflows may be produced by a
+      // lower-trust job than the one running the deploy. Re-apply the
+      // project's `.vercelignore` / `.nowignore` rules and reject values
+      // that escape the deployment root, so a tampered artifact cannot
+      // re-add ignored files (e.g. `.env`) to the upload set.
+      //
+      // Exception: paths under source-upload defaults like `node_modules/`
+      // and `.next/` — users often copy those into `.vercelignore`, but
+      // they are already ignored on a normal deploy, and `--prebuilt`
+      // must still upload the NFT-traced subset. See
+      // https://github.com/vercel/vercel/issues/17386.
+      const userIg = await getUserIgnore(path);
+      await Promise.all(
+        vcConfigFilePaths.map(async p => {
+          const configJson = await readFile(p, 'utf8');
+          const config = JSON.parse(configJson);
+          if (!config.filePathMap) return;
+          for (const v of Object.values(config.filePathMap) as string[]) {
+            const absPath = join(path, v);
+            const rel = relative(path, absPath);
+            const posixRel = rel.split(sep).join('/');
+            if (rel.startsWith('..') || isAbsolute(rel)) {
+              debug(
+                `Ignoring "filePathMap" entry "${v}": resolves outside the deployment root`
+              );
+              continue;
+            }
+            if (userIg && userIg.ignores(posixRel)) {
+              if (isFilePathMapIgnoreException(posixRel)) {
+                debug(
+                  `Keeping "filePathMap" entry "${v}": matches a default-ignored dependency/output path`
+                );
+              } else {
+                debug(
+                  `Ignoring "filePathMap" entry "${v}": matched by a rule in .vercelignore/.nowignore`
+                );
+                continue;
+              }
+            }
+            refs.add(absPath);
+          }
+        })
+      );
+
+      try {
+        let microfrontendConfigPath = findMicrofrontendsConfig({
+          dir: join(path, rootDirectory || ''),
+        });
+        if (!microfrontendConfigPath && !rootDirectory && projectName) {
+          microfrontendConfigPath = findMicrofrontendsConfig({
+            dir: inferMicrofrontendsLocation({
+              repositoryRoot: path,
+              applicationName: projectName,
+            }),
+          });
+        }
+        if (microfrontendConfigPath) {
+          refs.add(microfrontendConfigPath);
+        }
+      } catch (e) {
+        debug(`Error detecting microfrontend config: ${e}`);
+      }
+    }
+
+    // Check for .vercel/routes.json and include it if it exists
+    try {
+      const routesJsonPath = join(path, '.vercel', 'routes.json');
+      const routesJsonContent = await maybeRead(routesJsonPath, null);
+      if (routesJsonContent !== null) {
+        refs.add(routesJsonPath);
+        debug('Including .vercel/routes.json in deployment');
+      }
+    } catch (e) {
+      debug(`Error checking for .vercel/routes.json: ${e}`);
+    }
+
+    // Include bulkRedirectsPath file or directory if specified (for prebuilt deployments)
+    if (prebuilt && bulkRedirectsPath) {
+      try {
+        const projectRoot = path;
+        const bulkRedirectsFullPath = join(
+          projectRoot,
+          rootDirectory || '',
+          bulkRedirectsPath
+        );
+
+        // Validate that the resolved path stays within the project root
+        const relativeFromRoot = relative(projectRoot, bulkRedirectsFullPath);
+        if (relativeFromRoot.startsWith('..')) {
+          debug(
+            `Skipping bulk redirects path "${bulkRedirectsPath}" - path traversal detected (resolves outside project root)`
+          );
+        } else {
+          try {
+            const stats = await stat(bulkRedirectsFullPath);
+            if (stats.isDirectory()) {
+              // If it's a directory, recursively include all files
+              const dirFiles = await readdir(bulkRedirectsFullPath, []);
+              for (const file of dirFiles) {
+                refs.add(file);
+              }
+              debug(
+                `Including ${dirFiles.length} files from bulk redirects directory "${bulkRedirectsPath}" in deployment`
+              );
+            } else if (stats.isFile()) {
+              // If it's a file, include it directly
+              refs.add(bulkRedirectsFullPath);
+              debug(
+                `Including bulk redirects file "${bulkRedirectsPath}" in deployment`
+              );
+            }
+          } catch (_e) {
+            debug(`Bulk redirects path "${bulkRedirectsPath}" not found`);
+          }
+        }
+      } catch (e) {
+        debug(`Error checking for bulk redirects path: ${e}`);
+      }
+    }
+
+    if (refs.size > 0) {
+      fileList = fileList.concat(Array.from(refs));
+    }
+
     debug(`Found ${fileList.length} files in the specified directory`);
   } else if (Array.isArray(path)) {
     // Array of file paths
@@ -109,61 +320,96 @@ export async function buildFileTree(
 }
 
 export async function getVercelIgnore(
-  cwd: string | string[]
+  cwd: string | string[],
+  prebuilt?: boolean,
+  vercelOutputDir?: string
 ): Promise<{ ig: Ignore; ignores: string[] }> {
-  const ignores: string[] = [
-    '.hg',
-    '.git',
-    '.gitmodules',
-    '.svn',
-    '.cache',
-    '.next',
-    '.now',
-    '.vercel',
-    '.npmignore',
-    '.dockerignore',
-    '.gitignore',
-    '.*.swp',
-    '.DS_Store',
-    '.wafpicke-*',
-    '.lock-wscript',
-    '.env.local',
-    '.env.*.local',
-    '.venv',
-    'npm-debug.log',
-    'config.gypi',
-    'node_modules',
-    '__pycache__',
-    'venv',
-    'CVS',
-    '.vercel_build_output',
-  ];
+  const ig = ignore();
+  let ignores: string[];
 
-  const cwds = Array.isArray(cwd) ? cwd : [cwd];
+  if (prebuilt) {
+    if (typeof vercelOutputDir !== 'string') {
+      throw new Error(
+        `Missing required \`vercelOutputDir\` parameter when "prebuilt" is true`
+      );
+    }
+    if (typeof cwd !== 'string') {
+      throw new Error(`\`cwd\` must be a "string"`);
+    }
+    const relOutputDir = relative(cwd, vercelOutputDir);
+    // Root-anchor negations: ignore@4 caches regexes by pattern string without
+    // the negation flag, so an unanchored `!.vercel` collides with a positive
+    // `.vercel` compiled earlier and re-includes files meant to stay local.
+    ignores = ['*'];
+    const parts = relOutputDir.split(sep);
+    parts.forEach((_, i) => {
+      const level = parts.slice(0, i + 1).join('/');
+      ignores.push(`!/${level}`);
+    });
+    ignores.push(`!/${parts.join('/')}/**`);
+    ig.add(ignores.join('\n'));
+  } else {
+    ignores = [
+      '.hg',
+      '.git',
+      '.gitmodules',
+      '.svn',
+      '.cache',
+      '.next',
+      '.now',
+      '.vercel',
+      '.npmignore',
+      '.dockerignore',
+      '.gitignore',
+      '.*.swp',
+      '.DS_Store',
+      '.wafpicke-*',
+      '.lock-wscript',
+      '.env.local',
+      '.env.*.local',
+      '.venv',
+      '.yarn/cache',
+      '.pnp*',
+      'npm-debug.log',
+      'config.gypi',
+      'node_modules',
+      '__pycache__',
+      'venv',
+      'CVS',
+    ];
 
-  const files = await Promise.all(
-    cwds.map(async cwd => {
-      const [vercelignore, nowignore] = await Promise.all([
-        maybeRead(join(cwd, '.vercelignore'), ''),
-        maybeRead(join(cwd, '.nowignore'), ''),
-      ]);
-      if (vercelignore && nowignore) {
-        throw new NowBuildError({
-          code: 'CONFLICTING_IGNORE_FILES',
-          message:
-            'Cannot use both a `.vercelignore` and `.nowignore` file. Please delete the `.nowignore` file.',
-          link: 'https://vercel.link/combining-old-and-new-config',
-        });
-      }
-      return vercelignore || nowignore;
-    })
-  );
+    const cwds = Array.isArray(cwd) ? cwd : [cwd];
 
-  const ignoreFile = files.join('\n');
+    const files = await Promise.all(
+      cwds.map(async cwd => {
+        const [vercelignore, nowignore] = await Promise.all([
+          maybeRead(join(cwd, '.vercelignore'), ''),
+          maybeRead(join(cwd, '.nowignore'), ''),
+        ]);
+        if (vercelignore && nowignore) {
+          throw new NowBuildError({
+            code: 'CONFLICTING_IGNORE_FILES',
+            message:
+              'Cannot use both a `.vercelignore` and `.nowignore` file. Please delete the `.nowignore` file.',
+            link: 'https://vercel.link/combining-old-and-new-config',
+          });
+        }
+        return vercelignore || nowignore;
+      })
+    );
 
-  const ig = ignore().add(
-    `${ignores.join('\n')}\n${clearRelative(ignoreFile)}`
-  );
+    const isRustProject = (
+      await Promise.all(cwds.map(cwd => pathExists(join(cwd, 'Cargo.toml'))))
+    ).some(Boolean);
+
+    if (isRustProject) {
+      ignores.push('/target');
+    }
+
+    const ignoreFile = files.join('\n');
+
+    ig.add(`${ignores.join('\n')}\n${clearRelative(ignoreFile)}`);
+  }
 
   return { ig, ignores };
 }
@@ -176,20 +422,24 @@ function clearRelative(str: string) {
   return str.replace(/(\n|^)\.\//g, '$1');
 }
 
-interface FetchOpts extends FetchOptions {
+type NativeRequestInit = NonNullable<Parameters<typeof globalThis.fetch>[1]>;
+
+interface FetchOpts
+  extends Omit<NativeRequestInit, 'body' | 'headers' | 'dispatcher'> {
   apiUrl?: string;
   method?: string;
   teamId?: string;
   headers?: { [key: string]: any };
   userAgent?: string;
+  body?: NonNullable<NativeRequestInit['body']> | Buffer | Readable;
+  dispatcher?: FetchDispatcher;
 }
 
-export const fetch = async (
+export const fetchApi = async (
   url: string,
   token: string,
   opts: FetchOpts = {},
-  debugEnabled?: boolean,
-  useNodeFetch?: boolean
+  debugEnabled?: boolean
 ): Promise<any> => {
   semaphore.acquire();
   const debug = createDebug(debugEnabled);
@@ -197,6 +447,12 @@ export const fetch = async (
 
   url = `${opts.apiUrl || 'https://api.vercel.com'}${url}`;
   delete opts.apiUrl;
+
+  const { VERCEL_TEAM_ID } = process.env;
+
+  if (VERCEL_TEAM_ID) {
+    url += `${url.includes('?') ? '&' : '?'}teamId=${VERCEL_TEAM_ID}`;
+  }
 
   if (opts.teamId) {
     const parsedUrl = new URL(url);
@@ -215,63 +471,113 @@ export const fetch = async (
     'user-agent': userAgent,
   };
 
+  if (opts.body instanceof Readable) {
+    // Node.js streams must be sent with half duplex, since the request
+    // body length is not known upfront.
+    (opts as { duplex?: 'half' }).duplex = 'half';
+  }
+
   debug(`${opts.method || 'GET'} ${url}`);
   time = Date.now();
-  const res = useNodeFetch
-    ? await nodeFetch(url, opts)
-    : await zeitFetch(url, opts);
-  debug(`DONE in ${Date.now() - time}ms: ${opts.method || 'GET'} ${url}`);
-  semaphore.release();
-
-  return res;
+  try {
+    const res = await fetch(url, opts as unknown as NativeRequestInit);
+    debug(`DONE in ${Date.now() - time}ms: ${opts.method || 'GET'} ${url}`);
+    return res;
+  } finally {
+    semaphore.release();
+  }
 };
 
 export interface PreparedFile {
   file: string;
-  sha: string;
-  size: number;
+  sha?: string;
+  size?: number;
   mode: number;
+  data?: string;
+  encoding?: 'base64';
 }
 
 const isWin = process.platform.includes('win');
 
+const INLINE_STATIC_EXTENSIONS = ['.html', '.htm', '.md'];
+const MAX_INLINE_FILES = 10;
+const MAX_INLINE_TOTAL_BYTES = 5 * 1024 * 1024; // 5MB
+const S_IFREG = 0o100000;
+const S_IFMT = 0o170000;
+
+/**
+ * Small all-static file sets are sent inline in the deployment creation
+ * request instead of as SHA references. This lets the API take its instant
+ * static fast path (deployment is READY in the create response, no build) —
+ * eligibility is decided entirely server-side, and ineligible deployments
+ * fall back to the regular build flow with no behavior change.
+ */
+export function shouldInlineStaticFiles(files: FilesMap): boolean {
+  let count = 0;
+  let totalBytes = 0;
+  for (const file of files.values()) {
+    if ((file.mode & S_IFMT) !== S_IFREG) return false;
+    // Large files are streamed from disk and have no in-memory data
+    if (!file.data) return false;
+    for (const name of file.names) {
+      const lower = name.toLowerCase();
+      if (!INLINE_STATIC_EXTENSIONS.some(ext => lower.endsWith(ext))) {
+        return false;
+      }
+      count += 1;
+      totalBytes += file.data.byteLength;
+    }
+  }
+  return (
+    count > 0 &&
+    count <= MAX_INLINE_FILES &&
+    totalBytes <= MAX_INLINE_TOTAL_BYTES
+  );
+}
+
 export const prepareFiles = (
-  files: Map<string, DeploymentFile>,
+  files: FilesMap,
   clientOptions: VercelClientOptions
 ): PreparedFile[] => {
-  const preparedFiles = [...files.keys()].reduce(
-    (acc: PreparedFile[], sha: string): PreparedFile[] => {
-      const next = [...acc];
+  const preparedFiles: PreparedFile[] = [];
+  const inlineStaticFiles = shouldInlineStaticFiles(files);
+  for (const [sha, file] of files) {
+    for (const name of file.names) {
+      let fileName: string;
 
-      const file = files.get(sha) as DeploymentFile;
-
-      for (const name of file.names) {
-        let fileName: string;
-
-        if (clientOptions.isDirectory) {
-          // Directory
-          fileName =
-            typeof clientOptions.path === 'string'
-              ? relative(clientOptions.path, name)
-              : name;
-        } else {
-          // Array of files or single file
-          const segments = name.split(sep);
-          fileName = segments[segments.length - 1];
-        }
-
-        next.push({
-          file: isWin ? fileName.replace(/\\/g, '/') : fileName,
-          size: file.data.byteLength || file.data.length,
-          mode: file.mode,
-          sha,
-        });
+      if (clientOptions.isDirectory) {
+        // Directory
+        fileName =
+          typeof clientOptions.path === 'string'
+            ? relative(clientOptions.path, name)
+            : name;
+      } else {
+        // Array of files or single file
+        const segments = name.split(sep);
+        fileName = segments[segments.length - 1];
       }
 
-      return next;
-    },
-    []
-  );
+      const normalizedName = isWin ? fileName.replace(/\\/g, '/') : fileName;
+
+      if (inlineStaticFiles && file.data) {
+        // The InlinedFile API schema rejects `sha` and `size`
+        preparedFiles.push({
+          file: normalizedName,
+          data: file.data.toString('base64'),
+          encoding: 'base64',
+          mode: file.mode,
+        });
+        continue;
+      }
+
+      preparedFiles.push({
+        file: normalizedName,
+        size: file.data?.byteLength ?? file.size,
+        mode: file.mode,
+        sha: sha || undefined,
+      });
+    }
+  }
 
   return preparedFiles;
 };
@@ -287,4 +593,4 @@ export function createDebug(debug?: boolean) {
 
   return () => {};
 }
-type Debug = ReturnType<typeof createDebug>;
+export type Debug = ReturnType<typeof createDebug>;

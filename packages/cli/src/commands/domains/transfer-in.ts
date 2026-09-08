@@ -1,40 +1,41 @@
 import chalk from 'chalk';
-
 import * as ERRORS from '../../util/errors-ts';
-import Client from '../../util/client';
+import type Client from '../../util/client';
 import getScope from '../../util/get-scope';
 import param from '../../util/output/param';
 import transferInDomain from '../../util/domains/transfer-in-domain';
 import stamp from '../../util/output/stamp';
 import getAuthCode from '../../util/domains/get-auth-code';
 import getDomainPrice from '../../util/domains/get-domain-price';
-import checkTransfer from '../../util/domains/check-transfer';
-import promptBool from '../../util/input/prompt-bool';
 import isRootDomain from '../../util/is-root-domain';
 import { getCommandName } from '../../util/pkg-name';
+import { DomainsTransferInTelemetryClient } from '../../util/telemetry/commands/domains/transfer-in';
+import output from '../../output-manager';
+import { transferInSubcommand } from './command';
+import { parseArguments } from '../../util/get-args';
+import { getFlagsSpecification } from '../../util/get-flags-specification';
+import { printError } from '../../util/error';
 
-type Options = {
-  '--code': string;
-};
+export default async function transferIn(client: Client, argv: string[]) {
+  const telemetry = new DomainsTransferInTelemetryClient({
+    opts: {
+      store: client.telemetryEventStore,
+    },
+  });
 
-export default async function transferIn(
-  client: Client,
-  opts: Partial<Options>,
-  args: string[]
-) {
-  const { output } = client;
-  let contextName = null;
-
+  let parsedArgs;
+  const flagsSpecification = getFlagsSpecification(
+    transferInSubcommand.options
+  );
   try {
-    ({ contextName } = await getScope(client));
-  } catch (err) {
-    if (err.code === 'NOT_AUTHORIZED' || err.code === 'TEAM_DELETED') {
-      output.error(err.message);
-      return 1;
-    }
-
-    throw err;
+    parsedArgs = parseArguments(argv, flagsSpecification);
+  } catch (error) {
+    printError(error);
+    return 1;
   }
+  const { args, flags: opts } = parsedArgs;
+
+  telemetry.trackCliOptionCode(opts['--code']);
 
   const [domainName] = args;
   if (!domainName) {
@@ -43,6 +44,8 @@ export default async function transferIn(
     );
     return 1;
   }
+
+  telemetry.trackCliArgumentDomain(domainName);
 
   if (!isRootDomain(domainName)) {
     output.error(
@@ -54,35 +57,33 @@ export default async function transferIn(
   }
 
   const availableStamp = stamp();
-  const [domainPrice, { transferable, transferPolicy }] = await Promise.all([
-    getDomainPrice(client, domainName, 'renewal'),
-    checkTransfer(client, domainName),
-  ]);
+  const domainPrice = await getDomainPrice(client, domainName);
 
   if (domainPrice instanceof Error) {
     output.prettyError(domainPrice);
     return 1;
   }
 
-  if (!transferable) {
+  const { transferPrice, years } = domainPrice;
+  if (transferPrice === null) {
     output.error(`The domain ${param(domainName)} is not transferable.`);
     return 1;
   }
 
-  const { price } = domainPrice;
+  const { contextName } = await getScope(client);
   output.log(
     `The domain ${param(domainName)} is ${chalk.underline(
       'available'
     )} to transfer under ${chalk.bold(contextName)}! ${availableStamp()}`
   );
 
-  const authCode = await getAuthCode(opts['--code']);
+  const authCode = await getAuthCode(client, opts['--code']);
 
-  const shouldTransfer = await promptBool(
-    transferPolicy === 'no-change'
-      ? `Transfer now for ${chalk.bold(`$${price}`)}?`
-      : `Transfer now with 1yr renewal for ${chalk.bold(`$${price}`)}?`
+  const shouldTransfer = await client.input.confirm(
+    `Transfer now with 1yr renewal for ${chalk.bold(`$${transferPrice}`)}?`,
+    false
   );
+
   if (!shouldTransfer) {
     return 0;
   }
@@ -94,7 +95,8 @@ export default async function transferIn(
     client,
     domainName,
     authCode,
-    price
+    transferPrice,
+    years
   );
 
   if (transferInResult instanceof ERRORS.InvalidDomain) {
@@ -102,41 +104,32 @@ export default async function transferIn(
     return 1;
   }
 
-  if (
-    transferInResult instanceof ERRORS.DomainNotAvailable ||
-    transferInResult instanceof ERRORS.DomainNotTransferable
-  ) {
+  if (transferInResult instanceof ERRORS.DomainNotAvailable) {
     output.error(
       `The domain "${transferInResult.meta.domain}" is not transferable.`
     );
     return 1;
   }
 
-  if (transferInResult instanceof ERRORS.InvalidTransferAuthCode) {
+  if (transferInResult instanceof ERRORS.UnsupportedTLD) {
     output.error(
-      `The provided auth code does not match with the one expected by the current registar`
+      `The TLD for domain name ${transferInResult.meta.domain} is not supported.`
     );
     return 1;
   }
 
-  if (transferInResult instanceof ERRORS.SourceNotFound) {
-    output.error(
-      `Could not purchase domain. Please add a payment method using ${getCommandName(
-        `billing add`
-      )}.`
-    );
+  if (transferInResult instanceof ERRORS.DomainPaymentError) {
+    output.error(`Your card was declined.`);
     return 1;
   }
 
-  if (transferInResult instanceof ERRORS.DomainRegistrationFailed) {
-    output.error(`Could not transfer domain. ${transferInResult.message}`);
+  if (transferInResult instanceof ERRORS.UnexpectedDomainTransferError) {
+    output.error(`An unexpected error happened while initiating the transfer.`);
     return 1;
   }
 
-  console.log(
-    `${chalk.cyan('> Success!')} Domain ${param(
-      domainName
-    )} transfer started ${transferStamp()}`
+  output.success(
+    `Domain ${param(domainName)} transfer started ${transferStamp()}`
   );
   output.print(
     `  To finalize the transfer, we are waiting for approval from your current registrar.\n`

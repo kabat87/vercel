@@ -1,0 +1,1491 @@
+import minimatch from 'minimatch';
+import { valid as validSemver } from 'semver';
+import { parse as parsePath, extname, join } from 'path';
+import type { Route, RouteWithSrc } from '@vercel/routing-utils';
+import { frameworkList, type Framework } from '@vercel/frameworks';
+import type {
+  PackageJson,
+  Builder,
+  Config,
+  BuilderFunctions,
+  ProjectSettings,
+} from '@vercel/build-utils';
+import { isOfficialRuntime } from './is-official-runtime';
+import {
+  isNodeEntrypoint,
+  BACKEND_BUILDERS,
+  UNIFIED_BACKEND_BUILDER,
+  isExperimentalBackendsEnabled,
+  getMaxDurationLimit,
+} from '@vercel/build-utils';
+import { isPythonEntrypoint } from './python';
+
+/**
+ * Pattern for finding all supported middleware files.
+ */
+export const REGEX_MIDDLEWARE_FILES = 'middleware.[jt]s';
+
+/**
+ * Pattern for files that the Vercel platform cares about separately from frameworks.
+ * These files are excluded from static file serving.
+ */
+const VERCEL_PLATFORM_FILES = [
+  'api/**',
+  'node_modules/**',
+  REGEX_MIDDLEWARE_FILES,
+  'package.json',
+  'package-lock.json',
+  'yarn.lock',
+  'pnpm-lock.yaml',
+  'bun.lock',
+  'bun.lockb',
+  '.gitignore',
+  'README.md',
+];
+
+export const REGEX_VERCEL_PLATFORM_FILES = VERCEL_PLATFORM_FILES.join(',');
+
+function escapeMinimatchPath(path: string): string {
+  return path.replace(/([\\,*?[\]{}()!+@])/g, '\\$1');
+}
+
+function getStaticFilesPattern(additionalExclusions: string[] = []): string {
+  return `!{${[
+    ...VERCEL_PLATFORM_FILES,
+    ...additionalExclusions.map(escapeMinimatchPath),
+  ].join(',')}}`;
+}
+
+/**
+ * Pattern for non-Vercel platform files.
+ */
+export const REGEX_NON_VERCEL_PLATFORM_FILES = getStaticFilesPattern();
+
+const slugToFramework = new Map<string | null, Framework>(
+  frameworkList.map(f => [f.slug, f])
+);
+
+/**
+ * Maps each builder name to the frameworks it handles.
+ */
+export const builderToFrameworks: ReadonlyMap<string, readonly Framework[]> =
+  (() => {
+    const map = new Map<string, Framework[]>();
+    for (const f of frameworkList) {
+      if (!f.useRuntime?.use) continue;
+      const builder = f.useRuntime.use;
+      const entry = map.get(builder);
+      if (entry) {
+        entry.push(f);
+      } else {
+        map.set(builder, [f]);
+      }
+    }
+    return map;
+  })();
+
+export interface ErrorResponse {
+  code: string;
+  message: string;
+  action?: string;
+  link?: string;
+}
+
+export interface ProxyConfig {
+  entrypoint: string;
+  matcher?: string | string[];
+}
+
+export interface Options {
+  tag?: string;
+  functions?: BuilderFunctions;
+  ignoreBuildScript?: boolean;
+  projectSettings?: ProjectSettings;
+  cleanUrls?: boolean;
+  trailingSlash?: boolean;
+  featHandleMiss?: boolean;
+  bunVersion?: string;
+  workPath?: string;
+  proxy?: ProxyConfig;
+}
+
+// We need to sort the file paths by alphabet to make
+// sure the routes stay in the same order e.g. for deduping
+export function sortFiles(fileA: string, fileB: string) {
+  return fileA.localeCompare(fileB);
+}
+
+export function detectApiExtensions(builders: Builder[]): Set<string> {
+  return new Set<string>(
+    builders
+      .filter((b): b is Builder & { src: string } =>
+        Boolean(b.config && b.config.zeroConfig && b.src?.startsWith('api/'))
+      )
+      .map(b => extname(b.src))
+      .filter(Boolean)
+  );
+}
+
+export function detectApiDirectory(builders: Builder[]): string | null {
+  // TODO: We eventually want to save the api directory to
+  // builder.config.apiDirectory so it is only detected once
+  const found = builders.some(
+    b => b.config && b.config.zeroConfig && b.src?.startsWith('api/')
+  );
+  return found ? 'api' : null;
+}
+
+// TODO: Replace this function with `config.outputDirectory`
+function getPublicBuilder(
+  builders: Builder[]
+): (Builder & { src: string }) | null {
+  for (const builder of builders) {
+    if (
+      typeof builder.src === 'string' &&
+      isOfficialRuntime('static', builder.use) &&
+      /^.*\/\*\*\/\*$/.test(builder.src) &&
+      builder.config?.zeroConfig === true
+    ) {
+      return builder as Builder & { src: string };
+    }
+  }
+
+  return null;
+}
+export function detectOutputDirectory(builders: Builder[]): string | null {
+  // TODO: We eventually want to save the output directory to
+  // builder.config.outputDirectory so it is only detected once
+  const publicBuilder = getPublicBuilder(builders);
+  return publicBuilder ? publicBuilder.src.replace('/**/*', '') : null;
+}
+
+export async function detectBuilders(
+  files: string[],
+  pkg?: PackageJson | undefined | null,
+  options: Options = {}
+): Promise<{
+  builders: Builder[] | null;
+  errors: ErrorResponse[] | null;
+  warnings: ErrorResponse[];
+  defaultRoutes: Route[] | null;
+  redirectRoutes: Route[] | null;
+  rewriteRoutes: Route[] | null;
+  errorRoutes: Route[] | null;
+}> {
+  const { projectSettings = {} } = options;
+  const { framework } = projectSettings;
+  const proxyError = validateProxy(options, files, framework);
+  if (proxyError) {
+    return {
+      builders: null,
+      errors: [proxyError],
+      warnings: [],
+      defaultRoutes: null,
+      redirectRoutes: null,
+      rewriteRoutes: null,
+      errorRoutes: null,
+    };
+  }
+
+  const errors: ErrorResponse[] = [];
+  const warnings: ErrorResponse[] = [];
+
+  let apiBuilders: Builder[] = [];
+  let frontendBuilder: Builder | null = null;
+
+  const functionError = validateFunctions(options);
+
+  if (functionError) {
+    return {
+      builders: null,
+      errors: [functionError],
+      warnings,
+      defaultRoutes: null,
+      redirectRoutes: null,
+      rewriteRoutes: null,
+      errorRoutes: null,
+    };
+  }
+
+  const sortedFiles = files.sort(sortFiles);
+  const apiSortedFiles = files.sort(sortFilesBySegmentCount);
+
+  // Keep track of functions that are used
+  const usedFunctions = new Set<string>();
+
+  const addToUsedFunctions = (builder: Builder) => {
+    const key = Object.keys(builder.config!.functions || {})[0];
+    if (key) usedFunctions.add(key);
+  };
+
+  const absolutePathCache = new Map<string, string>();
+
+  const { buildCommand, outputDirectory } = projectSettings;
+  const frameworkConfig = slugToFramework.get(framework || '');
+  // Rust static output keeps `api/**/*.rs` runtimes enabled.
+  const rustStaticOutput = isRustStaticOutput(framework, projectSettings);
+  const ignoreRuntimes = new Set<string>(
+    rustStaticOutput ? undefined : frameworkConfig?.ignoreRuntimes
+  );
+  const withTag = options.tag ? `@${options.tag}` : '';
+  const apiMatches = getApiMatches()
+    .filter(
+      b =>
+        // Root-level middleware is enabled, unless `disableRootMiddleware: true`
+        (b.config?.middleware && !frameworkConfig?.disableRootMiddleware) ||
+        // "api" dir runtimes are enabled, unless opted-out via `ignoreRuntimes`
+        !ignoreRuntimes.has(b.use)
+    )
+    .map(b => {
+      b.use = `${b.use}${withTag}`;
+      return b;
+    });
+
+  // If either is missing we'll make the frontend static
+  const makeFrontendStatic = buildCommand === '' || outputDirectory === '';
+
+  // Only used when there is no frontend builder,
+  // but prevents looping over the files again.
+  const usedOutputDirectory = outputDirectory || 'public';
+  let hasUsedOutputDirectory = false;
+  let hasNoneApiFiles = false;
+  let hasNextApiFiles = false;
+
+  let fallbackEntrypoint: string | null = null;
+
+  const apiRoutes: RouteWithSrc[] = [];
+  const dynamicRoutes: RouteWithSrc[] = [];
+
+  // API
+  for (const fileName of sortedFiles) {
+    // The proxy entrypoint is built by the explicitly configured proxy
+    // builder below, not by file-convention detection.
+    if (fileName === options.proxy?.entrypoint) {
+      continue;
+    }
+
+    const apiBuilder = await maybeGetApiBuilder(fileName, apiMatches, options);
+
+    if (apiBuilder) {
+      const { routeError, apiRoute, isDynamic } = getApiRoute(
+        fileName,
+        apiSortedFiles,
+        options,
+        absolutePathCache
+      );
+
+      if (routeError) {
+        return {
+          builders: null,
+          errors: [routeError],
+          warnings,
+          defaultRoutes: null,
+          redirectRoutes: null,
+          rewriteRoutes: null,
+          errorRoutes: null,
+        };
+      }
+
+      if (apiRoute) {
+        apiRoutes.push(apiRoute);
+        if (isDynamic) {
+          dynamicRoutes.push(apiRoute);
+        }
+      }
+
+      addToUsedFunctions(apiBuilder);
+      apiBuilders.push(apiBuilder);
+      continue;
+    }
+
+    if (
+      !hasUsedOutputDirectory &&
+      fileName.startsWith(`${usedOutputDirectory}/`)
+    ) {
+      hasUsedOutputDirectory = true;
+    }
+
+    if (
+      !hasNoneApiFiles &&
+      !fileName.startsWith('api/') &&
+      fileName !== 'package.json'
+    ) {
+      hasNoneApiFiles = true;
+    }
+
+    if (
+      !hasNextApiFiles &&
+      (fileName.startsWith('pages/api') || fileName.startsWith('src/pages/api'))
+    ) {
+      hasNextApiFiles = true;
+    }
+
+    if (
+      !fallbackEntrypoint &&
+      buildCommand &&
+      !fileName.includes('/') &&
+      fileName !== 'now.json' &&
+      fileName !== 'vercel.json' &&
+      fileName !== 'vercel.toml'
+    ) {
+      fallbackEntrypoint = fileName;
+    }
+  }
+
+  if (options.proxy) {
+    const proxyBuilder = getProxyBuilder(
+      options.proxy,
+      options.tag,
+      options.functions
+    );
+    addToUsedFunctions(proxyBuilder);
+    apiBuilders.unshift(proxyBuilder);
+  }
+
+  const rustStaticPrebuilt = rustStaticOutput && !pkg && !buildCommand;
+
+  if (
+    !makeFrontendStatic &&
+    !rustStaticPrebuilt &&
+    (hasBuildScript(pkg) || buildCommand || framework)
+  ) {
+    // Framework or Build
+    frontendBuilder = detectFrontBuilder(
+      pkg,
+      files,
+      usedFunctions,
+      fallbackEntrypoint,
+      options
+    );
+  } else {
+    if (
+      pkg &&
+      !makeFrontendStatic &&
+      !apiBuilders.length &&
+      !options.ignoreBuildScript
+    ) {
+      // We only show this error when there are no api builders
+      // since the dependencies of the pkg could be used for those
+      errors.push(getMissingBuildScriptError());
+      return {
+        errors,
+        warnings,
+        builders: null,
+        redirectRoutes: null,
+        defaultRoutes: null,
+        rewriteRoutes: null,
+        errorRoutes: null,
+      };
+    }
+
+    // If `outputDirectory` is an empty string,
+    // we'll default to the root directory.
+    if (hasUsedOutputDirectory && outputDirectory !== '') {
+      frontendBuilder = {
+        use: '@vercel/static',
+        src: `${usedOutputDirectory}/**/*`,
+        config: {
+          zeroConfig: true,
+          outputDirectory: usedOutputDirectory,
+        },
+      };
+    } else if (apiBuilders.length && hasNoneApiFiles) {
+      // Everything besides the api directory
+      // and package.json can be served as static files
+      frontendBuilder = {
+        use: '@vercel/static',
+        src: getStaticFilesPattern(
+          options.proxy ? [options.proxy.entrypoint] : []
+        ),
+        config: {
+          zeroConfig: true,
+        },
+      };
+    }
+  }
+
+  if (
+    options.proxy &&
+    frontendBuilder &&
+    isOfficialRuntime('next', frontendBuilder.use)
+  ) {
+    return {
+      builders: null,
+      errors: [
+        {
+          code: 'proxy_framework_conflict',
+          message:
+            'The `proxy` property cannot be used with Next.js because the framework builds its own routing middleware.',
+        },
+      ],
+      warnings,
+      defaultRoutes: null,
+      redirectRoutes: null,
+      rewriteRoutes: null,
+      errorRoutes: null,
+    };
+  }
+
+  const unusedFunctionError = checkUnusedFunctions(
+    frontendBuilder,
+    usedFunctions,
+    options
+  );
+
+  if (unusedFunctionError) {
+    return {
+      builders: null,
+      errors: [unusedFunctionError],
+      warnings,
+      redirectRoutes: null,
+      defaultRoutes: null,
+      rewriteRoutes: null,
+      errorRoutes: null,
+    };
+  }
+
+  // Exclude the middleware builder for Next.js apps since @vercel/next
+  // will build middlewares.
+  //
+  // While maybeGetApiBuilder() excludes the middleware builder, however,
+  // we need to check if it's a Next.js app here again for the case where
+  // `projectSettings.framework == null`.
+  if (
+    framework === null &&
+    frontendBuilder?.use === '@vercel/next' &&
+    apiBuilders.length > 0
+  ) {
+    apiBuilders = apiBuilders.filter(builder => {
+      const isMiddlewareBuilder =
+        builder.use === '@vercel/node' && builder.config?.middleware;
+      return !isMiddlewareBuilder;
+    });
+  }
+
+  const builders: Builder[] = [];
+
+  if (apiBuilders.length) {
+    builders.push(...apiBuilders);
+  }
+
+  if (frontendBuilder) {
+    // Add @vercel/static build for public files for server-based frameworks
+    // so that files in `public/` are served from the root path, e.g. `/logo.svg`.
+    // This applies to Express, Hono, Go, Python, and experimental backends.
+    if (
+      isOfficialRuntime('express', frontendBuilder?.use) ||
+      isOfficialRuntime('hono', frontendBuilder?.use) ||
+      isOfficialRuntime('python', frontendBuilder?.use) ||
+      isOfficialRuntime('go', frontendBuilder?.use) ||
+      isOfficialRuntime('backends', frontendBuilder?.use)
+    ) {
+      builders.push({
+        src: 'public/**/*',
+        use: '@vercel/static',
+        config: {
+          zeroConfig: true,
+          outputDirectory: 'public',
+        },
+      });
+    }
+    builders.push(frontendBuilder);
+
+    if (
+      hasNextApiFiles &&
+      apiBuilders.some(b => isOfficialRuntime('node', b.use))
+    ) {
+      warnings.push({
+        code: 'conflicting_files',
+        message:
+          'When using Next.js, it is recommended to place JavaScript Functions inside of the `pages/api` (provided by Next.js) directory instead of `api` (provided by Vercel). Other languages (Python, Go, etc) should still go in the `api` directory.',
+        link: 'https://nextjs.org/docs/api-routes/introduction',
+        action: 'Learn More',
+      });
+    }
+  }
+
+  const routesResult = getRouteResult(
+    apiRoutes,
+    dynamicRoutes,
+    usedOutputDirectory,
+    apiBuilders,
+    frontendBuilder,
+    options
+  );
+
+  return {
+    warnings,
+    builders: builders.length ? builders : null,
+    errors: errors.length ? errors : null,
+    redirectRoutes: routesResult.redirectRoutes,
+    defaultRoutes: routesResult.defaultRoutes,
+    rewriteRoutes: routesResult.rewriteRoutes,
+    errorRoutes: routesResult.errorRoutes,
+  };
+}
+
+async function maybeGetApiBuilder(
+  fileName: string,
+  apiMatches: Builder[],
+  options: Options
+): Promise<Builder | null> {
+  // Root-level Middleware files are superseded by an explicitly
+  // configured proxy entrypoint.
+  const middleware =
+    !options.proxy &&
+    (fileName === 'middleware.js' || fileName === 'middleware.ts');
+
+  // Root-level Middleware file is handled by `@vercel/next`, so don't
+  // schedule a separate Builder when "nextjs" framework is selected
+  if (middleware && options.projectSettings?.framework === 'nextjs') {
+    return null;
+  }
+
+  if (!(fileName.startsWith('api/') || middleware)) {
+    return null;
+  }
+
+  if (fileName.includes('/.')) {
+    return null;
+  }
+
+  if (fileName.includes('/_')) {
+    return null;
+  }
+
+  if (fileName.includes('/node_modules/')) {
+    return null;
+  }
+
+  if (fileName.endsWith('.d.ts')) {
+    return null;
+  }
+
+  // For Python files, verify they are valid entrypoints before creating a builder
+  if (fileName.endsWith('.py') && options.workPath) {
+    const fsPath = join(options.workPath, fileName);
+    const isEntrypoint = await isPythonEntrypoint(fsPath);
+    if (!isEntrypoint) {
+      return null;
+    }
+  }
+
+  // For Node.js files under api/, verify they are valid entrypoints before
+  // creating a builder. This only applies to api/ files — root-level platform
+  // files (middleware.js, proxy.js, etc.) use different export signatures and
+  // must not be filtered by API handler pattern detection.
+  const nodeExtensions = ['.js', '.mjs', '.ts', '.tsx'];
+  if (
+    fileName.startsWith('api/') &&
+    process.env.VERCEL_NODE_FILTER_ENTRYPOINTS === '1' &&
+    nodeExtensions.some(ext => fileName.endsWith(ext)) &&
+    options.workPath
+  ) {
+    const fsPath = join(options.workPath, fileName);
+    const isEntrypoint = await isNodeEntrypoint({ fsPath });
+    if (!isEntrypoint) {
+      return null;
+    }
+  }
+
+  const match = apiMatches.find(({ src = '**' }) => {
+    return src === fileName || minimatch(fileName, src);
+  });
+
+  const { fnPattern, func } = getFunction(fileName, options);
+
+  const use = func?.runtime || match?.use;
+
+  if (!use) {
+    return null;
+  }
+
+  const config: Config = { zeroConfig: true };
+
+  if (middleware) {
+    config.middleware = true;
+  }
+
+  if (fnPattern && func) {
+    config.functions = { [fnPattern]: func };
+
+    if (func.includeFiles) {
+      config.includeFiles = func.includeFiles;
+    }
+
+    if (func.excludeFiles) {
+      config.excludeFiles = func.excludeFiles;
+    }
+  }
+
+  if (options.bunVersion) {
+    config.bunVersion = options.bunVersion;
+  }
+
+  const builder: Builder = {
+    use,
+    src: fileName,
+    config,
+  };
+
+  return builder;
+}
+
+function getFunction(fileName: string, { functions = {} }: Options) {
+  const keys = Object.keys(functions);
+
+  if (!keys.length) {
+    return { fnPattern: null, func: null };
+  }
+
+  const func = keys.find(key => key === fileName || minimatch(fileName, key));
+
+  return func
+    ? { fnPattern: func, func: functions[func] }
+    : { fnPattern: null, func: null };
+}
+
+export function getProxyBuilder(
+  proxy: ProxyConfig,
+  tag?: string,
+  functions: BuilderFunctions = {}
+): Builder {
+  const { fnPattern, func } = getFunction(proxy.entrypoint, { functions });
+  const runtime = func?.runtime;
+  const config: Config = {
+    zeroConfig: true,
+    middleware: true,
+    ...(!runtime ? { middlewareRuntime: 'nodejs' as const } : {}),
+    ...(proxy.matcher ? { middlewareMatcher: proxy.matcher } : {}),
+  };
+
+  if (fnPattern && func) {
+    config.functions = { [fnPattern]: func };
+
+    if (func.includeFiles) {
+      config.includeFiles = func.includeFiles;
+    }
+
+    if (func.excludeFiles) {
+      config.excludeFiles = func.excludeFiles;
+    }
+  }
+
+  return {
+    src: proxy.entrypoint,
+    use: runtime || `@vercel/node${tag ? `@${tag}` : ''}`,
+    config,
+  };
+}
+
+function getApiMatches(): Builder[] {
+  const config = { zeroConfig: true };
+
+  return [
+    {
+      src: REGEX_MIDDLEWARE_FILES,
+      use: `@vercel/node`,
+      config: { ...config, middleware: true },
+    },
+    { src: 'api/**/*.+(js|mjs|ts|tsx)', use: `@vercel/node`, config },
+    { src: 'api/**/!(*_test).go', use: `@vercel/go`, config },
+    { src: 'api/**/*.py', use: `@vercel/python`, config },
+    { src: 'api/**/*.rb', use: `@vercel/ruby`, config },
+    { src: 'api/**/*.rs', use: `@vercel/rust`, config },
+  ];
+}
+
+/**
+ * Validates a `proxy` config value in isolation, without knowledge of the
+ * project's files or framework. Also used by the CLI to validate
+ * `vercel.json` before builders are detected.
+ */
+export function validateProxyConfig(proxy: ProxyConfig): ErrorResponse | null {
+  if (
+    typeof proxy !== 'object' ||
+    typeof proxy.entrypoint !== 'string' ||
+    !proxy.entrypoint
+  ) {
+    return {
+      code: 'invalid_proxy',
+      message:
+        'The `proxy` property must contain an `entrypoint` string that references a `.js` or `.ts` file.',
+    };
+  }
+
+  const entrypoint = proxy.entrypoint;
+  const segments = entrypoint.split('/');
+  if (
+    entrypoint.startsWith('/') ||
+    entrypoint.includes('\\') ||
+    segments.includes('.') ||
+    segments.includes('..') ||
+    /[?#\u0000-\u001f]/.test(entrypoint)
+  ) {
+    return {
+      code: 'invalid_proxy_entrypoint',
+      message:
+        'The `proxy.entrypoint` path must be relative to the project root and cannot contain traversal, query, fragment, or control characters.',
+    };
+  }
+
+  if (!/\.(?:js|ts)$/.test(entrypoint) || entrypoint.endsWith('.d.ts')) {
+    return {
+      code: 'invalid_proxy_entrypoint',
+      message:
+        'The `proxy.entrypoint` path must end in `.js` or `.ts` and reference an executable file.',
+    };
+  }
+
+  if (proxy.matcher !== undefined) {
+    const matchers = Array.isArray(proxy.matcher)
+      ? proxy.matcher
+      : [proxy.matcher];
+    if (
+      matchers.length === 0 ||
+      matchers.some(
+        matcher => typeof matcher !== 'string' || !matcher.startsWith('/')
+      )
+    ) {
+      return {
+        code: 'invalid_proxy_matcher',
+        message:
+          'The `proxy.matcher` value must be a path matcher starting with `/`, or an array of path matchers starting with `/`.',
+      };
+    }
+  }
+
+  return null;
+}
+
+export function validateProxy(
+  options: Pick<Options, 'proxy'>,
+  files: string[],
+  framework: string | null | undefined
+): ErrorResponse | null {
+  const { proxy } = options;
+  if (!proxy) {
+    return null;
+  }
+
+  const configError = validateProxyConfig(proxy);
+  if (configError) {
+    return configError;
+  }
+
+  if (!files.includes(proxy.entrypoint)) {
+    return {
+      code: 'proxy_entrypoint_not_found',
+      message: `The proxy entrypoint \`${proxy.entrypoint}\` does not exist. Set \`proxy.entrypoint\` to an existing \`.js\` or \`.ts\` file.`,
+    };
+  }
+
+  if (framework === 'nextjs' || framework === 'astro') {
+    return {
+      code: 'proxy_framework_conflict',
+      message: `The \`proxy\` property cannot be used with ${framework === 'nextjs' ? 'Next.js' : 'Astro'} because the framework builds its own routing middleware.`,
+    };
+  }
+
+  return null;
+}
+
+function hasBuildScript(pkg: PackageJson | undefined | null) {
+  const { scripts = {} } = pkg || {};
+  return Boolean(scripts && scripts['build']);
+}
+
+/**
+ * A Rust project with an explicit output directory (e.g. a Trunk/wasm
+ * frontend) deploys static files, so the runtime preset must not apply.
+ */
+function isRustStaticOutput(
+  framework: string | null | undefined,
+  projectSettings: { outputDirectory?: string | null }
+): boolean {
+  return (
+    framework === 'rust' &&
+    typeof projectSettings.outputDirectory === 'string' &&
+    projectSettings.outputDirectory !== '' &&
+    // The framework preset's display default; not a real directory.
+    projectSettings.outputDirectory !== 'N/A'
+  );
+}
+
+function detectFrontBuilder(
+  pkg: PackageJson | null | undefined,
+  files: string[],
+  usedFunctions: Set<string>,
+  fallbackEntrypoint: string | null,
+  options: Options
+): Builder {
+  const { tag, projectSettings = {} } = options;
+  const withTag = tag ? `@${tag}` : '';
+  const { createdAt = 0 } = projectSettings;
+  let { framework } = projectSettings;
+
+  const config: Config = {
+    zeroConfig: true,
+  };
+
+  if (framework) {
+    config.framework = framework;
+  }
+
+  if (projectSettings.devCommand) {
+    config.devCommand = projectSettings.devCommand;
+  }
+
+  if (typeof projectSettings.installCommand === 'string') {
+    config.installCommand = projectSettings.installCommand;
+  }
+
+  if (projectSettings.buildCommand) {
+    config.buildCommand = projectSettings.buildCommand;
+  }
+
+  if (projectSettings.outputDirectory) {
+    config.outputDirectory = projectSettings.outputDirectory;
+  }
+
+  if (options.bunVersion) {
+    config.bunVersion = options.bunVersion;
+  }
+
+  if (
+    pkg &&
+    (framework === undefined ||
+      (framework !== 'storybook' && createdAt < Date.parse('2020-03-01')))
+  ) {
+    const deps: PackageJson['dependencies'] = {
+      ...pkg.dependencies,
+      ...pkg.devDependencies,
+    };
+
+    if (deps['next']) {
+      framework = 'nextjs';
+    }
+  }
+
+  if (options.functions) {
+    // When the builder is not used yet we'll use it for the frontend
+    Object.entries(options.functions).forEach(([key, func]) => {
+      if (!usedFunctions.has(key)) {
+        if (!config.functions) config.functions = {};
+        config.functions[key] = { ...func };
+      }
+    });
+  }
+
+  const f = slugToFramework.get(framework || '');
+  if (f && f.useRuntime && !isRustStaticOutput(framework, projectSettings)) {
+    const { src, use } = f.useRuntime;
+    // Replace framework-specific backend builders with the unified backend builder
+    // when experimental backends is enabled
+    const shouldUseUnifiedBackend =
+      isExperimentalBackendsEnabled() &&
+      BACKEND_BUILDERS.includes(use as (typeof BACKEND_BUILDERS)[number]);
+    const finalUse = shouldUseUnifiedBackend ? UNIFIED_BACKEND_BUILDER : use;
+    return { src, use: `${finalUse}${withTag}`, config };
+  }
+
+  // Entrypoints for other frameworks
+  // TODO - What if just a build script is provided, but no entrypoint.
+  const entrypoints = new Set([
+    'package.json',
+    'config.yaml',
+    'config.toml',
+    'config.json',
+    '_config.yml',
+    'config.yml',
+    'config.rb',
+  ]);
+
+  const source = pkg
+    ? 'package.json'
+    : files.find(file => entrypoints.has(file)) ||
+      fallbackEntrypoint ||
+      'package.json';
+
+  return {
+    src: source || 'package.json',
+    use: `@vercel/static-build${withTag}`,
+    config,
+  };
+}
+
+function getMissingBuildScriptError() {
+  return {
+    code: 'missing_build_script',
+    message:
+      'Your `package.json` file is missing a `build` property inside the `scripts` property.' +
+      '\nLearn More: https://vercel.link/missing-build-script',
+  };
+}
+
+function validateFunctions({ functions = {} }: Options) {
+  for (const [path, func] of Object.entries(functions)) {
+    if (path.length > 256) {
+      return {
+        code: 'invalid_function_glob',
+        message: 'Function globs must be less than 256 characters long.',
+      };
+    }
+
+    if (!func || typeof func !== 'object') {
+      return {
+        code: 'invalid_function',
+        message: 'Function must be an object.',
+      };
+    }
+
+    if (Object.keys(func).length === 0) {
+      return {
+        code: 'invalid_function',
+        message: 'Function must contain at least one property.',
+      };
+    }
+
+    // The upper bound is enforced by server-side validation; only apply a
+    // client-side maximum when it has not been skipped via
+    // `VERCEL_CLI_SKIP_MAX_DURATION_LIMIT`. The lower bound and integer check
+    // are always enforced.
+    const maxDurationLimit = getMaxDurationLimit();
+    if (
+      func.maxDuration !== undefined &&
+      func.maxDuration !== 'max' &&
+      (func.maxDuration < 1 ||
+        (maxDurationLimit !== undefined &&
+          func.maxDuration > maxDurationLimit) ||
+        !Number.isInteger(func.maxDuration))
+    ) {
+      return {
+        code: 'invalid_function_duration',
+        message:
+          maxDurationLimit !== undefined
+            ? `Functions must have a maxDuration between 1 and ${maxDurationLimit}, or "max".`
+            : 'Functions must have a positive integer maxDuration, or "max".',
+      };
+    }
+
+    if (
+      func.memory !== undefined &&
+      (func.memory < 128 || func.memory > 10240)
+    ) {
+      return {
+        code: 'invalid_function_memory',
+        message: 'Functions must have a memory value between 128 and 10240',
+      };
+    }
+
+    if (path.startsWith('/')) {
+      return {
+        code: 'invalid_function_source',
+        message: `The function path "${path}" is invalid. The path must be relative to your project root and therefore cannot start with a slash.`,
+      };
+    }
+
+    if (func.runtime !== undefined) {
+      const tag = `${func.runtime}`.split('@').pop();
+
+      if (!tag || !validSemver(tag)) {
+        return {
+          code: 'invalid_function_runtime',
+          message:
+            'Function Runtimes must have a valid version, for example `now-php@1.0.0`.',
+        };
+      }
+    }
+
+    if (func.includeFiles !== undefined) {
+      if (typeof func.includeFiles !== 'string') {
+        return {
+          code: 'invalid_function_property',
+          message: `The property \`includeFiles\` must be a string.`,
+        };
+      }
+    }
+
+    if (func.excludeFiles !== undefined) {
+      if (typeof func.excludeFiles !== 'string') {
+        return {
+          code: 'invalid_function_property',
+          message: `The property \`excludeFiles\` must be a string.`,
+        };
+      }
+    }
+  }
+
+  return null;
+}
+
+function checkUnusedFunctions(
+  frontendBuilder: Builder | null,
+  usedFunctions: Set<string>,
+  options: Options
+): ErrorResponse | null {
+  const unusedFunctions = new Set(
+    Object.keys(options.functions || {}).filter(key => !usedFunctions.has(key))
+  );
+
+  if (!unusedFunctions.size) {
+    return null;
+  }
+
+  // Next.js can use functions only for `src/pages` or `pages`
+  if (frontendBuilder && isOfficialRuntime('next', frontendBuilder.use)) {
+    for (const fnKey of unusedFunctions.values()) {
+      if (
+        fnKey.startsWith('pages/') ||
+        fnKey.startsWith('src/pages') ||
+        fnKey.startsWith('app/') ||
+        fnKey.startsWith('src/app/') ||
+        fnKey.startsWith('middleware') ||
+        fnKey.startsWith('src/middleware')
+      ) {
+        unusedFunctions.delete(fnKey);
+      } else {
+        return {
+          code: 'unused_function',
+          message: `The pattern "${fnKey}" defined in \`functions\` doesn't match any Serverless Functions.`,
+          action: 'Learn More',
+          link: 'https://vercel.link/unmatched-function-pattern',
+        };
+      }
+    }
+  }
+  if (
+    frontendBuilder &&
+    (isOfficialRuntime('express', frontendBuilder.use) ||
+      isOfficialRuntime('hono', frontendBuilder.use) ||
+      isOfficialRuntime('python', frontendBuilder.use) ||
+      isOfficialRuntime('backends', frontendBuilder.use))
+  ) {
+    // Skip for runtimes that resolve function names inside the builder.
+    return null;
+  }
+
+  if (unusedFunctions.size) {
+    const [fnKey] = Array.from(unusedFunctions);
+
+    return {
+      code: 'unused_function',
+      message: `The pattern "${fnKey}" defined in \`functions\` doesn't match any Serverless Functions inside the \`api\` directory.`,
+      action: 'Learn More',
+      link: 'https://vercel.link/unmatched-function-pattern',
+    };
+  }
+
+  return null;
+}
+
+function getApiRoute(
+  fileName: string,
+  sortedFiles: string[],
+  options: Options,
+  absolutePathCache: Map<string, string>
+): {
+  apiRoute: RouteWithSrc | null;
+  isDynamic: boolean;
+  routeError: ErrorResponse | null;
+} {
+  const conflictingSegment = getConflictingSegment(fileName);
+
+  if (conflictingSegment) {
+    return {
+      apiRoute: null,
+      isDynamic: false,
+      routeError: {
+        code: 'conflicting_path_segment',
+        message:
+          `The segment "${conflictingSegment}" occurs more than ` +
+          `one time in your path "${fileName}". Please make sure that ` +
+          `every segment in a path is unique.`,
+      },
+    };
+  }
+
+  const occurrences = pathOccurrences(fileName, sortedFiles, absolutePathCache);
+
+  if (occurrences.length > 0) {
+    const messagePaths = concatArrayOfText(
+      occurrences.map(name => `"${name}"`)
+    );
+
+    return {
+      apiRoute: null,
+      isDynamic: false,
+      routeError: {
+        code: 'conflicting_file_path',
+        message:
+          `Two or more files have conflicting paths or names. ` +
+          `Please make sure path segments and filenames, without their extension, are unique. ` +
+          `The path "${fileName}" has conflicts with ${messagePaths}.`,
+      },
+    };
+  }
+
+  const out = createRouteFromPath(
+    fileName,
+    Boolean(options.featHandleMiss),
+    Boolean(options.cleanUrls)
+  );
+
+  return {
+    apiRoute: out.route,
+    isDynamic: out.isDynamic,
+    routeError: null,
+  };
+}
+
+// Checks if a placeholder with the same name is used
+// multiple times inside the same path
+function getConflictingSegment(filePath: string): string | null {
+  const segments = new Set<string>();
+
+  for (const segment of filePath.split('/')) {
+    const name = getSegmentName(segment);
+
+    if (name !== null && segments.has(name)) {
+      return name;
+    }
+
+    if (name) {
+      segments.add(name);
+    }
+  }
+
+  return null;
+}
+
+// Takes a filename or foldername, strips the extension
+// gets the part between the "[]" brackets.
+// It will return `null` if there are no brackets
+// and therefore no segment.
+function getSegmentName(segment: string): string | null {
+  const { name } = parsePath(segment);
+
+  if (name.startsWith('[') && name.endsWith(']')) {
+    return name.slice(1, -1);
+  }
+
+  return null;
+}
+
+function getAbsolutePath(unresolvedPath: string) {
+  const { dir, name } = parsePath(unresolvedPath);
+  const parts = joinPath(dir, name).split('/');
+  return parts.map(part => part.replace(/\[.*\]/, '1')).join('/');
+}
+
+// Counts how often a path occurs when all placeholders
+// got resolved, so we can check if they have conflicts
+function pathOccurrences(
+  fileName: string,
+  files: string[],
+  absolutePathCache: Map<string, string>
+): string[] {
+  let currentAbsolutePath = absolutePathCache.get(fileName);
+
+  if (!currentAbsolutePath) {
+    currentAbsolutePath = getAbsolutePath(fileName);
+    absolutePathCache.set(fileName, currentAbsolutePath);
+  }
+
+  const prev: string[] = [];
+
+  // Do not call expensive functions like `minimatch` in here
+  // because we iterate over every file.
+  for (const file of files) {
+    if (file === fileName) {
+      continue;
+    }
+
+    let absolutePath = absolutePathCache.get(file);
+
+    if (!absolutePath) {
+      absolutePath = getAbsolutePath(file);
+      absolutePathCache.set(file, absolutePath);
+    }
+
+    if (absolutePath === currentAbsolutePath) {
+      prev.push(file);
+    } else if (partiallyMatches(fileName, file)) {
+      prev.push(file);
+    }
+  }
+
+  return prev;
+}
+
+function joinPath(...segments: string[]) {
+  const joinedPath = segments.join('/');
+  return joinedPath.replace(/\/{2,}/g, '/');
+}
+
+function escapeName(name: string) {
+  const special = '[]^$.|?*+()'.split('');
+
+  for (const char of special) {
+    name = name.replace(new RegExp(`\\${char}`, 'g'), `\\${char}`);
+  }
+
+  return name;
+}
+
+function concatArrayOfText(texts: string[]): string {
+  if (texts.length <= 2) {
+    return texts.join(' and ');
+  }
+
+  const last = texts.pop();
+  return `${texts.join(', ')}, and ${last}`;
+}
+
+// Check if the path partially matches and has the same
+// name for the path segment at the same position
+function partiallyMatches(pathA: string, pathB: string): boolean {
+  const partsA = pathA.split('/');
+  const partsB = pathB.split('/');
+
+  const long = partsA.length > partsB.length ? partsA : partsB;
+  const short = long === partsA ? partsB : partsA;
+
+  let index = 0;
+
+  for (const segmentShort of short) {
+    const segmentLong = long[index];
+
+    const nameLong = getSegmentName(segmentLong);
+    const nameShort = getSegmentName(segmentShort);
+
+    // If there are no segments or the paths differ we
+    // return as they are not matching
+    if (segmentShort !== segmentLong && (!nameLong || !nameShort)) {
+      return false;
+    }
+
+    if (nameLong !== nameShort) {
+      return true;
+    }
+
+    index += 1;
+  }
+
+  return false;
+}
+
+function createRouteFromPath(
+  filePath: string,
+  featHandleMiss: boolean,
+  cleanUrls: boolean
+): { route: RouteWithSrc; isDynamic: boolean } {
+  const parts = filePath.split('/');
+
+  let counter = 1;
+  const query: string[] = [];
+  let isDynamic = false;
+
+  const srcParts = parts.map((segment, i): string => {
+    const name = getSegmentName(segment);
+    const isLast = i === parts.length - 1;
+
+    if (name !== null) {
+      // We can't use `URLSearchParams` because `$` would get escaped
+      query.push(`${name}=$${counter++}`);
+      isDynamic = true;
+      return `([^/]+)`;
+    } else if (isLast) {
+      const { name: fileName, ext } = parsePath(segment);
+      const isIndex = fileName === 'index';
+      const prefix = isIndex ? '/' : '';
+
+      const names = [
+        isIndex ? prefix : `${fileName}/`,
+        prefix + escapeName(fileName),
+        featHandleMiss && cleanUrls
+          ? ''
+          : prefix + escapeName(fileName) + escapeName(ext),
+      ].filter(Boolean);
+
+      // Either filename with extension, filename without extension
+      // or nothing when the filename is `index`.
+      // When `cleanUrls: true` then do *not* add the filename with extension.
+      return `(${names.join('|')})${isIndex ? '?' : ''}`;
+    }
+
+    return segment;
+  });
+
+  const { name: fileName, ext } = parsePath(filePath);
+  const isIndex = fileName === 'index';
+  const queryString = `${query.length ? '?' : ''}${query.join('&')}`;
+
+  const src = isIndex
+    ? `^/${srcParts.slice(0, -1).join('/')}${srcParts.slice(-1)[0]}$`
+    : `^/${srcParts.join('/')}$`;
+
+  let route: RouteWithSrc;
+
+  if (featHandleMiss) {
+    const extensionless = ext ? filePath.slice(0, -ext.length) : filePath;
+    route = {
+      src,
+      dest: `/${extensionless}${queryString}`,
+      check: true,
+    };
+  } else {
+    route = {
+      src,
+      dest: `/${filePath}${queryString}`,
+    };
+  }
+
+  return { route, isDynamic };
+}
+
+function getRouteResult(
+  apiRoutes: RouteWithSrc[],
+  dynamicRoutes: RouteWithSrc[],
+  outputDirectory: string,
+  apiBuilders: Builder[],
+  frontendBuilder: Builder | null,
+  options: Options
+): {
+  defaultRoutes: Route[];
+  redirectRoutes: Route[];
+  rewriteRoutes: Route[];
+  errorRoutes: Route[];
+} {
+  const defaultRoutes: Route[] = [];
+  const redirectRoutes: Route[] = [];
+  const rewriteRoutes: Route[] = [];
+  const errorRoutes: Route[] = [];
+  const framework = frontendBuilder?.config?.framework || '';
+  const isGatsby = framework === 'gatsby';
+  const isNextjs =
+    framework === 'nextjs' || isOfficialRuntime('next', frontendBuilder?.use);
+  const ignoreRuntimes = slugToFramework.get(framework)?.ignoreRuntimes;
+
+  if (apiRoutes && apiRoutes.length > 0) {
+    if (options.featHandleMiss) {
+      // Exclude extension names if the corresponding plugin is not found in package.json
+      // detectBuilders({ignoreRoutesForBuilders: ['@vercel/python']})
+      // return a copy of routes.
+      // We should exclud errorRoutes and
+      const extSet = detectApiExtensions(apiBuilders);
+      if (extSet.size > 0) {
+        const extGroup = `(?:\\.(?:${Array.from(extSet)
+          .map(ext => ext.slice(1))
+          .join('|')}))`;
+
+        if (options.cleanUrls) {
+          redirectRoutes.push({
+            src: `^/(api(?:.+)?)/index${extGroup}?/?$`,
+            headers: { Location: options.trailingSlash ? '/$1/' : '/$1' },
+            status: 308,
+          });
+
+          redirectRoutes.push({
+            src: `^/api/(.+)${extGroup}/?$`,
+            headers: {
+              Location: options.trailingSlash ? '/api/$1/' : '/api/$1',
+            },
+            status: 308,
+          });
+        } else {
+          defaultRoutes.push({ handle: 'miss' });
+          defaultRoutes.push({
+            src: `^/api/(.+)${extGroup}$`,
+            dest: '/api/$1',
+            check: true,
+          });
+        }
+      }
+
+      rewriteRoutes.push(...dynamicRoutes);
+
+      const hasApiBuild = apiBuilders.find(builder => {
+        return builder.src?.startsWith('api/');
+      });
+      // Skip for Next.js: it serves /api (Pages + App Router) and 404s unmatched
+      // paths; adding a catch-all here would 404 dynamic routes like /api/flow/[id]/next.
+      if (typeof ignoreRuntimes === 'undefined' && hasApiBuild && !isNextjs) {
+        // But it causes issues in `vc dev` for frameworks that handle
+        // their own functions such as redwood, so we ignore.
+        rewriteRoutes.push({
+          src: '^/api(/.*)?$',
+          status: 404,
+        });
+      }
+    } else {
+      defaultRoutes.push(...apiRoutes);
+
+      if (apiRoutes.length && !isNextjs) {
+        defaultRoutes.push({
+          status: 404,
+          src: '^/api(/.*)?$',
+        });
+      }
+    }
+  }
+
+  if (
+    outputDirectory &&
+    frontendBuilder &&
+    !options.featHandleMiss &&
+    isOfficialRuntime('static', frontendBuilder.use)
+  ) {
+    defaultRoutes.push({
+      src: '/(.*)',
+      dest: `/${outputDirectory}/$1`,
+    });
+  }
+
+  if (options.featHandleMiss && !isNextjs && !isGatsby) {
+    // Exclude Next.js (and Gatsby) to avoid overriding custom error page
+    // https://nextjs.org/docs/advanced-features/custom-error-page
+    errorRoutes.push({
+      status: 404,
+      src: '^(?!/api).*$',
+      dest: options.cleanUrls ? '/404' : '/404.html',
+    });
+  }
+
+  return {
+    defaultRoutes,
+    redirectRoutes,
+    rewriteRoutes,
+    errorRoutes,
+  };
+}
+
+function sortFilesBySegmentCount(fileA: string, fileB: string): number {
+  const lengthA = fileA.split('/').length;
+  const lengthB = fileB.split('/').length;
+
+  if (lengthA > lengthB) {
+    return -1;
+  }
+
+  if (lengthA < lengthB) {
+    return 1;
+  }
+
+  // Paths that have the same segment length but
+  // less placeholders are preferred
+  const countSegments = (prev: number, segment: string) =>
+    getSegmentName(segment) ? prev + 1 : 0;
+  const segmentLengthA = fileA.split('/').reduce(countSegments, 0);
+  const segmentLengthB = fileB.split('/').reduce(countSegments, 0);
+
+  if (segmentLengthA > segmentLengthB) {
+    return 1;
+  }
+
+  if (segmentLengthA < segmentLengthB) {
+    return -1;
+  }
+
+  return fileA.localeCompare(fileB);
+}

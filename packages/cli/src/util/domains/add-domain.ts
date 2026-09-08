@@ -1,8 +1,9 @@
 import chalk from 'chalk';
 import retry from 'async-retry';
-import { DomainAlreadyExists, InvalidDomain } from '../errors-ts';
-import { Domain } from '../../types';
-import Client from '../client';
+import { DomainAlreadyExists, InvalidDomain, isAPIError } from '../errors-ts';
+import type { Domain } from '@vercel-internals/types';
+import type Client from '../client';
+import output from '../../output-manager';
 
 type Response = {
   domain: Domain;
@@ -13,9 +14,7 @@ export default async function addDomain(
   domain: string,
   contextName: string
 ) {
-  client.output.spinner(
-    `Adding domain ${domain} under ${chalk.bold(contextName)}`
-  );
+  output.spinner(`Adding domain ${domain} under ${chalk.bold(contextName)}`);
   const addedDomain = await performAddRequest(client, domain);
   return addedDomain;
 }
@@ -24,21 +23,25 @@ async function performAddRequest(client: Client, domainName: string) {
   return retry(
     async () => {
       try {
-        const { domain } = await client.fetch<Response>('/v4/domains', {
-          body: { name: domainName },
+        const { domain } = await client.fetch<Response>('/v7/domains', {
+          // `zone` must be sent explicitly: the API only defaults it to `true`
+          // on v4 and below, so omitting it here would stop creating DNS zones.
+          body: { name: domainName, zone: true },
           method: 'POST',
         });
         return domain;
-      } catch (error) {
-        if (error.code === 'invalid_name') {
-          return new InvalidDomain(domainName);
+      } catch (err: unknown) {
+        if (isAPIError(err)) {
+          if (err.code === 'invalid_name') {
+            return new InvalidDomain(domainName);
+          }
+
+          if (err.code === 'domain_already_exists') {
+            return new DomainAlreadyExists(domainName);
+          }
         }
 
-        if (error.code === 'domain_already_exists') {
-          return new DomainAlreadyExists(domainName);
-        }
-
-        throw error;
+        throw err;
       }
     },
     { retries: 5, maxTimeout: 8000 }

@@ -1,0 +1,65 @@
+const fs = require('fs');
+const path = require('path');
+const { intoChunks } = require('../../../utils/chunk-tests');
+
+const {
+  testDeployment,
+} = require('../../../test/lib/deployment/test-deployment.js');
+
+vi.setConfig({ testTimeout: 4 * 60 * 1000, hookTimeout: 4 * 60 * 1000 });
+
+module.exports = function setupTests(groupIndex) {
+  const fixturesPath = path.resolve(__dirname, 'fixtures');
+  const testsThatFailToBuild = new Map([
+    ['30-fail-build-invalid-pipfile', 'Could not parse config file'],
+    [
+      '31-fail-build-invalid-python36',
+      'Python version "3.6" detected in Pipfile.lock is discontinued and must be upgraded.',
+    ],
+  ]);
+  const allFixtures = fs.readdirSync(fixturesPath);
+  const skipFixtures = [];
+  const originalCompileAllEnv = process.env.VERCEL_PYTHON_COMPILEALL;
+
+  beforeAll(() => {
+    process.env.VERCEL_PYTHON_COMPILEALL = '1';
+  });
+
+  afterAll(() => {
+    if (originalCompileAllEnv === undefined) {
+      delete process.env.VERCEL_PYTHON_COMPILEALL;
+    } else {
+      process.env.VERCEL_PYTHON_COMPILEALL = originalCompileAllEnv;
+    }
+  });
+
+  let chunkedFixtures = allFixtures.filter(
+    fixture => !skipFixtures.includes(fixture)
+  );
+  if (typeof groupIndex !== 'undefined') {
+    chunkedFixtures = intoChunks(1, 2, chunkedFixtures)[groupIndex - 1];
+
+    console.log('testing group', groupIndex, chunkedFixtures);
+  }
+
+  for (const fixture of chunkedFixtures) {
+    const errMsg = testsThatFailToBuild.get(fixture);
+    if (errMsg) {
+      it.concurrent(`should fail to build ${fixture}`, async () => {
+        try {
+          await testDeployment(path.join(fixturesPath, fixture));
+        } catch (err) {
+          expect(err).toBeTruthy();
+          expect(err.deployment).toBeTruthy();
+          expect(err.deployment.errorMessage).toContain(errMsg);
+        }
+      });
+      continue;
+    }
+    it.concurrent(`should build ${fixture}`, async () => {
+      await expect(
+        testDeployment(path.join(fixturesPath, fixture))
+      ).resolves.toBeDefined();
+    });
+  }
+};

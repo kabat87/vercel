@@ -1,0 +1,111 @@
+import { TelemetryClient } from '../..';
+import { STANDARD_ENVIRONMENTS } from '../../../target/standard-environments';
+import type { TelemetryMethods } from '../../types';
+import type { addSubcommand } from '../../../../commands/env/command';
+import type { CustomEnvironmentType } from '@vercel-internals/types';
+
+export class EnvAddTelemetryClient
+  extends TelemetryClient
+  implements TelemetryMethods<typeof addSubcommand>
+{
+  trackCliArgumentName(name: string | undefined) {
+    if (name) {
+      this.trackCliArgument({
+        arg: 'name',
+        value: this.redactedValue,
+      });
+    }
+  }
+
+  trackCliArgumentEnvironment(environment: string | undefined) {
+    if (environment) {
+      const allStandard = environment
+        .split(',')
+        .map(t => t.trim())
+        .every(t => STANDARD_ENVIRONMENTS.includes(t as CustomEnvironmentType));
+      this.trackCliArgument({
+        arg: 'environment',
+        value: allStandard ? environment : this.redactedValue,
+      });
+    }
+  }
+
+  trackCliArgumentGitBranch(gitBranch: string | undefined) {
+    if (gitBranch) {
+      this.trackCliArgument({
+        arg: 'git-branch',
+        value: this.redactedValue,
+      });
+    }
+  }
+
+  trackCliOptionGitBranch(gitBranch: string | undefined) {
+    if (gitBranch) {
+      this.trackCliOption({
+        option: 'git-branch',
+        value: this.redactedValue,
+      });
+    }
+  }
+
+  trackCliOptionValue(value: string | undefined) {
+    if (value) {
+      this.trackCliOption({
+        option: 'value',
+        value: this.redactedValue,
+      });
+    }
+  }
+
+  trackCliOptionVisibility(visibility: string | undefined) {
+    if (visibility) {
+      const validVisibilities = ['config', 'secret'];
+      this.trackCliOption({
+        option: 'visibility',
+        value: validVisibilities.includes(visibility)
+          ? visibility
+          : this.redactedValue,
+      });
+    }
+  }
+
+  trackCliOptionType(type: string | undefined) {
+    if (type) {
+      const validTypes = ['config', 'secret'];
+      this.trackCliOption({
+        option: 'type',
+        value: validTypes.includes(type) ? type : this.redactedValue,
+      });
+    }
+  }
+
+  trackCliFlagSensitive(sensitive: boolean | undefined) {
+    if (sensitive) {
+      this.trackCliFlag('sensitive');
+    }
+  }
+
+  trackCliFlagNoSensitive(noSensitive: boolean | undefined) {
+    if (noSensitive) {
+      this.trackCliFlag('no-sensitive');
+    }
+  }
+
+  trackCliFlagForce(force: boolean | undefined) {
+    if (force) {
+      this.trackCliFlag('force');
+    }
+  }
+
+  trackCliFlagGuidance(guidance: boolean | undefined) {
+    if (guidance) {
+      this.trackCliFlag('guidance');
+    }
+  }
+
+  trackCliFlagYes(yes: boolean | undefined) {
+    if (yes) {
+      this.trackCliFlag('yes');
+    }
+  }
+}

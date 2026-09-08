@@ -1,0 +1,1139 @@
+import { join } from 'path';
+import ms from 'ms';
+import fs, { mkdirp } from 'fs-extra';
+import {
+  sleep,
+  fixture,
+  testFixture,
+  testFixtureStdio,
+  validateResponseHeaders,
+} from './utils';
+import assert from 'assert';
+import nodeFetch from '../../src/util/fetch';
+
+test(
+  '[vercel dev] temporary directory listing',
+  testFixtureStdio(
+    'temporary-directory-listing',
+    async (_testPath: any, port: any) => {
+      const directory = fixture('temporary-directory-listing');
+      await fs.unlink(join(directory, 'index.txt')).catch(() => null);
+
+      await sleep(ms('20s'));
+
+      const firstResponse = await nodeFetch(`http://localhost:${port}`);
+      validateResponseHeaders(firstResponse);
+      const body = await firstResponse.text();
+      console.log(body);
+      expect(firstResponse.status).toBe(404);
+
+      await fs.writeFile(join(directory, 'index.txt'), 'hello');
+
+      for (let i = 0; i < 20; i++) {
+        const response = await nodeFetch(`http://localhost:${port}`);
+        validateResponseHeaders(response);
+
+        if (response.status === 200) {
+          const body = await response.text();
+          expect(body).toBe('hello');
+        }
+
+        await sleep(ms('1s'));
+      }
+    },
+    { skipDeploy: true }
+  )
+);
+
+test('[vercel dev] add a `package.json` to trigger `@vercel/static-build`', async () => {
+  const directory = fixture('trigger-static-build');
+
+  await fs.unlink(join(directory, 'package.json')).catch(() => null);
+
+  await fs.unlink(join(directory, 'public', 'index.txt')).catch(() => null);
+
+  await fs.rmdir(join(directory, 'public')).catch(() => null);
+
+  const tester = testFixtureStdio(
+    'trigger-static-build',
+    async (_testPath: any, port: any) => {
+      {
+        const response = await nodeFetch(`http://localhost:${port}`);
+        validateResponseHeaders(response);
+        const body = await response.text();
+        expect(body.trim()).toBe('hello:index.txt');
+      }
+
+      const rnd = Math.random().toString();
+      const pkg = {
+        private: true,
+        scripts: { build: `mkdir -p public && echo ${rnd} > public/index.txt` },
+      };
+
+      await fs.writeFile(join(directory, 'package.json'), JSON.stringify(pkg));
+
+      // Wait until file events have been processed
+      await sleep(ms('2s'));
+
+      {
+        const response = await nodeFetch(`http://localhost:${port}`);
+        validateResponseHeaders(response);
+        const body = await response.text();
+        expect(body.trim()).toBe(rnd);
+      }
+    },
+    { skipDeploy: true }
+  );
+
+  await tester();
+});
+
+test('[vercel dev] no build matches warning', async () => {
+  const directory = fixture('no-build-matches');
+  const { dev } = await testFixture(directory, {
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+
+  try {
+    // start `vercel dev` detached in child_process
+    dev.unref();
+
+    assert(dev.stderr);
+    dev.stderr.setEncoding('utf8');
+    await new Promise<void>(resolve => {
+      assert(dev.stderr);
+      dev.stderr.on('data', (str: string) => {
+        if (str.includes('did not match any source files')) {
+          resolve();
+        }
+      });
+    });
+  } finally {
+    await dev.kill();
+  }
+});
+
+test(
+  '[vercel dev] do not recursivly check the path',
+  testFixtureStdio('handle-filesystem-missing', async (testPath: any) => {
+    await testPath(200, '/', /hello/m);
+    await testPath(404, '/favicon.txt');
+  })
+);
+
+test('[vercel dev] render warning for empty cwd dir', async () => {
+  const directory = fixture('empty');
+  const { dev, port } = await testFixture(directory, {
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+
+  try {
+    dev.unref();
+
+    // Monitor `stderr` for the warning
+    assert(dev.stderr);
+    dev.stderr.setEncoding('utf8');
+    const msg = 'There are no files inside your deployment.';
+    await new Promise<void>(resolve => {
+      assert(dev.stderr);
+      dev.stderr.on('data', (str: string) => {
+        if (str.includes(msg)) {
+          resolve();
+        }
+      });
+    });
+
+    // Issue a request to ensure a 404 response
+    await sleep(ms('3s'));
+    const response = await nodeFetch(`http://localhost:${port}`);
+    validateResponseHeaders(response);
+    expect(response.status).toBe(404);
+  } finally {
+    await dev.kill();
+  }
+});
+
+test('[vercel dev] do not rebuild for changes in the output directory', async () => {
+  const directory = fixture('output-is-source');
+
+  const { dev, port } = await testFixture(directory, {
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+
+  try {
+    dev.unref();
+
+    const stderr: any = [];
+    const start = Date.now();
+
+    assert(dev.stderr);
+    dev.stderr.on('data', (str: any) => stderr.push(str));
+
+    while (stderr.join('').includes('Ready') === false) {
+      await sleep(ms('3s'));
+
+      if (Date.now() - start > ms('30s')) {
+        console.log('stderr:', stderr.join(''));
+        break;
+      }
+    }
+
+    const resp1 = await nodeFetch(`http://localhost:${port}`);
+    const text1 = await resp1.text();
+    expect(text1.trim()).toBe('hello first');
+
+    await fs.writeFile(join(directory, 'public', 'index.html'), 'hello second');
+
+    await sleep(ms('3s'));
+
+    const resp2 = await nodeFetch(`http://localhost:${port}`);
+    const text2 = await resp2.text();
+    expect(text2.trim()).toBe('hello second');
+  } finally {
+    await dev.kill();
+  }
+});
+
+test(
+  '[vercel dev] test cleanUrls serve correct content',
+  testFixtureStdio('test-clean-urls', async (testPath: any) => {
+    await testPath(200, '/', 'Index Page');
+    await testPath(200, '/about', 'About Page');
+    await testPath(200, '/sub', 'Sub Index Page');
+    await testPath(200, '/sub/another', 'Sub Another Page');
+    await testPath(200, '/style.css', 'body { color: green }');
+    await testPath(308, '/index.html', 'Redirecting...', {
+      Location: '/',
+    });
+    await testPath(308, '/about.html', 'Redirecting...', {
+      Location: '/about',
+    });
+    await testPath(308, '/sub/index.html', 'Redirecting...', {
+      Location: '/sub',
+    });
+    await testPath(308, '/sub/another.html', 'Redirecting...', {
+      Location: '/sub/another',
+    });
+  })
+);
+
+test(
+  '[vercel dev] test cleanUrls serve correct content when using `outputDirectory`',
+  testFixtureStdio(
+    'test-clean-urls-with-output-directory',
+    async (testPath: any) => {
+      await testPath(200, '/', 'Index Page');
+      await testPath(200, '/about', 'About Page');
+      await testPath(200, '/sub', 'Sub Index Page');
+      await testPath(200, '/sub/another', 'Sub Another Page');
+      await testPath(200, '/style.css', 'body { color: green }');
+      await testPath(308, '/index.html', 'Redirecting...', {
+        Location: '/',
+      });
+      await testPath(308, '/about.html', 'Redirecting...', {
+        Location: '/about',
+      });
+      await testPath(308, '/sub/index.html', 'Redirecting...', {
+        Location: '/sub',
+      });
+      await testPath(308, '/sub/another.html', 'Redirecting...', {
+        Location: '/sub/another',
+      });
+    }
+  )
+);
+
+test(
+  '[vercel dev] should serve custom 404 when `cleanUrls: true`',
+  testFixtureStdio('test-clean-urls-custom-404', async (testPath: any) => {
+    await testPath(200, '/', 'This is the home page');
+    await testPath(200, '/about', 'The about page');
+    await testPath(200, '/contact/me', 'Contact Me Subdirectory');
+    await testPath(404, '/nothing', 'Custom 404 Page');
+    await testPath(404, '/nothing/', 'Custom 404 Page');
+  })
+);
+
+test(
+  '[vercel dev] test cleanUrls and trailingSlash serve correct content',
+  testFixtureStdio('test-clean-urls-trailing-slash', async (testPath: any) => {
+    await testPath(200, '/', 'Index Page');
+    await testPath(200, '/about/', 'About Page');
+    await testPath(200, '/sub/', 'Sub Index Page');
+    await testPath(200, '/sub/another/', 'Sub Another Page');
+    await testPath(200, '/style.css', 'body { color: green }');
+    //TODO: fix this test so that location is `/` instead of `//`
+    //await testPath(308, '/index.html', 'Redirecting...', { Location: '/' });
+    await testPath(308, '/about.html', 'Redirecting...', {
+      Location: '/about/',
+    });
+    await testPath(308, '/sub/index.html', 'Redirecting...', {
+      Location: '/sub/',
+    });
+    await testPath(308, '/sub/another.html', 'Redirecting...', {
+      Location: '/sub/another/',
+    });
+  })
+);
+
+test(
+  '[vercel dev] test cors headers work with OPTIONS',
+  testFixtureStdio('test-cors-routes', async (testPath: any) => {
+    const headers = {
+      'Access-Control-Allow-Origin': '*',
+      'Access-Control-Allow-Headers':
+        'Content-Type, Authorization, Accept, Content-Length, Origin, User-Agent',
+      'Access-Control-Allow-Methods':
+        'GET, POST, OPTIONS, HEAD, PATCH, PUT, DELETE',
+    };
+    await testPath(200, '/', 'status api', headers, { method: 'GET' });
+    await testPath(200, '/', 'status api', headers, { method: 'POST' });
+    await testPath(200, '/api/status.js', 'status api', headers, {
+      method: 'GET',
+    });
+    await testPath(200, '/api/status.js', 'status api', headers, {
+      method: 'POST',
+    });
+    await testPath(204, '/', '', headers, { method: 'OPTIONS' });
+    await testPath(204, '/api/status.js', '', headers, { method: 'OPTIONS' });
+  })
+);
+
+test(
+  '[vercel dev] test trailingSlash true serve correct content',
+  testFixtureStdio('test-trailing-slash', async (testPath: any) => {
+    await testPath(200, '/', 'Index Page');
+    await testPath(200, '/index.html', 'Index Page');
+    await testPath(200, '/about.html', 'About Page');
+    await testPath(200, '/sub/', 'Sub Index Page');
+    await testPath(200, '/sub/index.html', 'Sub Index Page');
+    await testPath(200, '/sub/another.html', 'Sub Another Page');
+    await testPath(200, '/style.css', 'body { color: green }');
+    await testPath(308, '/about.html/', 'Redirecting...', {
+      Location: '/about.html',
+    });
+    await testPath(308, '/style.css/', 'Redirecting...', {
+      Location: '/style.css',
+    });
+    await testPath(308, '/sub', 'Redirecting...', {
+      Location: '/sub/',
+    });
+  })
+);
+
+test(
+  '[vercel dev] should serve custom 404 when `trailingSlash: true`',
+  testFixtureStdio('test-trailing-slash-custom-404', async (testPath: any) => {
+    await testPath(200, '/', 'This is the home page');
+    await testPath(200, '/about.html', 'The about page');
+    await testPath(200, '/contact/', 'Contact Subdirectory');
+    await testPath(404, '/nothing/', 'Custom 404 Page');
+  })
+);
+
+test(
+  '[vercel dev] test trailingSlash false serve correct content',
+  testFixtureStdio('test-trailing-slash-false', async (testPath: any) => {
+    await testPath(200, '/', 'Index Page');
+    await testPath(200, '/index.html', 'Index Page');
+    await testPath(200, '/about.html', 'About Page');
+    await testPath(200, '/sub', 'Sub Index Page');
+    await testPath(200, '/sub/index.html', 'Sub Index Page');
+    await testPath(200, '/sub/another.html', 'Sub Another Page');
+    await testPath(200, '/style.css', 'body { color: green }');
+    await testPath(308, '/about.html/', 'Redirecting...', {
+      Location: '/about.html',
+    });
+    await testPath(308, '/sub/', 'Redirecting...', {
+      Location: '/sub',
+    });
+    await testPath(308, '/sub/another.html/', 'Redirecting...', {
+      Location: '/sub/another.html',
+    });
+  })
+);
+
+test(
+  '[vercel dev] throw when invalid builder routes detected',
+  testFixtureStdio(
+    'invalid-builder-routes',
+    async (testPath: any) => {
+      await testPath(
+        500,
+        '/',
+        /Route at index 0 has invalid `src`\/`source` regular expression/m
+      );
+    },
+    { skipDeploy: true }
+  )
+);
+
+// n.b. this test requires the project 00-list-directory to have directory listing
+// enabled at 00-list-directory/settings/advanced
+test(
+  '[vercel dev] 00-list-directory',
+  testFixtureStdio('00-list-directory', async (testPath: any) => {
+    await testPath(200, '/', /Files within/m);
+    await testPath(200, '/', /test[0-3]\.txt/m);
+    await testPath(200, '/', /\.well-known/m);
+    await testPath(200, '/.well-known/keybase.txt', 'proof goes here');
+  })
+);
+
+test(
+  '[vercel dev] 01-node',
+  testFixtureStdio('01-node', async (testPath: any) => {
+    await testPath(200, '/', /A simple deployment with the Vercel API!/m);
+  })
+);
+
+test(
+  '[vercel dev] add a `api/fn.ts` when `api` does not exist at startup`',
+  testFixtureStdio('no-api', async (_testPath: any, port: any) => {
+    const directory = fixture('no-api');
+    const apiDir = join(directory, 'api');
+
+    try {
+      {
+        const response = await nodeFetch(
+          `http://localhost:${port}/api/new-file`
+        );
+        validateResponseHeaders(response);
+        expect(response.status).toBe(404);
+      }
+
+      const fileContents = `
+          export const config = {
+            runtime: 'edge'
+          }
+
+          export default async function edge(request, event) {
+            return new Response('from new file');
+          }
+        `;
+
+      await mkdirp(apiDir);
+      await fs.writeFile(join(apiDir, 'new-file.js'), fileContents);
+
+      // Wait until file events have been processed
+      await sleep(ms('1s'));
+
+      {
+        const response = await nodeFetch(
+          `http://localhost:${port}/api/new-file`
+        );
+        validateResponseHeaders(response);
+        const body = await response.text();
+        expect(body.trim()).toBe('from new file');
+      }
+    } finally {
+      await fs.remove(apiDir);
+    }
+  })
+);
+
+describe('[vercel dev] Express', () => {
+  test(
+    '[vercel dev] Express no export',
+    testFixtureStdio(
+      'express-no-export',
+      async (_testPath: any, port: any) => {
+        const res = await nodeFetch(`http://localhost:${port}`);
+        validateResponseHeaders(res);
+        const json = await res.json();
+        expect(json).toHaveProperty('message', 'Hello Express!');
+
+        const res2 = await nodeFetch(`http://localhost:${port}/test.json`);
+        validateResponseHeaders(res2);
+        const json2 = await res2.json();
+        expect(json2).toHaveProperty('message', 'Hello Express!');
+      },
+      { skipDeploy: true }
+    )
+  );
+});
+
+describe('[vercel dev] ESM edge functions', () => {
+  test(
+    '[vercel dev] ESM .js type=module',
+    testFixtureStdio(
+      'esm-js-edge-module',
+      async (_testPath: any, port: any) => {
+        const res = await nodeFetch(`http://localhost:${port}/api/data`);
+        validateResponseHeaders(res);
+        const json = await res.json();
+        expect(json).toHaveProperty('isLeapYear');
+      },
+      { skipDeploy: true }
+    )
+  );
+
+  test(
+    '[vercel dev] ESM .ts type=module',
+    testFixtureStdio(
+      'esm-ts-edge-module',
+      async (_testPath: any, port: any) => {
+        const res = await nodeFetch(`http://localhost:${port}/api/data`);
+        validateResponseHeaders(res);
+        const json = await res.json();
+        expect(json).toHaveProperty('isLeapYear');
+      },
+      { skipDeploy: true }
+    )
+  );
+
+  test(
+    '[vercel dev] ESM .js type=commonjs',
+    testFixtureStdio(
+      'esm-js-edge-no-module',
+      async (_testPath: any, port: any) => {
+        const res = await nodeFetch(`http://localhost:${port}/api/data`);
+        validateResponseHeaders(res);
+        const json = await res.json();
+        expect(json).toHaveProperty('isLeapYear');
+      },
+      { skipDeploy: true }
+    )
+  );
+
+  test(
+    '[vercel dev] ESM .ts type=commonjs',
+    testFixtureStdio(
+      'esm-ts-edge-no-module',
+      async (_testPath: any, port: any) => {
+        const res = await nodeFetch(`http://localhost:${port}/api/data`);
+        validateResponseHeaders(res);
+        const json = await res.json();
+        expect(json).toHaveProperty('isLeapYear');
+      },
+      { skipDeploy: true }
+    )
+  );
+});
+
+describe('[vercel dev] ESM serverless functions', () => {
+  test(
+    '[vercel dev] ESM .js type=module',
+    testFixtureStdio(
+      'esm-js-nodejs-module',
+      async (_testPath: any, port: any) => {
+        const res = await nodeFetch(`http://localhost:${port}/api/data`);
+        validateResponseHeaders(res);
+        const json = await res.json();
+        expect(json).toHaveProperty('isLeapYear');
+      },
+      { skipDeploy: true }
+    )
+  );
+
+  test(
+    '[vercel dev] ESM .ts type=module',
+    testFixtureStdio(
+      'esm-ts-nodejs-module',
+      async (_testPath: any, port: any) => {
+        const res = await nodeFetch(`http://localhost:${port}/api/data`);
+        validateResponseHeaders(res);
+        const json = await res.json();
+        expect(json).toHaveProperty('isLeapYear');
+      },
+      { skipDeploy: true }
+    )
+  );
+
+  test(
+    '[vercel dev] ESM .js type=commonjs',
+    testFixtureStdio(
+      'esm-js-nodejs-no-module',
+      async (_testPath: any, port: any) => {
+        const res = await nodeFetch(`http://localhost:${port}/api/data`);
+        validateResponseHeaders(res);
+        const json = await res.json();
+        expect(json).toHaveProperty('isLeapYear');
+      },
+      { skipDeploy: true }
+    )
+  );
+
+  test(
+    '[vercel dev] ESM .ts type=commonjs',
+    testFixtureStdio(
+      'esm-ts-nodejs-no-module',
+      async (_testPath: any, port: any) => {
+        const res = await nodeFetch(`http://localhost:${port}/api/data`);
+        validateResponseHeaders(res);
+        const json = await res.json();
+        expect(json).toHaveProperty('isLeapYear');
+      },
+      { skipDeploy: true }
+    )
+  );
+
+  test(
+    '[vercel dev] TypeScript importing another TS file, type=commonjs',
+    testFixtureStdio(
+      'vercel-ts-test',
+      async (_testPath: any, port: number) => {
+        const res = await nodeFetch(`http://localhost:${port}/api/test`);
+        validateResponseHeaders(res);
+        const text = await res.text();
+        expect(text).toEqual('Hello, Batman!');
+      },
+      { skipDeploy: true }
+    )
+  );
+});
+
+describe('[vercel dev] Hono', () => {
+  test(
+    '[vercel dev] Hono with public folder',
+    testFixtureStdio(
+      'hono-no-export',
+      async (_testPath: any, port: number) => {
+        const res = await nodeFetch(`http://localhost:${port}/test.json`);
+        validateResponseHeaders(res);
+        const json2 = await res.json();
+        expect(json2).toHaveProperty('message', 'Hello Hono!');
+      },
+      { skipDeploy: true }
+    )
+  );
+});
+
+describe('[vercel dev] Multi-service with experimentalServices', () => {
+  test('[vercel dev] explicit config with Next.js + 2 Python services', async () => {
+    const dir = fixture('services-explicit-config');
+    const { dev, port, readyResolver } = await testFixture(
+      dir,
+      {
+        skipNpmInstall: true,
+        env: {
+          VERCEL_USE_EXPERIMENTAL_SERVICES: '1',
+          VERCEL_USE_EXPERIMENTAL_FRAMEWORKS: '1',
+        },
+      },
+      ['--local']
+    );
+
+    try {
+      await readyResolver;
+
+      // FastAPI service
+      const fastapiRes = await nodeFetch(
+        `http://localhost:${port}/api/fastapi/`
+      );
+      expect(fastapiRes.status).toBe(200);
+      const fastapiJson = await fastapiRes.json();
+      expect(fastapiJson).toHaveProperty('framework', 'fastapi');
+      expect(fastapiJson).toHaveProperty('service', 'service-fastapi');
+
+      // Flask service
+      const flaskRes = await nodeFetch(`http://localhost:${port}/api/flask/`);
+      expect(flaskRes.status).toBe(200);
+      const flaskJson = await flaskRes.json();
+      expect(flaskJson).toHaveProperty('framework', 'flask');
+      expect(flaskJson).toHaveProperty('service', 'service-flask');
+
+      // Next.js frontend
+      const frontendRes = await nodeFetch(`http://localhost:${port}/`);
+      expect(frontendRes.status).toBe(200);
+      const frontendHtml = await frontendRes.text();
+      expect(frontendHtml).toContain('Frontend - Explicit Config (Next.js)');
+    } finally {
+      await dev.kill();
+    }
+  });
+});
+
+describe('[vercel dev] Multi-service with experimentalServicesV2', () => {
+  test('[vercel dev] service routing with a pyproject Python entrypoint', async () => {
+    const dir = fixture('services-v2-frontend-backend');
+    const { dev, port, readyResolver } = await testFixture(
+      dir,
+      {
+        skipNpmInstall: true,
+        env: {
+          VERCEL_USE_EXPERIMENTAL_FRAMEWORKS: '1',
+        },
+      },
+      ['--local']
+    );
+
+    try {
+      await readyResolver;
+
+      // /api/:path + headers rule
+      const noPath = await nodeFetch(
+        `http://localhost:${port}/api/echo?foo=bar`
+      );
+      validateResponseHeaders(noPath);
+      expect(noPath.status).toBe(200);
+      expect(noPath.headers.get('x-backend-service')).toBe('backend');
+      const noPathJson = await noPath.json();
+      expect(noPathJson).toMatchObject({
+        service: 'backend',
+        received_path: '/api/echo',
+        received_query: 'foo=bar',
+      });
+
+      // /svc/:path top-level + header rule because of per-service /api/(.*)
+      const withPath = await nodeFetch(`http://localhost:${port}/svc/echo`);
+      validateResponseHeaders(withPath);
+      expect(withPath.headers.get('x-backend-service')).toBe('backend');
+      const withPathJson = await withPath.json();
+      expect(withPathJson).toHaveProperty('received_path', '/svc/echo');
+
+      // per-service rewrites are applied to the proxied path
+      const stripped = await nodeFetch(
+        `http://localhost:${port}/api/strip/echo?foo=bar`
+      );
+      validateResponseHeaders(stripped);
+      expect(stripped.status).toBe(200);
+      expect(stripped.headers.get('x-backend-service')).toBe('backend');
+      const strippedJson = await stripped.json();
+      expect(strippedJson).toMatchObject({
+        service: 'backend',
+        received_path: '/echo',
+        received_query: 'foo=bar',
+      });
+
+      // top-level + per-service rewrites redirect
+      const redirect = await nodeFetch(`http://localhost:${port}/api/old`, {
+        redirect: 'manual',
+      });
+      expect(redirect.status).toBe(308);
+      expect(redirect.headers.get('location')).toBe('/api/new');
+
+      // top-level + per-service routes redirect
+      const routeRedirect = await nodeFetch(
+        `http://localhost:${port}/api/legacy`,
+        { redirect: 'manual' }
+      );
+      expect(routeRedirect.status).toBe(308);
+      expect(routeRedirect.headers.get('location')).toBe('/api/new');
+
+      // top-level rule for /svc + per-service rewrites redirect for /api/
+      const pathRedirect = await nodeFetch(`http://localhost:${port}/svc/old`, {
+        redirect: 'manual',
+      });
+      expect(pathRedirect.status).toBe(308);
+      expect(pathRedirect.headers.get('location')).toBe('/api/new');
+
+      // route transforms
+      const transformed = await nodeFetch(
+        `http://localhost:${port}/transform/echo?foo=bar`
+      );
+      validateResponseHeaders(transformed);
+      expect(transformed.status).toBe(200);
+      expect(transformed.headers.get('x-resp-injected')).toBe('resp');
+      expect(transformed.headers.get('x-overridden')).toBe('overridden');
+      // a transform declared on the service-marker route is a marker-only
+      // handoff in the proxy and must not be applied here either
+      expect(transformed.headers.get('x-marker-should-not-apply')).toBeNull();
+      const transformedJson = await transformed.json();
+      expect(transformedJson).toMatchObject({
+        service: 'backend',
+        received_path: '/api/echo',
+        received_x_injected: 'hdr',
+      });
+      expect(transformedJson.received_query).toContain('foo=bar');
+      expect(transformedJson.received_query).toContain('injected=yes');
+
+      // a non-redirect status route (410) proceeds past the transform step, so
+      // its own `response.headers` transform DOES apply — the proxy's
+      // handle_status only finishes routing for redirects.
+      const gone = await nodeFetch(`http://localhost:${port}/gone`);
+      expect(gone.status).toBe(410);
+      expect(gone.headers.get('x-gone-resp')).toBe('1');
+
+      // a redirect route, by contrast, exits before its own transforms run.
+      const oldRedirect = await nodeFetch(`http://localhost:${port}/old`, {
+        redirect: 'manual',
+      });
+      expect(oldRedirect.status).toBe(308);
+      expect(oldRedirect.headers.get('location')).toBe('/new');
+      expect(oldRedirect.headers.get('x-should-not-apply')).toBeNull();
+
+      // a `request.path` transform declared directly on a service rewrite is a
+      // no-op
+      const markerNoop = await nodeFetch(`http://localhost:${port}/rw/echo`);
+      validateResponseHeaders(markerNoop);
+      expect(markerNoop.status).toBe(200);
+      const markerNoopJson = await markerNoop.json();
+      expect(markerNoopJson).toMatchObject({
+        service: 'backend',
+        received_path: '/rw/echo',
+      });
+
+      // frontend handler
+      const frontend = await nodeFetch(`http://localhost:${port}/`);
+      validateResponseHeaders(frontend);
+      const frontendHtml = await frontend.text();
+      expect(frontendHtml).toContain('Frontend in frontend/ directory');
+    } finally {
+      await dev.kill();
+    }
+  });
+});
+
+describe('[vercel dev] experimentalServicesV2 service bindings', () => {
+  test('[vercel dev] bindings for different runtime services', async () => {
+    const dir = fixture('services-v2-bindings');
+    const { dev, port, readyResolver } = await testFixture(
+      dir,
+      {
+        skipNpmInstall: true,
+        env: {
+          VERCEL_USE_EXPERIMENTAL_FRAMEWORKS: '1',
+        },
+      },
+      ['--local']
+    );
+
+    try {
+      await readyResolver;
+
+      // Each binding env var is injected as a local URL base with no trailing slash.
+      const info = await nodeFetch(`http://localhost:${port}/binding-info`);
+      expect(info.status).toBe(200);
+      const infoJson = await info.json();
+      expect(infoJson.node_api_url).toMatch(/^http:\/\/127\.0\.0\.1:\d+$/);
+      expect(infoJson.py_api_url).toMatch(/^http:\/\/127\.0\.0\.1:\d+$/);
+      expect(infoJson.go_api_url).toMatch(/^http:\/\/127\.0\.0\.1:\d+$/);
+      expect(infoJson.ruby_api_url).toMatch(/^http:\/\/127\.0\.0\.1:\d+$/);
+
+      // The gateway reaches each internal service (one per runtime) through its
+      // binding. None of the targets are publicly routed.
+      const nodeRes = await nodeFetch(`http://localhost:${port}/call/node`);
+      expect(nodeRes.status).toBe(200);
+      expect((await nodeRes.text()).trim()).toBe('node_api: ok');
+
+      const pyRes = await nodeFetch(`http://localhost:${port}/call/py`);
+      expect(pyRes.status).toBe(200);
+      expect(await pyRes.json()).toMatchObject({ service: 'py_api', ok: true });
+
+      const goRes = await nodeFetch(`http://localhost:${port}/call/go`);
+      expect(goRes.status).toBe(200);
+      expect((await goRes.text()).trim()).toBe('go_api: pong');
+
+      const rubyRes = await nodeFetch(`http://localhost:${port}/call/ruby`);
+      expect(rubyRes.status).toBe(200);
+      expect((await rubyRes.text()).trim()).toBe('ruby_api: ok');
+    } finally {
+      await dev.kill();
+    }
+  });
+});
+
+describe('[vercel dev] services with a top-level proxy', () => {
+  test('[vercel dev] proxy runs ahead of service rewrites', async () => {
+    const dir = fixture('services-proxy');
+    const { dev, port, readyResolver } = await testFixture(dir, {}, [
+      '--local',
+    ]);
+
+    try {
+      await readyResolver;
+
+      // The proxy responds directly for its own path.
+      const proxied = await nodeFetch(`http://localhost:${port}/from-proxy`);
+      expect(proxied.status).toBe(200);
+      expect(await proxied.text()).toBe('hi from proxy');
+
+      // Everything else falls through the proxy to the routed service.
+      const web = await nodeFetch(`http://localhost:${port}/`);
+      expect(web.status).toBe(200);
+      expect(await web.text()).toBe('web: /');
+
+      const webPath = await nodeFetch(`http://localhost:${port}/some/path`);
+      expect(webPath.status).toBe(200);
+      expect(await webPath.text()).toBe('web: /some/path');
+    } finally {
+      await dev.kill();
+    }
+  });
+});
+
+describe('[vercel dev] Pyproject queue subscribers', () => {
+  const resultsDir = join(
+    __dirname,
+    'fixtures',
+    'pyproject-subscriber',
+    '.results'
+  );
+
+  beforeEach(async () => {
+    await fs.remove(resultsDir);
+  });
+
+  test('[vercel dev] Celery tasks trigger pyproject subscribers', async () => {
+    const dir = fixture('pyproject-subscriber');
+    const { dev, port, readyResolver } = await testFixture(
+      dir,
+      {
+        skipNpmInstall: true,
+        // Both workers share one managed environment; an unrelated activated
+        // environment must not trip the multi-workspace guard.
+        env: {
+          VIRTUAL_ENV: join(process.cwd(), '.external-test-venv'),
+        },
+      },
+      ['--local']
+    );
+    try {
+      await readyResolver;
+
+      const enqueueRes = await nodeFetch(`http://localhost:${port}/enqueue`, {
+        method: 'POST',
+      });
+      expect(enqueueRes.status).toBe(200);
+
+      const highResultPath = join(resultsDir, 'high-priority.json');
+      const lowResultPath = join(resultsDir, 'low-priority.json');
+      let highResult: any = null;
+      let lowResult: any = null;
+      for (let i = 0; i < 30; i++) {
+        await sleep(500);
+        if (
+          (await fs.pathExists(highResultPath)) &&
+          (await fs.pathExists(lowResultPath))
+        ) {
+          highResult = await fs.readJson(highResultPath);
+          lowResult = await fs.readJson(lowResultPath);
+          break;
+        }
+      }
+
+      expect(highResult).toEqual({
+        requestId: 'dev-celery-high',
+        priority: 'high-priority',
+        sum: 42,
+      });
+      expect(lowResult).toEqual({
+        requestId: 'dev-celery-low',
+        priority: 'low-priority',
+        sum: 42,
+      });
+    } finally {
+      await dev.kill();
+    }
+  });
+});
+
+describe('[vercel dev] APScheduler pyproject subscriber', () => {
+  const resultsDir = join(
+    __dirname,
+    'fixtures',
+    'services-v2-apscheduler',
+    '.results'
+  );
+
+  beforeEach(async () => {
+    await fs.remove(resultsDir);
+  });
+
+  test('[vercel dev] first request activates the scheduler and the wake chain ticks', async () => {
+    const dir = fixture('services-v2-apscheduler');
+    const { dev, port, readyResolver } = await testFixture(
+      dir,
+      {
+        skipNpmInstall: true,
+        env: {
+          VERCEL_USE_EXPERIMENTAL_FRAMEWORKS: '1',
+        },
+      },
+      ['--local']
+    );
+
+    try {
+      await readyResolver;
+
+      // Traffic-driven activation: the first web request publishes the
+      // durable start message; the sidecar starts the scheduler and keeps
+      // it alive through delayed wake messages on the dev queue broker.
+      const res = await nodeFetch(`http://localhost:${port}/`);
+      expect(res.status).toBe(200);
+      expect(await res.json()).toEqual({ service: 'web' });
+
+      // Two ticks prove the chain advances (start -> wake -> wake), not
+      // just a single delivery.
+      const ticksPath = join(resultsDir, 'ticks.log');
+      let ticks: string[] = [];
+      for (let i = 0; i < 60; i++) {
+        await sleep(500);
+        if (await fs.pathExists(ticksPath)) {
+          const contents = await fs.readFile(ticksPath, 'utf8');
+          ticks = contents.split('\n').filter(Boolean);
+          if (ticks.length >= 2) break;
+        }
+      }
+
+      expect(ticks.length).toBeGreaterThanOrEqual(2);
+    } finally {
+      await dev.kill();
+    }
+  });
+});
+
+describe('[vercel dev] Worker service', () => {
+  const resultsDir = join(__dirname, 'fixtures', 'services-worker', '.results');
+
+  beforeEach(async () => {
+    await fs.remove(resultsDir);
+  });
+
+  test('[vercel dev] web send() triggers exact and wildcard worker execution', async () => {
+    const dir = fixture('services-worker');
+    const { dev, port, readyResolver } = await testFixture(
+      dir,
+      {
+        skipNpmInstall: true,
+        env: {
+          VERCEL_USE_EXPERIMENTAL_SERVICES: '1',
+          VERCEL_USE_EXPERIMENTAL_FRAMEWORKS: '1',
+        },
+      },
+      ['--local']
+    );
+
+    try {
+      await readyResolver;
+
+      const enqueueRes = await nodeFetch(`http://localhost:${port}/enqueue`, {
+        method: 'POST',
+      });
+      expect(enqueueRes.status).toBe(200);
+      const enqueueJson = await enqueueRes.json();
+      expect(enqueueJson).toHaveProperty('messageId');
+
+      // Poll for both worker side-effect files
+      const exactResultPath = join(resultsDir, 'worker_exact_result.json');
+      const wildcardResultPath = join(
+        resultsDir,
+        'worker_wildcard_result.json'
+      );
+      let exactResult: any = null;
+      let wildcardResult: any = null;
+      for (let i = 0; i < 30; i++) {
+        await sleep(500);
+        if (!exactResult && (await fs.pathExists(exactResultPath))) {
+          exactResult = await fs.readJson(exactResultPath);
+        }
+        if (!wildcardResult && (await fs.pathExists(wildcardResultPath))) {
+          wildcardResult = await fs.readJson(wildcardResultPath);
+        }
+        if (exactResult && wildcardResult) break;
+      }
+
+      expect(exactResult).not.toBeNull();
+      expect(exactResult).toHaveProperty('received', true);
+      expect(exactResult.message).toHaveProperty('action', 'test');
+      expect(exactResult.message).toHaveProperty('value', 42);
+
+      expect(wildcardResult).not.toBeNull();
+      expect(wildcardResult).toHaveProperty('received', true);
+      expect(wildcardResult.message).toHaveProperty('action', 'test');
+      expect(wildcardResult.message).toHaveProperty('value', 42);
+    } finally {
+      await dev.kill();
+    }
+  });
+});
+
+describe('[vercel dev] Queues + Runtime Cache across services', () => {
+  test('[vercel dev] Next.js enqueues, Python completes via the shared Runtime Cache', async () => {
+    const dir = fixture('services-queue-cache');
+    const { dev, port, readyResolver } = await testFixture(
+      dir,
+      {
+        skipNpmInstall: true,
+        env: {
+          VERCEL_USE_EXPERIMENTAL_FRAMEWORKS: '1',
+        },
+      },
+      ['--local']
+    );
+
+    try {
+      await readyResolver;
+
+      // Next.js publishes a message for the Python subscriber.
+      const enqueueRes = await nodeFetch(
+        `http://localhost:${port}/api/enqueue`,
+        {
+          method: 'POST',
+        }
+      );
+      expect(enqueueRes.status).toBe(200);
+      const { taskId, messageId } = await enqueueRes.json();
+      expect(taskId).toBeTruthy();
+      expect(messageId).toBeTruthy();
+
+      // The Python subscriber writes the completion into the Runtime Cache;
+      // Next.js reads it back from the store shared by both processes.
+      let status: any = null;
+      for (let i = 0; i < 60; i++) {
+        await sleep(500);
+        const statusRes = await nodeFetch(
+          `http://localhost:${port}/api/status?taskId=${taskId}`
+        );
+        if (statusRes.status !== 200) continue;
+        const json = await statusRes.json();
+        if (json.status === 'completed') {
+          status = json;
+          break;
+        }
+      }
+
+      expect(status).not.toBeNull();
+      expect(status.completion).toMatchObject({
+        completed: true,
+        messageId,
+      });
+    } finally {
+      await dev.kill();
+    }
+  });
+});
+
+describe('[vercel dev] Schedule-triggered job service', () => {
+  const resultsDir = join(__dirname, 'fixtures', 'services-cron', '.results');
+
+  beforeEach(async () => {
+    await fs.remove(resultsDir);
+  });
+
+  test('[vercel dev] trigger schedule-triggered job via proxy', async () => {
+    const dir = fixture('services-cron');
+    const { dev, port, readyResolver } = await testFixture(
+      dir,
+      {
+        skipNpmInstall: true,
+        env: {
+          VERCEL_USE_EXPERIMENTAL_SERVICES: '1',
+          VERCEL_USE_EXPERIMENTAL_FRAMEWORKS: '1',
+        },
+      },
+      ['--local']
+    );
+
+    try {
+      await readyResolver;
+
+      // Trigger the service directly via the proxy to not wait for a minute
+      const cronRes = await nodeFetch(
+        `http://localhost:${port}/_svc/cron/crons/task/run_cron_task`,
+        { method: 'POST' }
+      );
+      expect(cronRes.status).toBe(200);
+      const cronJson = await cronRes.json();
+      expect(cronJson).toHaveProperty('ok', true);
+
+      const cronResultPath = join(resultsDir, 'cron_result.json');
+      expect(await fs.pathExists(cronResultPath)).toBe(true);
+      const cronResult = await fs.readJson(cronResultPath);
+      expect(cronResult).toHaveProperty('executed', true);
+    } finally {
+      await dev.kill();
+    }
+  });
+});

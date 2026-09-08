@@ -1,56 +1,74 @@
 import chalk from 'chalk';
 import ms from 'ms';
-import table from 'text-table';
-import Client from '../../util/client';
+import table from '../../util/output/table';
+import type Client from '../../util/client';
 import getAliases from '../../util/alias/get-aliases';
 import getScope from '../../util/get-scope';
+import { getPaginationOpts } from '../../util/get-pagination-opts';
 import stamp from '../../util/output/stamp';
-import strlen from '../../util/strlen';
 import getCommandFlags from '../../util/get-command-flags';
 import { getCommandName } from '../../util/pkg-name';
+import { validateJsonOutput } from '../../util/output-format';
+import { AliasListTelemetryClient } from '../../util/telemetry/commands/alias/list';
+import output from '../../output-manager';
+import { listSubcommand } from './command';
+import { getFlagsSpecification } from '../../util/get-flags-specification';
+import { parseArguments } from '../../util/get-args';
+import { printError } from '../../util/error';
+import { validateLsArgs } from '../../util/validate-ls-args';
+import type { Alias } from '@vercel-internals/types';
 
-import { Alias } from '../../types';
+export default async function ls(client: Client, argv: string[]) {
+  let parsedArguments;
 
-interface Options {
-  '--next'?: number;
-}
-
-export default async function ls(
-  client: Client,
-  opts: Options,
-  args: string[]
-) {
-  const { output } = client;
-  const { '--next': nextTimestamp } = opts;
-
-  let contextName = null;
+  const flagsSpecification = getFlagsSpecification(listSubcommand.options);
 
   try {
-    ({ contextName } = await getScope(client));
+    parsedArguments = parseArguments(argv, flagsSpecification);
   } catch (err) {
-    if (err.code === 'NOT_AUTHORIZED' || err.code === 'TEAM_DELETED') {
-      output.error(err.message);
-      return 1;
-    }
-
-    throw err;
+    printError(err);
+    return 1;
   }
 
-  if (typeof nextTimestamp !== undefined && Number.isNaN(nextTimestamp)) {
-    output.error('Please provide a number for flag --next');
+  const { args, flags: opts } = parsedArguments;
+
+  const validationResult = validateLsArgs({
+    commandName: 'alias ls',
+    args: args,
+  });
+  if (validationResult !== 0) {
+    return validationResult;
+  }
+
+  const { contextName } = await getScope(client);
+
+  const telemetryClient = new AliasListTelemetryClient({
+    opts: {
+      store: client.telemetryEventStore,
+    },
+  });
+  let paginationOptions;
+
+  const formatResult = validateJsonOutput(opts);
+  if (!formatResult.valid) {
+    output.error(formatResult.error);
+    return 1;
+  }
+  const asJson = formatResult.jsonOutput;
+
+  try {
+    paginationOptions = getPaginationOpts(opts);
+    const [next, limit] = paginationOptions;
+
+    telemetryClient.trackCliOptionNext(next);
+    telemetryClient.trackCliOptionLimit(limit);
+    telemetryClient.trackCliOptionFormat(opts['--format']);
+  } catch (err: unknown) {
+    output.prettyError(err);
     return 1;
   }
 
   const lsStamp = stamp();
-
-  if (args.length > 0) {
-    output.error(
-      `Invalid number of arguments. Usage: ${chalk.cyan(
-        `${getCommandName('alias ls')}`
-      )}`
-    );
-    return 1;
-  }
 
   output.spinner(`Fetching aliases under ${chalk.bold(contextName)}`);
 
@@ -58,18 +76,33 @@ export default async function ls(
   const { aliases, pagination } = await getAliases(
     client,
     undefined,
-    nextTimestamp
+    ...paginationOptions
   );
-  output.log(`aliases found under ${chalk.bold(contextName)} ${lsStamp()}`);
-  console.log(printAliasTable(aliases));
 
-  if (pagination && pagination.count === 20) {
-    const flags = getCommandFlags(opts, ['_', '--next']);
-    output.log(
-      `To display the next page run ${getCommandName(
-        `alias ls${flags} --next ${pagination.next}`
-      )}`
-    );
+  if (asJson) {
+    output.stopSpinner();
+    const jsonOutput = {
+      aliases: aliases.map(a => ({
+        alias: a.alias,
+        deploymentId: a.deploymentId,
+        url: a.deployment?.url ?? null,
+        createdAt: a.createdAt,
+      })),
+      pagination,
+    };
+    client.stdout.write(`${JSON.stringify(jsonOutput, null, 2)}\n`);
+  } else {
+    output.log(`aliases found under ${chalk.bold(contextName)} ${lsStamp()}`);
+    client.stdout.write(printAliasTable(aliases));
+
+    if (pagination.next) {
+      const flags = getCommandFlags(opts, ['_', '--next', '--format']);
+      output.log(
+        `To display the next page run ${getCommandName(
+          `alias ls${flags} --next ${pagination.next}`
+        )}`
+      );
+    }
   }
 
   return 0;
@@ -83,15 +116,11 @@ function printAliasTable(aliases: Alias[]) {
         // for legacy reasons, we might have situations
         // where the deployment was deleted and the alias
         // not collected appropriately, and we need to handle it
-        a.deployment && a.deployment.url ? a.deployment.url : chalk.gray('–'),
+        a.deployment?.url ? a.deployment.url : chalk.gray('–'),
         a.alias,
         ms(Date.now() - a.createdAt),
       ]),
     ],
-    {
-      align: ['l', 'l', 'r'],
-      hsep: ' '.repeat(4),
-      stringLength: strlen,
-    }
+    { align: ['l', 'l', 'r'], hsep: 4 }
   ).replace(/^/gm, '  ')}\n\n`;
 }

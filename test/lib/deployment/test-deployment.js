@@ -2,13 +2,18 @@ const assert = require('assert');
 const bufferReplace = require('buffer-replace');
 const fs = require('fs');
 const json5 = require('json5');
-const glob = require('util').promisify(require('glob'));
+const { glob } = require('glob');
 const path = require('path');
 const { spawn } = require('child_process');
 const fetch = require('./fetch-retry.js');
-const { nowDeploy, fileModeSymbol } = require('./now-deploy.js');
+const { nowDeploy, fileModeSymbol, fetchWithAuth } = require('./now-deploy.js');
+const { handleTransientError } = require('./transient-error.js');
+const {
+  scanParentDirs,
+  getSupportedNodeVersion,
+} = require('@vercel/build-utils');
 
-async function packAndDeploy(builderPath) {
+async function packAndDeploy(builderPath, shouldUnlink = true) {
   await spawnAsync('npm', ['--loglevel', 'warn', 'pack'], {
     stdio: 'inherit',
     cwd: builderPath,
@@ -18,26 +23,513 @@ async function packAndDeploy(builderPath) {
   console.log('tgzPath', tgzPath);
   const url = await nowDeployIndexTgz(tgzPath);
   await fetchTgzUrl(`https://${url}`);
-  fs.unlinkSync(tgzPath);
+  console.log('finished calling the tgz');
+  if (shouldUnlink) {
+    fs.unlinkSync(tgzPath);
+    console.log('finished unlinking tgz');
+  } else {
+    console.log('leaving tgz in place');
+  }
   return url;
 }
 
 const RANDOMNESS_PLACEHOLDER_STRING = 'RANDOMNESS_PLACEHOLDER';
+const DEPLOYMENT_LOG_FETCH_RETRY_DELAY_MS = 2000;
+const DEPLOYMENT_LOG_FETCH_ATTEMPTS = Math.ceil(
+  15000 / DEPLOYMENT_LOG_FETCH_RETRY_DELAY_MS
+);
 
-async function testDeployment(
-  { builderUrl, buildUtilsUrl },
-  fixturePath,
-  buildDelegate
-) {
-  console.log('testDeployment', fixturePath);
+/**
+ * Run a declarative WebSocket probe against a deployment.
+ *
+ * Probe shape (under the `websocket` key of a probe):
+ *   {
+ *     "path": "/ws",                       // required, the upgrade path
+ *     "send": ["hello", "world"],          // optional, text frames to send
+ *     "receive": ["echo:hello", ...],      // optional, exact ordered replies
+ *     "receiveMustContain": ["partial"],   // optional, substring (ordered)
+ *     "status": 101,                        // optional, expected upgrade status
+ *     "headers": { "x-foo": "bar" },       // optional, extra upgrade headers
+ *     "subprotocols": ["v1"],              // optional
+ *     "timeout": 20000                      // optional, ms
+ *   }
+ *
+ * One of `receive` or `receiveMustContain` should be provided. The probe sends
+ * each `send` frame in order, waiting for a reply between frames, and asserts
+ * the upgrade status and the received frames.
+ */
+async function runWebSocketProbe(spec, origin) {
+  // Lazily require so non-WebSocket probes don't load the module.
+  const WebSocket = require('ws');
+
+  assert(spec.path, 'websocket probe must specify a "path"');
+  const send = spec.send || [];
+  const expectExact = spec.receive;
+  const expectContains = spec.receiveMustContain;
+  assert(
+    expectExact || expectContains,
+    'websocket probe must specify "receive" or "receiveMustContain"'
+  );
+  const expectedCount = (expectExact || expectContains).length;
+  const expectedStatus = spec.status || 101;
+  const timeout = spec.timeout || 20000;
+
+  const wsUrl = `${origin.replace(/^https?/, protocol =>
+    protocol === 'https' ? 'wss' : 'ws'
+  )}${spec.path}`;
+  console.log('testing websocket', wsUrl);
+
+  const { received, upgradeStatus } = await new Promise((resolve, reject) => {
+    const socket = new WebSocket(wsUrl, spec.subprotocols || [], {
+      headers: spec.headers || {},
+    });
+    const got = [];
+    let index = 0;
+    let status = 0;
+
+    const timer = setTimeout(() => {
+      try {
+        socket.terminate();
+      } catch (_) {
+        // ignore
+      }
+      reject(
+        new Error(
+          `WebSocket ${wsUrl} timed out after ${timeout}ms ` +
+            `(upgrade status ${status}, received ${JSON.stringify(got)})`
+        )
+      );
+    }, timeout);
+
+    const maybeFinish = () => {
+      if (got.length >= expectedCount) {
+        clearTimeout(timer);
+        try {
+          socket.close();
+        } catch (_) {
+          // ignore
+        }
+        resolve({ received: got, upgradeStatus: status });
+      }
+    };
+
+    socket.on('upgrade', res => {
+      status = res.statusCode;
+    });
+    socket.on('open', () => {
+      if (send.length > 0) {
+        socket.send(send[index]);
+      } else {
+        // No frames to send; wait for server-initiated messages.
+        maybeFinish();
+      }
+    });
+    socket.on('message', data => {
+      got.push(data.toString());
+      index += 1;
+      if (index < send.length) {
+        socket.send(send[index]);
+      }
+      maybeFinish();
+    });
+    socket.on('close', () => {
+      clearTimeout(timer);
+      resolve({ received: got, upgradeStatus: status });
+    });
+    socket.on('unexpected-response', (_req, res) => {
+      clearTimeout(timer);
+      reject(
+        new Error(
+          `WebSocket upgrade failed for ${wsUrl}: HTTP ${res.statusCode}`
+        )
+      );
+    });
+    socket.on('error', err => {
+      clearTimeout(timer);
+      reject(err);
+    });
+  });
+
+  assert.strictEqual(
+    upgradeStatus,
+    expectedStatus,
+    `WebSocket ${wsUrl} expected upgrade status ${expectedStatus}, got ${upgradeStatus}`
+  );
+
+  if (expectExact) {
+    assert.deepStrictEqual(
+      received,
+      expectExact,
+      `WebSocket ${wsUrl} unexpected frames. Expected ${JSON.stringify(
+        expectExact
+      )}, got ${JSON.stringify(received)}`
+    );
+  } else {
+    assert.strictEqual(
+      received.length,
+      expectContains.length,
+      `WebSocket ${wsUrl} expected ${expectContains.length} frames, got ${received.length}: ${JSON.stringify(received)}`
+    );
+    expectContains.forEach((needle, i) => {
+      assert(
+        received[i].includes(needle),
+        `WebSocket ${wsUrl} frame ${i} (${JSON.stringify(received[i])}) does not contain ${JSON.stringify(needle)}`
+      );
+    });
+  }
+
+  console.log('finished testing websocket', wsUrl, JSON.stringify(received));
+}
+
+async function runProbe(probe, deploymentId, origin, ctx) {
+  if (probe.delay) {
+    await new Promise(resolve => setTimeout(resolve, probe.delay));
+    return;
+  }
+
+  if (probe.websocket) {
+    await runWebSocketProbe(probe.websocket, origin);
+    return;
+  }
+
+  if (probe.logMustContain || probe.logMustNotContain) {
+    if (!deploymentId) {
+      throw new Error(
+        `log probes require a deployment; not supported against a dev server`
+      );
+    }
+
+    const shouldContain = !!probe.logMustContain;
+    const toCheck = probe.logMustContain || probe.logMustNotContain;
+
+    if (probe.logMustContain && probe.logMustNotContain) {
+      throw new Error(
+        `probe can not check logMustContain and logMustNotContain in the same check`
+      );
+    }
+
+    if (!ctx.deploymentLogs) {
+      let lastErr;
+
+      for (let i = 0; i < DEPLOYMENT_LOG_FETCH_ATTEMPTS; i++) {
+        try {
+          const logsRes = await fetchWithAuth(
+            `/v1/now/deployments/${deploymentId}/events?limit=-1`
+          );
+
+          if (!logsRes.ok) {
+            throw new Error(
+              `fetching logs failed with status ${logsRes.status}`
+            );
+          }
+          ctx.deploymentLogs = await logsRes.json();
+
+          if (
+            Array.isArray(ctx.deploymentLogs) &&
+            ctx.deploymentLogs.length > 2
+          ) {
+            break;
+          }
+        } catch (err) {
+          lastErr = err;
+        }
+        const logLineCount = Array.isArray(ctx.deploymentLogs)
+          ? ctx.deploymentLogs.length
+          : typeof ctx.deploymentLogs;
+        ctx.deploymentLogs = null;
+        console.log(
+          'Retrying to fetch logs for',
+          deploymentId,
+          `in ${DEPLOYMENT_LOG_FETCH_RETRY_DELAY_MS}ms. Read lines:`,
+          logLineCount
+        );
+        await new Promise(resolve =>
+          setTimeout(resolve, DEPLOYMENT_LOG_FETCH_RETRY_DELAY_MS)
+        );
+      }
+      if (
+        !Array.isArray(ctx.deploymentLogs) ||
+        ctx.deploymentLogs.length === 0
+      ) {
+        throw new Error(
+          `Failed to get deployment logs for probe: ${
+            lastErr ? lastErr.message : 'received empty logs'
+          }`
+        );
+      }
+    }
+
+    let found = false;
+    const deploymentLogs = ctx.deploymentLogs;
+
+    for (const log of deploymentLogs) {
+      if (log.text && log.text.includes(toCheck)) {
+        if (shouldContain) {
+          found = true;
+          break;
+        } else {
+          ctx.deploymentLogs = null;
+          throw new Error(
+            `Expected deployment logs of ${deploymentId} not to contain ${toCheck}, but found ${log.text}`
+          );
+        }
+      }
+    }
+
+    if (!found && shouldContain) {
+      console.log({
+        deploymentId,
+        origin,
+        deploymentLogs,
+        logLength: deploymentLogs?.length,
+      });
+      ctx.deploymentLogs = null;
+      const error = new Error(
+        `Expected deployment logs of ${deploymentId} to contain ${toCheck}, it was not found`
+      );
+      error.retries = 20;
+      error.retryDelay = 5000; // ms
+      throw error;
+    } else {
+      console.log('finished testing', JSON.stringify(probe));
+      return;
+    }
+  }
+
+  const nextScriptIndex = probe.path.indexOf('__NEXT_SCRIPT__(');
+
+  if (nextScriptIndex > -1) {
+    const scriptNameEnd = probe.path.lastIndexOf(')');
+    let scriptName = probe.path.substring(
+      nextScriptIndex + '__NEXT_SCRIPT__('.length,
+      scriptNameEnd
+    );
+    const scriptArgs = scriptName.split(',');
+
+    scriptName = scriptArgs.shift();
+    const manifestPrefix = scriptArgs.shift() || '';
+
+    if (!ctx.nextBuildManifest) {
+      const manifestUrl = `${origin}${manifestPrefix}/_next/static/build-TfctsWXpff2fKS/_buildManifest.js`;
+
+      console.log('fetching buildManifest at', manifestUrl);
+      const { text: manifestContent } = await fetchDeploymentUrl(manifestUrl);
+
+      // we must eval it since we use devalue to stringify it
+      global.__BUILD_MANIFEST_CB = null;
+      ctx.nextBuildManifest = eval(
+        `var self = {};` + manifestContent + `;self.__BUILD_MANIFEST`
+      );
+    }
+    let scriptRelativePath = ctx.nextBuildManifest[scriptName];
+
+    if (Array.isArray(scriptRelativePath)) {
+      scriptRelativePath = scriptRelativePath[0];
+    }
+
+    probe.path =
+      probe.path.substring(0, nextScriptIndex) +
+      scriptRelativePath +
+      probe.path.substring(scriptNameEnd + 1);
+  }
+
+  const probeUrl = `${origin}${probe.path}`;
+  const fetchOpts = {
+    ...probe.fetchOptions,
+    method: probe.method,
+    headers: { ...probe.headers },
+  };
+  if (probe.body) {
+    fetchOpts.headers['content-type'] = 'application/json';
+    fetchOpts.body = JSON.stringify(probe.body);
+  }
+  let result = await fetchDeploymentUrl(probeUrl, fetchOpts);
+
+  // If we receive the preview page from Vercel, the real page should appear momentarily,
+  // retry a few times before running the probe checks
+  const checkForPreviewPage = text => {
+    return text.includes('This page will update once the build completes');
+  };
+  let isShowingBuildPreviewPage = checkForPreviewPage(result.text);
+  for (let retryCount = 0; retryCount < 10; retryCount++) {
+    if (!isShowingBuildPreviewPage) {
+      break;
+    } else {
+      try {
+        result = await fetchDeploymentUrl(probeUrl, fetchOpts);
+      } catch (error) {
+        if (handleTransientError(error, 'preview_page')) {
+          console.log(
+            `Transient error checking preview page for ${probeUrl} (attempt ${retryCount}): ${error.message}`
+          );
+          await new Promise(r => setTimeout(r, 1000));
+          continue;
+        }
+        throw error;
+      }
+      isShowingBuildPreviewPage = checkForPreviewPage(result.text);
+      if (!isShowingBuildPreviewPage) {
+        break;
+      }
+    }
+    await new Promise(r => setTimeout(r, 1000));
+  }
+  if (isShowingBuildPreviewPage) {
+    throw new Error(`Timed out while waiting for preview page to be replaced`);
+  }
+
+  const { text, resp } = result;
+
+  console.log('finished testing', JSON.stringify(probe));
+
+  let hadTest = false;
+
+  if (probe.status) {
+    if (probe.status !== resp.status) {
+      throw new Error(
+        `Fetched page ${probeUrl} does not return the status ${probe.status} Instead it has ${resp.status}`
+      );
+    }
+    hadTest = true;
+  }
+
+  if (probe.mustContain) {
+    const containsIt = text.includes(probe.mustContain);
+    if (!containsIt) {
+      fs.writeFileSync(path.join(__dirname, 'failed-page.txt'), text);
+      const headers = Array.from(resp.headers.entries())
+        .map(([k, v]) => `  ${k}=${v}`)
+        .join('\n');
+      throw new Error(
+        `Fetched page ${probeUrl} does not contain ${probe.mustContain}.` +
+          ` Content ${text}` +
+          ` Response headers:\n ${headers}`
+      );
+    }
+    hadTest = true;
+  }
+
+  if (probe.mustNotContain) {
+    const containsIt = text.includes(probe.mustNotContain);
+    if (containsIt) {
+      fs.writeFileSync(path.join(__dirname, 'failed-page.txt'), text);
+      const headers = Array.from(resp.headers.entries())
+        .map(([k, v]) => `  ${k}=${v}`)
+        .join('\n');
+      throw new Error(
+        `Fetched page ${probeUrl} does contain ${probe.mustNotContain}.` +
+          ` Content ${text}` +
+          ` Response headers:\n ${headers}`
+      );
+    }
+    hadTest = true;
+  }
+
+  if (probe.bodyMustBe) {
+    if (text !== probe.bodyMustBe) {
+      throw new Error(
+        `Fetched page ${probeUrl} does not have an exact body match of ${probe.bodyMustBe}. Content: ${text}`
+      );
+    }
+
+    hadTest = true;
+  }
+
+  /**
+   * @type Record<string, string[]>
+   */
+  const rawHeaders = resp.headers.raw();
+  if (probe.responseHeaders) {
+    // eslint-disable-next-line no-loop-func
+    Object.keys(probe.responseHeaders).forEach(header => {
+      const actualArr = rawHeaders[header.toLowerCase()];
+      let expectedArr = probe.responseHeaders[header];
+
+      // Header should not exist
+      if (expectedArr === null) {
+        if (actualArr) {
+          throw new Error(
+            `Page ${probeUrl} contains response header "${header}", but probe says it should not.\n\nActual: ${formatHeaders(
+              rawHeaders
+            )}`
+          );
+        }
+        return;
+      }
+
+      if (!actualArr?.length) {
+        throw new Error(
+          `Page ${probeUrl} does NOT contain response header "${header}", but probe says it should .\n\nActual: ${formatHeaders(
+            rawHeaders
+          )}`
+        );
+      }
+
+      if (!Array.isArray(expectedArr)) {
+        expectedArr = [expectedArr];
+      }
+      for (const expected of expectedArr) {
+        let isEqual = false;
+
+        for (const actual of actualArr) {
+          isEqual =
+            expected.startsWith('/') && expected.endsWith('/')
+              ? new RegExp(expected.slice(1, -1)).test(actual)
+              : expected === actual;
+          if (isEqual) break;
+        }
+        if (!isEqual) {
+          throw new Error(
+            `Page ${probeUrl} does not have expected response header ${header}.\n\nExpected: ${expected}.\n\nActual: ${formatHeaders(
+              rawHeaders
+            )}`
+          );
+        }
+      }
+    });
+    hadTest = true;
+  }
+
+  if (probe.notResponseHeaders) {
+    Object.keys(probe.notResponseHeaders).forEach(header => {
+      const headerValue = resp.headers.get(header);
+      const expected = probe.notResponseHeaders[header];
+
+      if (headerValue === expected) {
+        throw new Error(
+          `Page ${probeUrl} has unexpected response header ${header}.\n\nDid not expect: ${header}=${expected}.\n\nAll: ${formatHeaders(
+            rawHeaders
+          )}`
+        );
+      }
+    });
+    hadTest = true;
+  }
+
+  assert(hadTest, 'probe must have a test condition');
+}
+
+async function testDeployment(fixturePath, opts = {}) {
+  const projectName = path
+    .basename(fixturePath)
+    .toLowerCase()
+    .replace(/(_|\.)/g, '-');
+  console.log(`testDeployment "${projectName}"`);
   const globResult = await glob(`${fixturePath}/**`, {
     nodir: true,
     dot: true,
   });
   const bodies = globResult.reduce((b, f) => {
+    let data;
     const r = path.relative(fixturePath, f);
-    b[r] = fs.readFileSync(f);
-    b[r][fileModeSymbol] = fs.statSync(f).mode;
+    const stat = fs.lstatSync(f);
+    if (stat.isSymbolicLink()) {
+      data = Buffer.from(fs.readlinkSync(f), 'utf8');
+    } else {
+      data = fs.readFileSync(f);
+    }
+    data[fileModeSymbol] = stat.mode;
+    b[r] = data;
     return b;
   }, {});
 
@@ -57,257 +549,185 @@ async function testDeployment(
   const configName = 'vercel.json' in bodies ? 'vercel.json' : 'now.json';
 
   // we use json5 to allow comments for probes
-  const nowJson = json5.parse(bodies[configName]);
+  const nowJson = json5.parse(bodies[configName] || '{}');
   const uploadNowJson = nowJson.uploadNowJson;
   delete nowJson.uploadNowJson;
 
-  if (process.env.VERCEL_BUILDER_DEBUG) {
-    if (!nowJson.build) {
-      nowJson.build = {};
-    }
-    if (!nowJson.build.env) {
-      nowJson.build.env = {};
-    }
-    nowJson.build.env.VERCEL_BUILDER_DEBUG = process.env.VERCEL_BUILDER_DEBUG;
-  }
-
-  for (const build of nowJson.builds || []) {
-    if (builderUrl) {
-      if (builderUrl === '@canary') {
-        build.use = `${build.use}@canary`;
-      } else {
-        build.use = `https://${builderUrl}`;
-      }
-    }
-    if (buildUtilsUrl) {
-      build.config = build.config || {};
-      const { config } = build;
-      if (buildUtilsUrl === '@canary') {
-        const buildUtils = config.useBuildUtils || '@vercel/build-utils';
-        config.useBuildUtils = `${buildUtils}@canary`;
-      } else {
-        config.useBuildUtils = `https://${buildUtilsUrl}`;
-      }
-    }
-
-    if (buildDelegate) {
-      buildDelegate(build);
+  // Set `projectSettings.nodeVersion` based on the "engines.node" field of
+  // the `package.json`. This ensures the correct build-container version is used.
+  let rootDirectory = path.join(
+    fixturePath,
+    nowJson.builds?.length
+      ? path.dirname(nowJson.builds[0].src)
+      : (nowJson.projectSettings?.rootDirectory ?? '')
+  );
+  const { packageJson } = await scanParentDirs(
+    rootDirectory,
+    true,
+    fixturePath
+  );
+  let nodeVersion;
+  if (packageJson?.engines?.node) {
+    try {
+      const { range } = await getSupportedNodeVersion(packageJson.engines.node);
+      nodeVersion = range;
+    } catch (err) {
+      console.error(err);
     }
   }
 
+  if (nodeVersion) {
+    if (!opts.projectSettings) opts.projectSettings = {};
+    opts.projectSettings.nodeVersion = nodeVersion;
+  }
+
+  const cjsProbePath = path.resolve(fixturePath, 'probe.cjs');
+  const jsProbePath = path.resolve(fixturePath, 'probe.js');
+  const probePath = fs.existsSync(cjsProbePath) ? cjsProbePath : jsProbePath;
+  let probes = [];
+  if ('probes' in nowJson) {
+    probes = nowJson.probes;
+  } else if ('probes.json' in bodies) {
+    probes = json5.parse(bodies['probes.json']).probes;
+  } else if (fs.existsSync(probePath)) {
+    // we'll run probes after we have the deployment url below
+  } else {
+    console.warn(
+      `WARNING: Test fixture "${fixturePath}" does not contain probes.json, probe.cjs, probe.js, or vercel.json`
+    );
+  }
   bodies[configName] = Buffer.from(JSON.stringify(nowJson));
+  delete bodies['probe.cjs'];
   delete bodies['probe.js'];
+  delete bodies['probes.json'];
+  // marks fixtures not expected to work under `vc dev`; not part of the app
+  delete bodies['VC_DEV_XFAIL'];
 
   const { deploymentId, deploymentUrl } = await nowDeploy(
+    projectName,
     bodies,
     randomness,
-    uploadNowJson
+    uploadNowJson,
+    opts
   );
-  let nextBuildManifest;
-  let deploymentLogs;
+  const probeCtx = {};
 
-  for (const probe of nowJson.probes || []) {
-    console.log('testing', JSON.stringify(probe));
-    if (probe.delay) {
-      await new Promise(resolve => setTimeout(resolve, probe.delay));
-      continue;
-    }
-
-    if (probe.logMustContain || probe.logMustNotContain) {
-      const shouldContain = !!probe.logMustContain;
-      const toCheck = probe.logMustContain || probe.logMustNotContain;
-
-      if (probe.logMustContain && probe.logMustNotContain) {
-        throw new Error(
-          `probe can not check logMustContain and logMustNotContain in the same check`
-        );
-      }
-
-      if (!deploymentLogs) {
-        try {
-          const logsRes = await fetch(
-            `https://vercel.com/api/v1/now/deployments/${deploymentId}/events?limit=-1`
-          );
-
-          if (!logsRes.ok) {
-            throw new Error(
-              `fetching logs failed with status ${logsRes.status}`
-            );
-          }
-          deploymentLogs = await logsRes.json();
-        } catch (err) {
-          throw new Error(
-            `Failed to get deployment logs for probe: ${err.message}`
-          );
-        }
-      }
-
-      let found = false;
-
-      for (const log of deploymentLogs) {
-        if (log.text && log.text.includes(toCheck)) {
-          if (shouldContain) {
-            found = true;
-            break;
-          } else {
-            throw new Error(
-              `Expected deployment logs not to contain ${toCheck}, but found ${log.text}`
-            );
-          }
-        }
-      }
-
-      if (!found && shouldContain) {
-        throw new Error(
-          `Expected deployment logs to contain ${toCheck}, it was not found`
-        );
-      } else {
-        console.log('finished testing', JSON.stringify(probe));
-        continue;
-      }
-    }
-
-    const nextScriptIndex = probe.path.indexOf('__NEXT_SCRIPT__(');
-
-    if (nextScriptIndex > -1) {
-      const scriptNameEnd = probe.path.lastIndexOf(')');
-      let scriptName = probe.path.substring(
-        nextScriptIndex + '__NEXT_SCRIPT__('.length,
-        scriptNameEnd
-      );
-      const scriptArgs = scriptName.split(',');
-
-      scriptName = scriptArgs.shift();
-      const manifestPrefix = scriptArgs.shift() || '';
-
-      if (!nextBuildManifest) {
-        const manifestUrl = `https://${deploymentUrl}${manifestPrefix}/_next/static/testing-build-id/_buildManifest.js`;
-
-        console.log('fetching buildManifest at', manifestUrl);
-        const { text: manifestContent } = await fetchDeploymentUrl(manifestUrl);
-
-        // we must eval it since we use devalue to stringify it
-        global.__BUILD_MANIFEST_CB = null;
-        nextBuildManifest = eval(
-          manifestContent
-            .replace('self.__BUILD_MANIFEST', 'manifest')
-            .replace(/self.__BUILD_MANIFEST_CB.*/, '')
-        );
-      }
-      const scriptRelativePath = nextBuildManifest[scriptName];
-
-      probe.path =
-        probe.path.substring(0, nextScriptIndex) +
-        scriptRelativePath +
-        probe.path.substr(scriptNameEnd + 1);
-    }
-
-    const probeUrl = `https://${deploymentUrl}${probe.path}`;
-    const fetchOpts = {
-      ...probe.fetchOptions,
-      method: probe.method,
-      headers: { ...probe.headers },
-    };
-    if (probe.body) {
-      fetchOpts.headers['content-type'] = 'application/json';
-      fetchOpts.body = JSON.stringify(probe.body);
-    }
-    const { text, resp } = await fetchDeploymentUrl(probeUrl, fetchOpts);
-    console.log('finished testing', JSON.stringify(probe));
-
-    if (probe.status) {
-      if (probe.status !== resp.status) {
-        throw new Error(
-          `Fetched page ${probeUrl} does not return the status ${probe.status} Instead it has ${resp.status}`
-        );
-      }
-    }
-
-    if (probe.mustContain || probe.mustNotContain) {
-      const shouldContain = !!probe.mustContain;
-      const containsIt = text.includes(probe.mustContain);
-      if (
-        (!containsIt && probe.mustContain) ||
-        (containsIt && probe.mustNotContain)
-      ) {
-        fs.writeFileSync(path.join(__dirname, 'failed-page.txt'), text);
-        const headers = Array.from(resp.headers.entries())
-          .map(([k, v]) => `  ${k}=${v}`)
-          .join('\n');
-        throw new Error(
-          `Fetched page ${probeUrl} does${
-            shouldContain ? ' not' : ''
-          } contain ${
-            shouldContain ? probe.mustContain : probe.mustNotContain
-          }.` +
-            (shouldContain ? ` Instead it contains ${text.slice(0, 60)}` : '') +
-            ` Response headers:\n ${headers}`
-        );
-      }
-    } else if (probe.responseHeaders) {
-      // eslint-disable-next-line no-loop-func
-      Object.keys(probe.responseHeaders).forEach(header => {
-        const actual = resp.headers.get(header);
-        const expected = probe.responseHeaders[header];
-        const isEqual = Array.isArray(expected)
-          ? expected.every(h => actual.includes(h))
-          : typeof expected === 'string' &&
-            expected.startsWith('/') &&
-            expected.endsWith('/')
-          ? new RegExp(expected.slice(1, -1)).test(actual)
-          : expected === actual;
-        if (!isEqual) {
-          const headers = Array.from(resp.headers.entries())
-            .map(([k, v]) => `  ${k}=${v}`)
-            .join('\n');
-
-          throw new Error(
-            `Page ${probeUrl} does not have header ${header}.\n\nExpected: ${expected}.\nActual: ${headers}`
-          );
-        }
-      });
-    } else if (probe.notResponseHeaders) {
-      Object.keys(probe.notResponseHeaders).forEach(header => {
-        const headerValue = resp.headers.get(header);
-        const expected = probe.notResponseHeaders[header];
-
-        if (headerValue === expected) {
-          const headers = Array.from(resp.headers.entries())
-            .map(([k, v]) => `  ${k}=${v}`)
-            .join('\n');
-
-          throw new Error(
-            `Page ${probeUrl} invalid page header ${header}.\n\n Did not expect: ${header}=${expected}.\nBut got ${headers}`
-          );
-        }
-      });
-    } else if (!probe.status) {
-      assert(false, 'probe must have a test condition');
-    }
+  if (fs.existsSync(probePath)) {
+    await require(probePath)({ deploymentUrl, fetch, randomness });
   }
 
-  const probeJsFullPath = path.resolve(fixturePath, 'probe.js');
-  if (fs.existsSync(probeJsFullPath)) {
-    await require(probeJsFullPath)({ deploymentUrl, fetch, randomness });
-  }
+  await runProbes(probes, `https://${deploymentUrl}`, {
+    deploymentId,
+    ctx: probeCtx,
+  });
 
   return { deploymentId, deploymentUrl };
+}
+
+/**
+ * Run declarative probes against an origin (scheme included), e.g.
+ * `https://my-deployment.vercel.app` or `http://localhost:3001`.
+ * `deploymentId` is required only for log probes.
+ */
+async function runProbes(
+  probes,
+  origin,
+  { deploymentId = null, ctx = {} } = {}
+) {
+  for (const probe of probes) {
+    const stringifiedProbe = JSON.stringify(probe);
+    console.log('testing', stringifiedProbe);
+
+    try {
+      await runProbe(probe, deploymentId, origin, ctx);
+    } catch (err) {
+      const retries = Math.max(probe.retries || 0, err.retries || 0);
+      if (!retries) {
+        throw err;
+      }
+
+      const retryDelay = Math.max(probe.retryDelay || 0, err.retryDelay || 0);
+
+      for (let i = 0; i < retries; i++) {
+        console.log(`re-trying ${i + 1}/${retries}:`, stringifiedProbe);
+
+        try {
+          await runProbe(probe, deploymentId, origin, ctx);
+          break;
+        } catch (err) {
+          if (i === retries - 1) {
+            throw err;
+          }
+
+          if (retryDelay) {
+            console.log(`Waiting ${retryDelay}ms before retrying`);
+            await new Promise(resolve => setTimeout(resolve, retryDelay));
+          }
+        }
+      }
+    }
+  }
+}
+
+function readFixtureJson5(fixturePath, name, randomness) {
+  const filePath = path.join(fixturePath, name);
+  if (!fs.existsSync(filePath)) return null;
+  let text = fs.readFileSync(filePath, 'utf8');
+  if (randomness) {
+    text = text.split(RANDOMNESS_PLACEHOLDER_STRING).join(randomness);
+  }
+  return json5.parse(text);
+}
+
+/** Read a fixture's vercel.json/now.json; null when neither exists. */
+function loadFixtureConfig(fixturePath, { randomness } = {}) {
+  return (
+    readFixtureJson5(fixturePath, 'vercel.json', randomness) ||
+    readFixtureJson5(fixturePath, 'now.json', randomness)
+  );
+}
+
+/**
+ * Read the declarative probes for a fixture directory: the `probes` key of
+ * vercel.json/now.json if present, else probes.json. Returns [] when neither
+ * exists. Pass `randomness` to substitute RANDOMNESS_PLACEHOLDER before
+ * parsing.
+ */
+function loadFixtureProbes(fixturePath, { randomness } = {}) {
+  const config = loadFixtureConfig(fixturePath, { randomness });
+  if (config && 'probes' in config) {
+    return config.probes;
+  }
+  const probesJson = readFixtureJson5(fixturePath, 'probes.json', randomness);
+  return probesJson ? probesJson.probes : [];
 }
 
 async function nowDeployIndexTgz(file) {
   const bodies = {
     'index.tgz': fs.readFileSync(file),
-    'now.json': Buffer.from(JSON.stringify({ version: 2 })),
+    'vercel.json': Buffer.from(JSON.stringify({ version: 2 })),
   };
 
-  return (await nowDeploy(bodies)).deploymentUrl;
+  return (await nowDeploy('pack-n-deploy', bodies)).deploymentUrl;
 }
 
 async function fetchDeploymentUrl(url, opts) {
   for (let i = 0; i < 50; i += 1) {
-    const resp = await fetch(url, opts);
+    let resp;
+    try {
+      resp = await fetch(url, opts);
+    } catch (error) {
+      if (handleTransientError(error, 'deployment_url')) {
+        console.log(
+          `Transient error fetching deployment url ${url} (attempt ${i}): ${error.message}`
+        );
+        await new Promise(r => setTimeout(r, 1000));
+        continue;
+      }
+      throw error;
+    }
     const text = await resp.text();
-    if (text && !text.includes('Join Free')) {
+    if (typeof text !== 'undefined' && !text.includes('Join Free')) {
       return { resp, text };
     }
 
@@ -319,7 +739,19 @@ async function fetchDeploymentUrl(url, opts) {
 
 async function fetchTgzUrl(url) {
   for (let i = 0; i < 500; i += 1) {
-    const resp = await fetch(url);
+    let resp;
+    try {
+      resp = await fetch(url);
+    } catch (error) {
+      if (handleTransientError(error, 'tgz_url')) {
+        console.log(
+          `Transient error fetching tgz url ${url} (attempt ${i}): ${error.message}`
+        );
+        await new Promise(r => setTimeout(r, 1000));
+        continue;
+      }
+      throw error;
+    }
     if (resp.status === 200) {
       const buffer = await resp.buffer();
       if (buffer[0] === 0x1f) {
@@ -357,7 +789,19 @@ async function spawnAsync(...args) {
   });
 }
 
+/**
+ * @param {Record<string, string[]>} headers
+ */
+function formatHeaders(headers) {
+  return Object.entries(headers)
+    .flatMap(([name, values]) => values.map(v => `  ${name}: ${v}`))
+    .join('\n');
+}
+
 module.exports = {
   packAndDeploy,
   testDeployment,
+  runProbes,
+  loadFixtureConfig,
+  loadFixtureProbes,
 };

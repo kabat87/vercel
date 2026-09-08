@@ -1,10 +1,11 @@
 import bytes from 'bytes';
-import { Response } from 'node-fetch';
+import type { Response } from './fetch';
 import { NowBuildError } from '@vercel/build-utils';
 import { NowError } from './now-error';
 import code from './output/code';
 import { getCommandName } from './pkg-name';
 import chalk from 'chalk';
+import { isError } from '@vercel/error-utils';
 
 /**
  * This error is thrown when there is an API error with a payload. The error
@@ -17,7 +18,8 @@ export class APIError extends Error {
   link?: string;
   slug?: string;
   action?: string;
-  retryAfter: number | null | 'never';
+  retryAfterMs?: number | 'never';
+  wwwAuthenticate?: string;
   [key: string]: any;
 
   constructor(message: string, response: Response, body?: object) {
@@ -25,7 +27,8 @@ export class APIError extends Error {
     this.message = `${message} (${response.status})`;
     this.status = response.status;
     this.serverMessage = message;
-    this.retryAfter = null;
+    this.wwwAuthenticate =
+      response.headers.get('WWW-Authenticate') ?? undefined;
 
     if (body) {
       for (const field of Object.keys(body)) {
@@ -36,13 +39,38 @@ export class APIError extends Error {
       }
     }
 
-    if (response.status === 429) {
-      const retryAfter = response.headers.get('Retry-After');
-      if (retryAfter) {
-        this.retryAfter = parseInt(retryAfter, 10);
-      }
+    // HTTP 429 (Too Many Requests) or 503 (Service Unavailable) both are spec'd to serve retry-after headers
+    if (response.status === 429 || response.status === 503) {
+      const parsed = parseRetryAfterHeaderAsMillis(
+        response.headers.get('Retry-After')
+      );
+      // If the retry-after header is missing or malfomed set to 0.  This ensures users will attempt a retry even in these cases.
+      this.retryAfterMs = parsed ?? (response.status === 429 ? 0 : undefined);
     }
   }
+}
+
+export function parseRetryAfterHeaderAsMillis(
+  header: string | null
+): number | undefined {
+  if (!header) return undefined;
+  // The header might be a literal number of seconds or a formatted date
+  // The date format is spec'd and date.parse should handle it.
+  let retryAfterMs = Number(header) * 1000;
+  if (Number.isNaN(retryAfterMs)) {
+    retryAfterMs = Date.parse(header);
+    if (Number.isNaN(retryAfterMs)) {
+      return undefined;
+    } else {
+      retryAfterMs = retryAfterMs - Date.now();
+    }
+  }
+  // If the date is in the past (clock skew? latency?) just retry immediately
+  return Math.max(retryAfterMs, 0);
+}
+
+export function isAPIError(v: unknown): v is APIError {
+  return isError(v) && 'status' in v;
 }
 
 /**
@@ -54,7 +82,7 @@ export class TeamDeleted extends NowError<'TEAM_DELETED', {}> {
   constructor() {
     super({
       code: 'TEAM_DELETED',
-      message: `Your team was deleted. You can switch to a different one using ${getCommandName(
+      message: `Your team was deleted or you were removed from the team. You can switch to a different one using ${getCommandName(
         `switch`
       )}.`,
       meta: {},
@@ -67,12 +95,22 @@ export class TeamDeleted extends NowError<'TEAM_DELETED', {}> {
  * because the token is not valid anymore.
  */
 export class InvalidToken extends NowError<'NOT_AUTHORIZED', {}> {
-  constructor() {
+  constructor(tokenSource?: 'flag' | 'env') {
+    let message: string;
+    if (tokenSource === 'flag') {
+      message =
+        'The token provided via `--token` argument is not valid. Please provide a valid token.';
+    } else if (tokenSource === 'env') {
+      message =
+        'The token provided via VERCEL_TOKEN environment variable is not valid. Please provide a valid token.';
+    } else {
+      message = `The specified token is not valid. Use ${getCommandName(
+        'login'
+      )} to generate a new token.`;
+    }
     super({
-      code: `NOT_AUTHORIZED`,
-      message: `The specified token is not valid. Use ${getCommandName(
-        `login`
-      )} to generate a new token.`,
+      code: 'NOT_AUTHORIZED',
+      message,
       meta: {},
     });
   }
@@ -147,9 +185,7 @@ export class SourceNotFound extends NowError<'SOURCE_NOT_FOUND', {}> {
     super({
       code: 'SOURCE_NOT_FOUND',
       meta: {},
-      message: `Not able to purchase. Please add a payment method using ${getCommandName(
-        `billing add`
-      )}.`,
+      message: `Not able to purchase. Please add a payment method using the dashboard.`,
     });
   }
 }
@@ -261,31 +297,6 @@ export type TXTVerificationError = {
 };
 
 /**
- * This error is returned when the domain is not verified by nameservers for wildcard alias.
- */
-export class DomainNsNotVerifiedForWildcard extends NowError<
-  'DOMAIN_NS_NOT_VERIFIED_FOR_WILDCARD',
-  {
-    domain: string;
-    nsVerification: NSVerificationError;
-  }
-> {
-  constructor({
-    domain,
-    nsVerification,
-  }: {
-    domain: string;
-    nsVerification: NSVerificationError;
-  }) {
-    super({
-      code: 'DOMAIN_NS_NOT_VERIFIED_FOR_WILDCARD',
-      meta: { domain, nsVerification },
-      message: `The domain ${domain} is not verified by nameservers for wildcard alias.`,
-    });
-  }
-}
-
-/**
  * Used when a domain is validated because we tried to add it to an account
  * via API or for any other reason.
  */
@@ -316,11 +327,11 @@ export class InvalidDeploymentId extends NowError<
   'INVALID_DEPLOYMENT_ID',
   { id: string }
 > {
-  constructor(id: string) {
+  constructor(id: string, message?: string | null) {
     super({
       code: 'INVALID_DEPLOYMENT_ID',
       meta: { id },
-      message: `The deployment id "${id}" is not valid.`,
+      message: message || `The deployment id "${id}" is not valid.`,
     });
   }
 }
@@ -343,6 +354,22 @@ export class UnsupportedTLD extends NowError<
 }
 
 /**
+ * Returned when a given TLD can not be purchased via the CLI.
+ */
+export class TLDNotSupportedViaCLI extends NowError<
+  'UNSUPPORTED_TLD_VIA_CLI',
+  { domain: string }
+> {
+  constructor(domain: string) {
+    super({
+      code: 'UNSUPPORTED_TLD_VIA_CLI',
+      meta: { domain },
+      message: `Purchased for the TLD for domain name ${domain} are not supported via the CLI. Use the REST API or the dashboard to purchase.`,
+    });
+  }
+}
+
+/**
  * Returned when the user tries to purchase a domain but the API returns
  * an error telling that it is not available.
  */
@@ -355,23 +382,6 @@ export class DomainNotAvailable extends NowError<
       code: 'DOMAIN_NOT_AVAILABLE',
       meta: { domain },
       message: `The domain ${domain} is not available to be purchased.`,
-    });
-  }
-}
-
-/**
- * Returned when the domain purchase service is not available for reasons
- * that are out of our control.
- */
-export class DomainServiceNotAvailable extends NowError<
-  'DOMAIN_SERVICE_NOT_AVAILABLE',
-  { domain: string }
-> {
-  constructor(domain: string) {
-    super({
-      code: 'DOMAIN_SERVICE_NOT_AVAILABLE',
-      meta: { domain },
-      message: `The domain purchase is unavailable, try again later.`,
     });
   }
 }
@@ -405,6 +415,22 @@ export class UnexpectedDomainPurchaseError extends NowError<
       code: 'UNEXPECTED_DOMAIN_PURCHASE_ERROR',
       meta: { domain },
       message: `An unexpected error happened while purchasing.`,
+    });
+  }
+}
+
+/**
+ * Returned when there is an expected error during the domain transfer.
+ */
+export class UnexpectedDomainTransferError extends NowError<
+  'UNEXPECTED_DOMAIN_TRANSFER_ERROR',
+  { domain: string }
+> {
+  constructor(domain: string) {
+    super({
+      code: 'UNEXPECTED_DOMAIN_TRANSFER_ERROR',
+      meta: { domain },
+      message: `An unexpected error happened while transferring.`,
     });
   }
 }
@@ -448,7 +474,7 @@ export class UserAborted extends NowError<'USER_ABORTED', {}> {
     super({
       code: 'USER_ABORTED',
       meta: {},
-      message: `The user aborted the operation.`,
+      message: `The user canceled the operation.`,
     });
   }
 }
@@ -496,12 +522,12 @@ export class CertOrderNotFound extends NowError<
  */
 export class TooManyRequests extends NowError<
   'TOO_MANY_REQUESTS',
-  { api: string; retryAfter: number }
+  { api: string; retryAfterMs: number }
 > {
-  constructor(api: string, retryAfter: number) {
+  constructor(api: string, retryAfterMs: number) {
     super({
       code: 'TOO_MANY_REQUESTS',
-      meta: { api, retryAfter },
+      meta: { api, retryAfterMs },
       message: `Rate limited. Too many requests to the same endpoint.`,
     });
   }
@@ -593,7 +619,7 @@ export class DeploymentNotFound extends NowError<
     super({
       code: 'DEPLOYMENT_NOT_FOUND',
       meta: { id, context },
-      message: `Can't find the deployment ${id} under the context ${context}`,
+      message: `Can't find the deployment "${id}" under the context "${context}"`,
     });
   }
 }
@@ -678,25 +704,26 @@ export class AliasInUse extends NowError<'ALIAS_IN_USE', { alias: string }> {
  * a certificate for a domain but the domain is missing. An example would
  * be alias.
  */
-export class CertMissing extends NowError<'ALIAS_IN_USE', { domain: string }> {
+export class CertMissing extends NowError<'CERT_MISSING', { domain: string }> {
   constructor(domain: string) {
     super({
-      code: 'ALIAS_IN_USE',
+      code: 'CERT_MISSING',
       meta: { domain },
-      message: `The alias is already in use`,
+      message: `The certificate for domain ${domain} is missing`,
     });
   }
 }
 
 export class CantParseJSONFile extends NowError<
   'CANT_PARSE_JSON_FILE',
-  { file: string }
+  { file: string; parseErrorLocation: string }
 > {
-  constructor(file: string) {
+  constructor(file: string, parseErrorLocation: string) {
+    const message = `Can't parse json file ${file}: ${parseErrorLocation}`;
     super({
       code: 'CANT_PARSE_JSON_FILE',
-      meta: { file },
-      message: `Can't parse json file`,
+      meta: { file, parseErrorLocation },
+      message,
     });
   }
 }
@@ -704,14 +731,26 @@ export class CantParseJSONFile extends NowError<
 export class ConflictingConfigFiles extends NowBuildError {
   files: string[];
 
-  constructor(files: string[]) {
+  constructor(files: string[], message?: string, link?: string) {
     super({
       code: 'CONFLICTING_CONFIG_FILES',
       message:
-        'Cannot use both a `vercel.json` and `now.json` file. Please delete the `now.json` file.',
-      link: 'https://vercel.link/combining-old-and-new-config',
+        message ||
+        'Multiple config files found. Please use only one configuration file.',
+      link: link || 'https://vercel.link/combining-old-and-new-config',
     });
     this.files = files;
+  }
+}
+
+export class DeprecatedNowJson extends NowBuildError {
+  constructor(_file: string) {
+    super({
+      code: 'DEPRECATED_NOW_JSON',
+      message:
+        'The `now.json` file is deprecated and no longer supported. Please rename it to `vercel.json`.',
+      link: 'https://vercel.com/docs/projects/project-configuration',
+    });
   }
 }
 
@@ -1023,11 +1062,25 @@ export class DeploymentsRateLimited extends NowError<
   }
 }
 
-export class BuildsRateLimited extends NowError<'BUILDS_RATE_LIMITED', {}> {
-  constructor(message: string) {
+export interface BuildsRateLimitedMeta {
+  /** Backend-provided call-to-action label (newer field). */
+  ctaLabel?: string;
+  /** Backend-provided call-to-action URL (newer field). */
+  ctaUrl?: string;
+  /** Legacy call-to-action label. */
+  action?: string;
+  /** Legacy call-to-action URL. */
+  link?: string;
+}
+
+export class BuildsRateLimited extends NowError<
+  'BUILDS_RATE_LIMITED',
+  BuildsRateLimitedMeta
+> {
+  constructor(message: string, meta: BuildsRateLimitedMeta = {}) {
     super({
       code: 'BUILDS_RATE_LIMITED',
-      meta: {},
+      meta,
       message,
     });
   }
@@ -1039,6 +1092,19 @@ export class ProjectNotFound extends NowError<'PROJECT_NOT_FOUND', {}> {
       code: 'PROJECT_NOT_FOUND',
       meta: {},
       message: `There is no project for "${nameOrId}"`,
+    });
+  }
+}
+
+/** Thrown when a read-only command needs a linked project but none is configured (non-interactive). */
+export class LinkRequiredError extends NowError<'LINK_REQUIRED', {}> {
+  constructor(
+    message: string = 'No project is linked in this directory. Run `vercel link` or pass a project name.'
+  ) {
+    super({
+      code: 'LINK_REQUIRED',
+      meta: {},
+      message,
     });
   }
 }
@@ -1098,6 +1164,50 @@ export class BuildError extends NowError<'BUILD_ERROR', {}> {
       code: 'BUILD_ERROR',
       meta,
       message,
+    });
+  }
+}
+
+interface SchemaValidationFailedMeta {
+  message: string;
+  keyword: string;
+  dataPath: string;
+  params: object;
+}
+
+export class SchemaValidationFailed extends NowError<
+  'SCHEMA_VALIDATION_FAILED',
+  SchemaValidationFailedMeta
+> {
+  constructor(
+    message: string,
+    keyword: string,
+    dataPath: string,
+    params: object
+  ) {
+    super({
+      code: 'SCHEMA_VALIDATION_FAILED',
+      meta: { message, keyword, dataPath, params },
+      message: `Schema verification failed`,
+    });
+  }
+}
+
+interface InvalidLocalConfigMeta {
+  value: string[];
+}
+
+export class InvalidLocalConfig extends NowError<
+  'INVALID_LOCAL_CONFIG',
+  InvalidLocalConfigMeta
+> {
+  constructor(value: string[]) {
+    super({
+      code: 'INVALID_LOCAL_CONFIG',
+      meta: { value },
+      message: `Invalid local config parameter [${value
+        .map(localConfig => `"${localConfig}"`)
+        .join(', ')}]. A string was expected.`,
     });
   }
 }

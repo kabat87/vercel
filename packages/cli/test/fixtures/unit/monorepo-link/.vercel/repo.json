@@ -1,0 +1,23 @@
+{
+    "remoteName": "origin",
+    "projects": [
+      {
+        "id": "QmbKpqpiUqbcke",
+        "name": "monorepo-dashboard",
+        "directory": "dashboard",
+        "orgId": "team_dummy"
+      },
+      {
+        "id": "QmX6P93ChNDoZP",
+        "name": "monorepo-marketing",
+        "directory": "marketing",
+        "orgId": "team_dummy"
+      },
+      {
+        "id": "QmScb7GPQt6gsS",
+        "name": "monorepo-blog",
+        "directory": "blog",
+        "orgId": "team_dummy"
+      }
+    ]
+}

@@ -1,20 +1,20 @@
 import chalk from 'chalk';
 import plural from 'pluralize';
 
-import { Output } from '../output';
-import Client from '../client';
+import type Client from '../client';
 import eraseLines from '../output/erase-lines';
 import getDomainPrice from './get-domain-price';
 import getDomainStatus from './get-domain-status';
-import promptBool from '../input/prompt-bool';
 import purchaseDomain from './purchase-domain';
 import stamp from '../output/stamp';
 import * as ERRORS from '../errors-ts';
+import output from '../../output-manager';
+import param from '../output/param';
+import collectContactInformation from './collect-contact-information';
 
 const isTTY = process.stdout.isTTY;
 
 export default async function purchaseDomainIfAvailable(
-  output: Output,
   client: Client,
   domain: string,
   contextName: string
@@ -43,7 +43,17 @@ export default async function purchaseDomainIfAvailable(
       throw domainPrice;
     }
 
-    const { price, period } = domainPrice;
+    const { purchasePrice, years } = domainPrice;
+
+    if (purchasePrice === null) {
+      output.error(
+        `The domain ${param(domain)} is ${chalk.underline(
+          'unavailable'
+        )}! ${buyDomainStamp()}`
+      );
+      return new ERRORS.DomainNotAvailable(domain);
+    }
+
     output.log(
       `Domain not found, but you can buy it under ${chalk.bold(
         contextName
@@ -51,10 +61,11 @@ export default async function purchaseDomainIfAvailable(
     );
 
     if (
-      !(await promptBool(
+      !(await client.input.confirm(
         `Buy ${chalk.underline(domain)} for ${chalk.bold(
-          `$${price}`
-        )} (${plural('yr', period, true)})?`
+          `$${purchasePrice}`
+        )} (${plural('yr', years, true)})?`,
+        false
       ))
     ) {
       output.print(eraseLines(1));
@@ -62,13 +73,20 @@ export default async function purchaseDomainIfAvailable(
     }
 
     output.print(eraseLines(1));
-    const result = await purchaseDomain(client, domain, price);
+
+    // Collect contact information
+    const contactInformation = await collectContactInformation(client);
+
+    const result = await purchaseDomain(
+      client,
+      domain,
+      purchasePrice,
+      years,
+      true,
+      contactInformation
+    );
     if (result instanceof Error) {
       return result;
-    }
-
-    if (result.pending) {
-      return new ERRORS.DomainPurchasePending(domain);
     }
 
     return true;

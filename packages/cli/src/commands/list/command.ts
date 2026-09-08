@@ -1,0 +1,98 @@
+import { packageName } from '../../util/pkg-name';
+import {
+  allOption,
+  confirmOption,
+  formatOption,
+  jsonOption,
+  limitOption,
+  nextOption,
+  yesOption,
+} from '../../util/arg-common';
+
+export const listCommand = {
+  name: 'list',
+  aliases: ['ls'],
+  description: 'List deployments.',
+  arguments: [
+    {
+      name: 'app',
+      required: false,
+    },
+  ],
+  options: [
+    allOption,
+    {
+      name: 'meta',
+      description:
+        'Filter deployments by metadata (e.g.: `-m KEY=value`). Can appear many times.',
+      argument: 'KEY=VALUE',
+      shorthand: 'm',
+      type: [String],
+      deprecated: false,
+    },
+    {
+      name: 'policy',
+      description:
+        'See deployments with provided Deployment Retention policies (e.g.: `-p KEY=value`). Can appear many times.',
+      argument: 'KEY=VALUE',
+      shorthand: 'p',
+      type: [String],
+      deprecated: false,
+    },
+    {
+      name: 'environment',
+      description: '',
+      argument: 'TARGET',
+      shorthand: null,
+      type: String,
+      deprecated: false,
+    },
+    {
+      name: 'status',
+      description:
+        'Filter deployments by their status. Can be comma-separated for multiple statuses (e.g.: `--status BUILDING,READY`)',
+      argument: 'STATUS',
+      shorthand: 's',
+      type: String,
+      deprecated: false,
+    },
+    nextOption,
+    limitOption,
+    // this can be deprecated someday
+    { name: 'prod', shorthand: null, type: Boolean, deprecated: false },
+    yesOption,
+    confirmOption,
+    formatOption,
+    jsonOption,
+  ],
+  examples: [
+    {
+      name: 'List all deployments for the currently linked project',
+      value: `${packageName} list`,
+    },
+    {
+      name: 'List all deployments across all projects',
+      value: `${packageName} list --all`,
+    },
+    {
+      name: 'List all deployments for the project `my-app`',
+      value: `${packageName} list my-app`,
+    },
+    {
+      name: 'Filter deployments by metadata',
+      value: `${packageName} list -m key1=value1 -m key2=value2`,
+    },
+    {
+      name: 'Paginate deployments for a project, where `1584722256178` is the time in milliseconds since the UNIX epoch',
+      value: `${packageName} list my-app --next 1584722256178`,
+    },
+    {
+      name: 'Filter deployments by status',
+      value: `${packageName} list --status READY`,
+    },
+    {
+      name: 'Filter deployments by multiple statuses',
+      value: `${packageName} list --status BUILDING,ERROR`,
+    },
+  ],
+} as const;

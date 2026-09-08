@@ -1,0 +1,45 @@
+{
+  "version": 2,
+  "builds": [{ "src": "package.json", "use": "@vercel/next" }],
+  "probes": [
+    {
+      "path": "/",
+      "status": 200,
+      "mustContain": "index page"
+    },
+    {
+      "delay": 3000
+    },
+    {
+      "path": "/",
+      "status": 200,
+      "mustContain": "index page"
+    },
+    {
+      "path": "/_next/data/build-TfctsWXpff2fKS/index.json",
+      "status": 200,
+      "mustContain": "page\":\"index\""
+    },
+    {
+      "delay": 3000
+    },
+    {
+      "path": "/_next/data/build-TfctsWXpff2fKS/index.json",
+      "status": 200,
+      "mustContain": "page\":\"index\""
+    },
+    {
+      "delay": 3000
+    },
+    {
+      "path": "/",
+      "status": 200,
+      "mustContain": "index page"
+    }
+  ],
+  "build": {
+    "env": {
+      "NEXT_BUILDER_INTEGRATION": "1"
+    }
+  }
+}

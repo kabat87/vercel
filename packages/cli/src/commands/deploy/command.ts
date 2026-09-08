@@ -1,0 +1,354 @@
+import {
+  confirmOption,
+  forceOption,
+  formatOption,
+  jsonOption,
+  projectOption,
+  yesOption,
+} from '../../util/arg-common';
+
+export const deprecatedArchiveSplitTgz = 'split-tgz';
+
+export const initSubcommand = {
+  name: 'init',
+  aliases: [],
+  description: 'Create a manual deployment that can be continued later',
+  hidden: true as const,
+  arguments: [],
+  options: [
+    {
+      ...forceOption,
+      description: 'Force a new deployment even if nothing has changed',
+    },
+    {
+      name: 'with-cache',
+      shorthand: null,
+      type: Boolean,
+      deprecated: false,
+      description: 'Retain build cache when using "--force"',
+    },
+    {
+      name: 'env',
+      shorthand: 'e',
+      type: [String],
+      argument: 'KEY=VALUE',
+      deprecated: false,
+      description:
+        'Specify environment variables during run-time (e.g. `-e KEY1=value1 -e KEY2=value2`)',
+    },
+    {
+      name: 'build-env',
+      shorthand: 'b',
+      type: [String],
+      argument: 'KEY=VALUE',
+      deprecated: false,
+      description:
+        'Specify environment variables during build-time (e.g. `-b KEY1=value1 -b KEY2=value2`)',
+    },
+    {
+      name: 'meta',
+      shorthand: 'm',
+      type: [String],
+      argument: 'KEY=VALUE',
+      deprecated: false,
+      description:
+        'Specify metadata for the deployment (e.g. `-m KEY1=value1 -m KEY2=value2`)',
+    },
+    {
+      name: 'regions',
+      shorthand: null,
+      type: String,
+      argument: 'REGION',
+      deprecated: false,
+      description: 'Set default regions to enable the deployment on',
+    },
+    {
+      name: 'prod',
+      shorthand: null,
+      type: Boolean,
+      deprecated: false,
+      description:
+        'Create a production deployment (shorthand for `--target=production`)',
+    },
+    {
+      name: 'archive',
+      shorthand: null,
+      type: String,
+      argument: 'FORMAT',
+      deprecated: false,
+      description:
+        'Compress the deployment code into an archive before uploading it',
+    },
+    {
+      name: 'skip-domain',
+      shorthand: null,
+      type: Boolean,
+      deprecated: false,
+      description:
+        'Disable the automatic promotion (aliasing) of the relevant domains to a new production deployment. You can use `vc promote` to complete the domain-assignment process later',
+    },
+    {
+      ...yesOption,
+      description: 'Use default options to skip all prompts',
+    },
+    {
+      name: 'target',
+      shorthand: null,
+      type: String,
+      argument: 'TARGET',
+      deprecated: false,
+      description: 'Specify the target deployment environment',
+    },
+    formatOption,
+    jsonOption,
+    confirmOption,
+    projectOption,
+  ],
+  examples: [
+    {
+      name: 'Create a manual deployment',
+      value: 'vercel deploy init',
+    },
+    {
+      name: 'Create a manual production deployment',
+      value: 'vercel deploy init --prod',
+    },
+  ],
+} as const;
+
+export const continueSubcommand = {
+  name: 'continue',
+  aliases: [],
+  description: 'Continue a manual deployment by uploading build outputs',
+  hidden: true as const,
+  arguments: [],
+  options: [
+    {
+      name: 'id',
+      shorthand: null,
+      type: String,
+      argument: 'ID',
+      deprecated: false,
+      description: 'The deployment ID to continue (e.g. dpl_xxx)',
+    },
+    {
+      name: 'archive',
+      shorthand: null,
+      type: String,
+      argument: 'FORMAT',
+      deprecated: false,
+      description:
+        'Compress the deployment code into an archive before uploading it',
+    },
+    {
+      name: 'error',
+      shorthand: null,
+      type: String,
+      argument: 'MESSAGE',
+      deprecated: false,
+      description: 'Mark the deployment as errored with a message',
+    },
+  ],
+  examples: [
+    {
+      name: 'Continue a deployment by ID',
+      value: 'vercel deploy continue --id dpl_xxx',
+    },
+  ],
+} as const;
+
+export const deployCommand = {
+  name: 'deploy',
+  aliases: [],
+  description:
+    'Deploy your project to Vercel. Use `--temporary` to create a temporary deployment without logging in. The `deploy` command is the default command for the Vercel CLI, and can be omitted (`vc deploy my-app` equals `vc my-app`). Use `--dry` to inspect the detected framework preset and source files without deploying.',
+  arguments: [
+    {
+      name: 'project-path',
+      required: false,
+    },
+  ],
+  subcommands: [initSubcommand, continueSubcommand],
+  options: [
+    {
+      ...forceOption,
+      description: 'Force a new deployment even if nothing has changed',
+    },
+    {
+      name: 'with-cache',
+      shorthand: null,
+      type: Boolean,
+      deprecated: false,
+      description: 'Retain build cache when using "--force"',
+    },
+    {
+      name: 'env',
+      shorthand: 'e',
+      type: [String],
+      argument: 'KEY=VALUE',
+      deprecated: false,
+      description:
+        'Specify environment variables during run-time (e.g. `-e KEY1=value1 -e KEY2=value2`)',
+    },
+    {
+      name: 'build-env',
+      shorthand: 'b',
+      type: [String],
+      argument: 'KEY=VALUE',
+      deprecated: false,
+      description:
+        'Specify environment variables during build-time (e.g. `-b KEY1=value1 -b KEY2=value2`)',
+    },
+    {
+      name: 'meta',
+      shorthand: 'm',
+      type: [String],
+      argument: 'KEY=VALUE',
+      deprecated: false,
+      description:
+        'Specify metadata for the deployment (e.g. `-m KEY1=value1 -m KEY2=value2`)',
+    },
+    {
+      name: 'regions',
+      shorthand: null,
+      type: String,
+      argument: 'REGION',
+      deprecated: false,
+      description: 'Set default regions to enable the deployment on',
+    },
+    {
+      name: 'prebuilt',
+      shorthand: null,
+      type: Boolean,
+      deprecated: false,
+      description:
+        'Use in combination with `vc build`. Deploy an existing build',
+    },
+    {
+      name: 'prod',
+      shorthand: null,
+      type: Boolean,
+      deprecated: false,
+      description:
+        'Create a production deployment (shorthand for `--target=production`)',
+    },
+    {
+      name: 'temporary',
+      shorthand: null,
+      type: Boolean,
+      deprecated: false,
+      description: 'Create a temporary deployment without logging in',
+    },
+    {
+      name: 'archive',
+      shorthand: null,
+      type: String,
+      argument: 'FORMAT',
+      deprecated: false,
+      description:
+        'Compress the deployment code into an archive before uploading it',
+    },
+    {
+      name: 'no-wait',
+      shorthand: null,
+      type: Boolean,
+      deprecated: false,
+      description: "Don't wait for the deployment to finish",
+    },
+    {
+      name: 'dry',
+      shorthand: null,
+      type: Boolean,
+      deprecated: false,
+      description:
+        'Inspect the detected framework preset and source files without uploading or creating a deployment. Non-TTY output includes every file as JSON',
+    },
+    {
+      name: 'skip-domain',
+      shorthand: null,
+      type: Boolean,
+      deprecated: false,
+      description:
+        'Disable the automatic promotion (aliasing) of the relevant domains to a new production deployment. You can use `vc promote` to complete the domain-assignment process later',
+    },
+    {
+      ...yesOption,
+      description: 'Use default options to skip all prompts',
+    },
+    {
+      name: 'logs',
+      shorthand: 'l',
+      type: Boolean,
+      deprecated: false,
+      description: 'Print the build logs',
+    },
+    {
+      name: 'guidance',
+      shorthand: null,
+      type: Boolean,
+      deprecated: false,
+      description: 'Receive command suggestions once deployment is complete',
+    },
+    {
+      name: 'no-logs',
+      shorthand: null,
+      type: Boolean,
+      deprecated: true,
+      description: 'Do not print the build logs',
+    },
+    {
+      name: 'name',
+      shorthand: 'n',
+      type: String,
+      deprecated: true,
+    },
+    {
+      name: 'no-clipboard',
+      shorthand: null,
+      type: Boolean,
+      deprecated: true,
+    },
+    {
+      name: 'target',
+      shorthand: null,
+      type: String,
+      argument: 'TARGET',
+      deprecated: false,
+      description: 'Specify the target deployment environment',
+    },
+    formatOption,
+    jsonOption,
+    confirmOption,
+    projectOption,
+  ],
+  examples: [
+    {
+      name: 'Deploy the current directory',
+      value: 'vercel',
+    },
+    {
+      name: 'Deploy a custom path',
+      value: 'vercel /usr/src/project',
+    },
+    {
+      name: 'Deploy with run-time Environment Variables',
+      value: 'vercel -e NODE_ENV=production',
+    },
+    {
+      name: 'Deploy with prebuilt outputs',
+      value: ['vercel build', 'vercel deploy --prebuilt'],
+    },
+    {
+      name: 'Inspect deployment inputs without deploying',
+      value: 'vercel deploy --dry',
+    },
+    {
+      name: 'Get every deployment file as JSON',
+      value: 'vercel deploy --dry --json',
+    },
+    {
+      name: 'Write Deployment URL to a file',
+      value: 'vercel > deployment-url.txt',
+    },
+  ],
+} as const;

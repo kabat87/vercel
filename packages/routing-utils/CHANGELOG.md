@@ -1,0 +1,233 @@
+# @vercel/routing-utils
+
+## 6.5.0
+
+### Minor Changes
+
+- 852e1a0: Move middleware matcher utils from node builder to general build utils.
+
+## 6.4.1
+
+### Patch Changes
+
+- 6d7fbfa: Bump all workspace packages to trigger a full publish from vercel-internal.
+
+## 6.4.0
+
+### Minor Changes
+
+- 7cecf55: Make hand-written service-targeted route/rewrite `destination` config less repetitive and verbose by making the `type` discriminator optional.
+
+  ```diff
+   {
+     "rewrites": [{
+  -    "type": "service",
+       "service": "my_backend",
+       "path": "/api/$1"
+     }]
+   }
+  ```
+
+  The explicit `{ "type": "service", "service": NAME }` format continues to
+  validate. Normalized route output continues to include `"type": "service"`, so
+  machine-facing config remains canonical.
+
+## 6.3.1
+
+### Patch Changes
+
+- c4afec8: [routing-utils] support `request.path` transforms on routes and high-level rewrites, lowering path-to-regexp parameters such as `/:path*` to low-level capture references such as `/$1`
+  [config] support request path transforms in the router builder
+  [cli] preserve request path transform syntax and environment metadata across AI/manual route edits
+
+## 6.3.0
+
+### Minor Changes
+
+- 90a7cc1: Support a service-targeted `destination` object (`{ type: "service", service, path }`) on routes and rewrites, so a route/rewrite can delegate into a named service. The service handoff is terminal: `continue: true` together with a service `destination` is rejected during normalization.
+
+## 6.2.0
+
+### Minor Changes
+
+- c56f851: Upgrade to TypeScript 5.9
+
+## 6.1.1
+
+### Patch Changes
+
+- Redirect sources now support domains ([#15670](https://github.com/vercel/vercel/pull/15670))
+
+## 6.1.0
+
+### Minor Changes
+
+- Removed bulkRedirectsSchema ([#14340](https://github.com/vercel/vercel/pull/14340))
+
+## 6.0.2
+
+### Patch Changes
+
+- Fix typo in routes type ([#15318](https://github.com/vercel/vercel/pull/15318))
+
+## 6.0.1
+
+### Patch Changes
+
+- Fix type error caused by `source` normalization in Routes ([#15292](https://github.com/vercel/vercel/pull/15292))
+
+## 6.0.0
+
+### Major Changes
+
+- Allow `routes` to coexist with `rewrites`, `headers`, `redirects`, `cleanUrls`, and `trailingSlash`. ([#15020](https://github.com/vercel/vercel/pull/15020))
+
+  This is part of our efforts to undeprecate `routes`, which had previously been deprecated for a few years and replaced by the properties above. Now that we are undeprecating `routes` in favor of a more focused deprecation of properties within it, it is now allowed to coexist with the new properties.
+
+  When used together, `routes` are inserted after `cleanUrls` and `trailingSlash` but before `redirects`, `headers`, and `rewrites` in the routing order.
+
+- Deprecate `handle`, `important`, and `override` properties in `routes` schema ([#15015](https://github.com/vercel/vercel/pull/15015))
+
+## 5.4.0
+
+### Minor Changes
+
+- Undeprecate `routes` schema and add aliases for `src`, `dest`, and `status` ([#15010](https://github.com/vercel/vercel/pull/15010))
+
+## 5.3.3
+
+### Patch Changes
+
+- Services routing improvements: ([#15018](https://github.com/vercel/vercel/pull/15018))
+
+  - Fix route ownership scoping so parent service catch-alls (e.g. Vite SPA fallback) don't capture sibling service prefixes
+  - Move shared ownership-guard helpers (`getOwnershipGuard`, `scopeRouteSourceToOwnership`) to `@vercel/routing-utils`
+  - Place runtime service function outputs under internal `/_svc/<service>/index` namespace to prevent filesystem path leakage
+  - Block `/_svc` as a reserved routePrefix in service validation
+  - Scope all builder-emitted routes (not just route-owning builders) to their service ownership before merging
+
+## 5.3.2
+
+### Patch Changes
+
+- Add respectOriginCacheControl to rewritesSchema ([#14506](https://github.com/vercel/vercel/pull/14506))
+
+- Add respectOriginCacheControl to routes schema ([#14565](https://github.com/vercel/vercel/pull/14565))
+
+## 5.3.1
+
+### Patch Changes
+
+- add env field to redirects, rewrites, routes ([#14405](https://github.com/vercel/vercel/pull/14405))
+
+## 5.3.0
+
+### Minor Changes
+
+- add support for the env field in transforms for explicit environment variable usage ([#14223](https://github.com/vercel/vercel/pull/14223))
+
+## 5.2.2
+
+### Patch Changes
+
+- Allow header values of up to 32kb in length in routes. ([#14263](https://github.com/vercel/vercel/pull/14263))
+
+## 5.2.1
+
+### Patch Changes
+
+- Add experimental support for routes.json ([#14138](https://github.com/vercel/vercel/pull/14138))
+
+## 5.2.0
+
+### Minor Changes
+
+- support bulk redirects in routing-utils ([#14032](https://github.com/vercel/vercel/pull/14032))
+
+### Patch Changes
+
+- fix: support underscores in named capture groups for routing patterns ([#14017](https://github.com/vercel/vercel/pull/14017))
+
+## 5.1.1
+
+### Patch Changes
+
+- Reverting support for `preferredRegion` ([#13566](https://github.com/vercel/vercel/pull/13566))
+
+## 5.1.0
+
+### Minor Changes
+
+- Change where validation on the routing array happens (schema to api) ([#13476](https://github.com/vercel/vercel/pull/13476))
+
+## 5.0.8
+
+### Patch Changes
+
+- support transform rules in vercel.json ([#13464](https://github.com/vercel/vercel/pull/13464))
+
+## 5.0.7
+
+### Patch Changes
+
+- Fixed TS literal type inference for compatibility with json-schema-to-ts ([#13446](https://github.com/vercel/vercel/pull/13446))
+
+## 5.0.6
+
+### Patch Changes
+
+- Adds support for conditionValues for `has` and `missing` and `mitigate` in your `vercel.json` file. ([#13409](https://github.com/vercel/vercel/pull/13409))
+
+## 5.0.5
+
+### Patch Changes
+
+- Revert "[routing-utils] Support Conditions and Mitigate in vercel.json" ([#13400](https://github.com/vercel/vercel/pull/13400))
+
+## 5.0.4
+
+### Patch Changes
+
+- [routing-utils] fix dep bundling ([#13026](https://github.com/vercel/vercel/pull/13026))
+
+## 5.0.3
+
+### Patch Changes
+
+- better path-to-regexp diff logging ([#12962](https://github.com/vercel/vercel/pull/12962))
+
+## 5.0.2
+
+### Patch Changes
+
+- Update routes schema for new limit of 2048 ([#12968](https://github.com/vercel/vercel/pull/12968))
+
+## 5.0.1
+
+### Patch Changes
+
+- log diff between current and updated versions of path-to-regexp ([#12926](https://github.com/vercel/vercel/pull/12926))
+
+## 5.0.0
+
+### Major Changes
+
+- [remix-builder][node][routing-utils] revert path-to-regexp updates ([#12746](https://github.com/vercel/vercel/pull/12746))
+
+## 4.0.0
+
+### Major Changes
+
+- update path-to-regexp ([#12734](https://github.com/vercel/vercel/pull/12734))
+
+## 3.1.0
+
+### Minor Changes
+
+- Adds support for statusCode property on rewrites ([#10495](https://github.com/vercel/vercel/pull/10495))
+
+## 3.0.0
+
+### Major Changes
+
+- BREAKING CHANGE: Drop Node.js 14, bump minimum to Node.js 16 ([#10369](https://github.com/vercel/vercel/pull/10369))

@@ -1,0 +1,216 @@
+import { promises as fs } from 'fs';
+import { dirname, join, relative } from 'path';
+import {
+  debug,
+  download,
+  EdgeFunction,
+  execCommand,
+  generateProjectManifest,
+  getEnvForPackageManager,
+  getNodeVersion,
+  getReportedServiceType,
+  getPrefixedEnvVars,
+  glob,
+  readConfigFile,
+  runNpmInstall,
+  runPackageJsonScript,
+  scanParentDirs,
+} from '@vercel/build-utils';
+import type { BuildV2, PackageJson } from '@vercel/build-utils';
+import { getConfig } from '@vercel/static-config';
+import { Project } from 'ts-morph';
+
+export const build: BuildV2 = async ({
+  entrypoint,
+  files,
+  workPath,
+  config,
+  meta = {},
+  service,
+  span,
+}) => {
+  const { installCommand, buildCommand } = config;
+
+  await download(files, workPath, meta);
+
+  const prefixedEnvs = getPrefixedEnvVars({
+    envPrefix: 'PUBLIC_',
+    envs: process.env,
+  });
+
+  for (const [key, value] of Object.entries(prefixedEnvs)) {
+    process.env[key] = value;
+  }
+
+  const mountpoint = dirname(entrypoint);
+  const entrypointDir = join(workPath, mountpoint);
+
+  const nodeVersion = await getNodeVersion(
+    entrypointDir,
+    undefined,
+    config,
+    meta
+  );
+
+  const {
+    cliType,
+    lockfilePath,
+    lockfileVersion,
+    packageJsonPackageManager,
+    packageJsonDevEngines,
+    turboSupportsCorepackHome,
+  } = await scanParentDirs(entrypointDir, true);
+
+  const spawnEnv = getEnvForPackageManager({
+    cliType,
+    lockfileVersion,
+    packageJsonPackageManager,
+    packageJsonDevEngines,
+    nodeVersion,
+    env: process.env,
+    turboSupportsCorepackHome,
+    projectCreatedAt: config.projectSettings?.createdAt,
+  });
+
+  if (typeof installCommand === 'string') {
+    if (installCommand.trim()) {
+      console.log(`Running "install" command: \`${installCommand}\`...`);
+      await execCommand(installCommand, {
+        env: spawnEnv,
+        cwd: entrypointDir,
+      });
+    } else {
+      console.log(`Skipping "install" command...`);
+    }
+  } else {
+    await runNpmInstall(
+      entrypointDir,
+      [],
+      { env: spawnEnv },
+      meta,
+      config.projectSettings?.createdAt
+    );
+  }
+
+  try {
+    await generateProjectManifest({
+      workPath: entrypointDir,
+      nodeVersion,
+      cliType,
+      lockfilePath,
+      lockfileVersion,
+      framework: config.framework ?? undefined,
+      serviceType: service ? getReportedServiceType(service) : undefined,
+    });
+  } catch (err) {
+    debug(
+      `Failed to write hydrogen manifest: ${err instanceof Error ? err.message : String(err)}`
+    );
+  }
+
+  // Copy the edge entrypoint file into `.vercel/cache`
+  const edgeEntryDir = join(workPath, '.vercel/cache/hydrogen');
+  const edgeEntryRelative = relative(edgeEntryDir, workPath);
+  const edgeEntryDest = join(edgeEntryDir, 'edge-entry.js');
+  let edgeEntryContents = await fs.readFile(
+    join(__dirname, '..', 'edge-entry.js'),
+    'utf8'
+  );
+  edgeEntryContents = edgeEntryContents.replace(
+    /__RELATIVE__/g,
+    edgeEntryRelative
+  );
+  await fs.mkdir(edgeEntryDir, { recursive: true });
+  await fs.writeFile(edgeEntryDest, edgeEntryContents);
+
+  // Make `shopify hydrogen build` output a Edge Function compatible bundle
+  spawnEnv.SHOPIFY_FLAG_BUILD_TARGET = 'worker';
+
+  // Use this file as the entrypoint for the Edge Function bundle build
+  spawnEnv.SHOPIFY_FLAG_BUILD_SSR_ENTRY = edgeEntryDest;
+
+  // Run "Build Command"
+  if (buildCommand) {
+    debug(`Executing build command "${buildCommand}"`);
+    await execCommand(buildCommand, {
+      env: spawnEnv,
+      cwd: entrypointDir,
+    });
+  } else {
+    const pkg = await readConfigFile<PackageJson>(
+      join(entrypointDir, 'package.json')
+    );
+    if (hasScript('vercel-build', pkg)) {
+      debug(`Executing "yarn vercel-build"`);
+      await runPackageJsonScript(
+        entrypointDir,
+        'vercel-build',
+        { env: spawnEnv },
+        config.projectSettings?.createdAt
+      );
+    } else if (hasScript('build', pkg)) {
+      debug(`Executing "yarn build"`);
+      await runPackageJsonScript(
+        entrypointDir,
+        'build',
+        { env: spawnEnv },
+        config.projectSettings?.createdAt
+      );
+    } else {
+      await execCommand('shopify hydrogen build', {
+        env: spawnEnv,
+        cwd: entrypointDir,
+      });
+    }
+  }
+
+  const [staticFiles, edgeFunctionFiles] = await Promise.all([
+    glob('**', join(entrypointDir, 'dist/client')),
+    glob('**', join(entrypointDir, 'dist/worker')),
+  ]);
+
+  const edgeFunction = new EdgeFunction({
+    deploymentTarget: 'v8-worker',
+    entrypoint: 'index.js',
+    files: edgeFunctionFiles,
+    regions: (() => {
+      try {
+        const project = new Project();
+        const config = getConfig(
+          project,
+          edgeFunctionFiles['index.js'].fsPath,
+          undefined,
+          span
+        );
+        return config?.regions;
+      } catch {
+        return undefined;
+      }
+    })(),
+  });
+
+  // The `index.html` file is a template, but we want to serve the
+  // SSR version instead, so omit this static file from the output
+  delete staticFiles['index.html'];
+
+  return {
+    routes: [
+      {
+        handle: 'filesystem',
+      },
+      {
+        src: '/(.*)',
+        dest: '/hydrogen',
+      },
+    ],
+    output: {
+      hydrogen: edgeFunction,
+      ...staticFiles,
+    },
+  };
+};
+
+function hasScript(scriptName: string, pkg: PackageJson | null) {
+  const scripts = pkg?.scripts || {};
+  return typeof scripts[scriptName] === 'string';
+}

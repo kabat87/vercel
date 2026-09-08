@@ -1,0 +1,13 @@
+{
+  "name": "simple-backend",
+  "version": "1.0.0",
+  "type": "module",
+  "dependencies": {
+    "express": "5.1.0"
+  },
+  "devDependencies": {
+    "@types/express": "5.0.3",
+    "@types/node": "22.10.0",
+    "typescript": "5.9.3"
+  }
+}

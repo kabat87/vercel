@@ -1,9 +1,9 @@
-import { DeploymentFile } from './utils/hashes';
+import { FilesMap } from './utils/hashes';
 import { generateQueryString } from './utils/query-string';
 import { isReady, isAliasAssigned } from './utils/ready-state';
 import { checkDeploymentStatus } from './check-deployment-status';
 import {
-  fetch,
+  fetchApi,
   prepareFiles,
   createDebug,
   getApiDeploymentsUrl,
@@ -16,7 +16,7 @@ import {
 } from './types';
 
 async function* postDeployment(
-  files: Map<string, DeploymentFile>,
+  files: FilesMap,
   clientOptions: VercelClientOptions,
   deploymentOptions: DeploymentOptions
 ): AsyncIterableIterator<{
@@ -27,11 +27,27 @@ async function* postDeployment(
 }> {
   const debug = createDebug(clientOptions.debug);
   const preparedFiles = prepareFiles(files, clientOptions);
-  const apiDeployments = getApiDeploymentsUrl(deploymentOptions);
+  const apiDeployments = getApiDeploymentsUrl();
+
+  if (deploymentOptions?.builds && !deploymentOptions.functions) {
+    clientOptions.skipAutoDetectionConfirmation = true;
+  }
+
+  // Preview deployments are the default - no need to set `target`
+  if (deploymentOptions.target === 'preview') {
+    deploymentOptions.target = undefined;
+  }
+
+  // "production" environment need to use `target`,
+  // otherwise use `customEnvironmentSlugOrId` for a Custom Environment
+  if (deploymentOptions.target && deploymentOptions.target !== 'production') {
+    deploymentOptions.customEnvironmentSlugOrId = deploymentOptions.target;
+    deploymentOptions.target = undefined;
+  }
 
   debug('Sending deployment creation API request');
   try {
-    const response = await fetch(
+    const response = await fetchApi(
       `${apiDeployments}${generateQueryString(clientOptions)}`,
       clientOptions.token,
       {
@@ -46,10 +62,16 @@ async function* postDeployment(
         }),
         apiUrl: clientOptions.apiUrl,
         userAgent: clientOptions.userAgent,
+        dispatcher: clientOptions.dispatcher,
       }
     );
 
-    const deployment = await response.json();
+    let deployment = undefined;
+    try {
+      deployment = await response.json();
+    } catch (_error) {
+      throw new Error('Invalid JSON response');
+    }
 
     if (clientOptions.debug) {
       // Wrapped because there is no need to
@@ -90,7 +112,7 @@ async function* postDeployment(
 }
 
 function getDefaultName(
-  files: Map<string, DeploymentFile>,
+  files: FilesMap,
   clientOptions: VercelClientOptions
 ): string {
   const debug = createDebug(clientOptions.debug);
@@ -109,14 +131,14 @@ function getDefaultName(
 }
 
 export async function* deploy(
-  files: Map<string, DeploymentFile>,
+  files: FilesMap,
   clientOptions: VercelClientOptions,
   deploymentOptions: DeploymentOptions
-): AsyncIterableIterator<{ type: string; payload: any }> {
+): AsyncIterableIterator<{ type: DeploymentEventType; payload: any }> {
   const debug = createDebug(clientOptions.debug);
 
   // Check if we should default to a static deployment
-  if (!deploymentOptions.name) {
+  if (!deploymentOptions.name && files.size > 0) {
     deploymentOptions.version = 2;
     deploymentOptions.name =
       files.size === 1 ? 'file' : getDefaultName(files, clientOptions);
@@ -126,28 +148,7 @@ export async function* deploy(
     }
   }
 
-  if (
-    files.size === 1 &&
-    deploymentOptions.builds === undefined &&
-    deploymentOptions.routes === undefined &&
-    deploymentOptions.cleanUrls === undefined &&
-    deploymentOptions.rewrites === undefined &&
-    deploymentOptions.redirects === undefined &&
-    deploymentOptions.headers === undefined &&
-    deploymentOptions.trailingSlash === undefined
-  ) {
-    debug(`Assigning '/' route for single file deployment`);
-    const filePath = Array.from(files.values())[0].names[0];
-
-    deploymentOptions.routes = [
-      {
-        src: '/',
-        dest: `/${filePath.split('/').pop()}`,
-      },
-    ];
-  }
-
-  if (!deploymentOptions.name) {
+  if (!deploymentOptions.name && files.size > 0) {
     deploymentOptions.name =
       clientOptions.defaultName || getDefaultName(files, clientOptions);
     debug('No name provided. Defaulting to', deploymentOptions.name);
@@ -178,6 +179,15 @@ export async function* deploy(
   } catch (e) {
     debug('An unexpected error occurred when creating the deployment');
     return yield { type: 'error', payload: e };
+  }
+
+  /**
+   * When using manual, the deployment will remain INITIALIZING until it is
+   * manually continued so we skip waiting for Ready State.
+   */
+  if (clientOptions.manual) {
+    debug('Manual mode - skipping ready state check');
+    return;
   }
 
   if (deployment) {

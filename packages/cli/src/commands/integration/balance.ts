@@ -1,0 +1,273 @@
+import chalk from 'chalk';
+import output from '../../output-manager';
+import type Client from '../../util/client';
+import { parseArguments } from '../../util/get-args';
+import { getFlagsSpecification } from '../../util/get-flags-specification';
+import { printError } from '../../util/error';
+import { validateJsonOutput } from '../../util/output-format';
+import getScope from '../../util/get-scope';
+import { getBalanceInformation } from '../../util/integration/fetch-installation-prepayment-info';
+import { getFirstConfiguration } from '../../util/integration/fetch-marketplace-integrations';
+import type {
+  CreditWithAmount,
+  InstallationBalancesAndThresholds,
+  PrepaymentCreditThreshold,
+} from '../../util/integration/types';
+import { IntegrationBalanceTelemetryClient } from '../../util/telemetry/commands/integration/balance';
+import type { Resource } from '../../util/integration-resource/types';
+import { getResources } from '../../util/integration-resource/get-resources';
+import { balanceSubcommand } from './command';
+
+export async function balance(client: Client) {
+  const telemetry = new IntegrationBalanceTelemetryClient({
+    opts: {
+      store: client.telemetryEventStore,
+    },
+  });
+
+  let parsedArguments = null;
+  const flagsSpecification = getFlagsSpecification(balanceSubcommand.options);
+
+  try {
+    parsedArguments = parseArguments(client.argv.slice(3), flagsSpecification);
+  } catch (error) {
+    printError(error);
+    return 1;
+  }
+
+  const formatResult = validateJsonOutput(parsedArguments.flags);
+  if (!formatResult.valid) {
+    output.error(formatResult.error);
+    return 1;
+  }
+  const asJson = formatResult.jsonOutput;
+
+  telemetry.trackCliOptionFormat(parsedArguments.flags['--format']);
+
+  if (parsedArguments.args.length > 2) {
+    output.error('Cannot specify more than one integration at a time');
+    return 1;
+  }
+
+  const integrationSlug = parsedArguments.args[1];
+
+  if (!integrationSlug) {
+    output.error('You must pass an integration slug');
+    return 1;
+  }
+
+  const { team } = await getScope(client);
+
+  if (!team) {
+    output.error('Team not found.');
+    return 1;
+  }
+  client.config.currentTeam = team.id;
+
+  const installation = await getBalanceInstallationId(
+    client,
+    integrationSlug,
+    telemetry
+  );
+  if (installation === undefined) {
+    return 1;
+  }
+  const installationId = installation.id;
+
+  const resources = await getResourcesForInstallation(client, installationId);
+  if (resources === undefined) {
+    return 1;
+  }
+
+  const prepaymentInfo = await getBalanceInformation(client, installationId);
+  if (prepaymentInfo === undefined) {
+    return 1;
+  }
+
+  if (asJson) {
+    output.stopSpinner();
+    const jsonData = buildJsonOutput(
+      prepaymentInfo,
+      resources,
+      integrationSlug
+    );
+    client.stdout.write(`${JSON.stringify(jsonData, null, 2)}\n`);
+    return 0;
+  }
+
+  outputBalanceInformation(prepaymentInfo, resources, integrationSlug);
+
+  return 0;
+}
+
+async function getBalanceInstallationId(
+  client: Client,
+  integrationSlug: string,
+  telemetry: IntegrationBalanceTelemetryClient
+) {
+  let knownIntegrationSlug = false;
+  output.spinner('Retrieving installation…', 500);
+  try {
+    const installation = await getFirstConfiguration(client, integrationSlug);
+
+    if (!installation) {
+      output.stopSpinner();
+      output.error('No installations found for this integration');
+      return;
+    }
+
+    knownIntegrationSlug = true;
+    return installation;
+  } catch (error) {
+    output.stopSpinner();
+    output.error(`Failed to fetch installations: ${(error as Error).message}`);
+    return;
+  } finally {
+    telemetry.trackCliArgumentIntegration(
+      integrationSlug,
+      knownIntegrationSlug
+    );
+  }
+}
+
+async function getResourcesForInstallation(
+  client: Client,
+  installationId: string
+) {
+  output.spinner('Retrieving resources…', 500);
+  try {
+    const resources = (await getResources(client)).filter(
+      resource =>
+        resource.product?.integrationConfigurationId === installationId
+    );
+
+    output.stopSpinner();
+    return resources;
+  } catch (error) {
+    output.stopSpinner();
+    output.error(`Failed to fetch resources: ${(error as Error).message}`);
+    return;
+  }
+}
+
+function buildJsonOutput(
+  prepaymentInfo: InstallationBalancesAndThresholds,
+  resources: Resource[],
+  integrationSlug: string
+) {
+  const balances = prepaymentInfo.balances.map(balance => {
+    const resourceName = balance.resourceId
+      ? (resources.find(r => r.externalResourceId === balance.resourceId)
+          ?.name ?? balance.resourceId)
+      : 'installation';
+    return {
+      resourceName,
+      resourceId: balance.resourceId ?? null,
+      amountInCents: balance.currencyValueInCents,
+      amount: formattedCurrency(balance.currencyValueInCents),
+    };
+  });
+
+  const thresholds = prepaymentInfo.thresholds.map(threshold => {
+    const resourceName = threshold.resourceId
+      ? (resources.find(r => r.externalResourceId === threshold.resourceId)
+          ?.name ?? threshold.resourceId)
+      : 'installation';
+    return {
+      resourceName,
+      resourceId: threshold.resourceId ?? null,
+      minimumAmountInCents: threshold.minimumAmountInCents,
+      minimumAmount: formattedCurrency(threshold.minimumAmountInCents),
+      purchaseAmountInCents: threshold.purchaseAmountInCents,
+      purchaseAmount: formattedCurrency(threshold.purchaseAmountInCents),
+    };
+  });
+
+  return {
+    integration: integrationSlug,
+    balances,
+    thresholds,
+  };
+}
+
+function outputBalanceInformation(
+  prepaymentInfo: InstallationBalancesAndThresholds,
+  resources: Resource[],
+  integrationSlug: string
+) {
+  const hasBalances = prepaymentInfo.balances.length > 0;
+  const hasThresholds = prepaymentInfo.thresholds.length > 0;
+
+  if (!hasBalances) {
+    output.log('No balances found for this integration');
+  }
+
+  if (!hasThresholds) {
+    output.log('No thresholds found for this integration');
+  }
+
+  if (!hasBalances && !hasThresholds) {
+    return 0;
+  }
+
+  const mappings: Record<
+    string,
+    {
+      balance?: CreditWithAmount;
+      threshold?: PrepaymentCreditThreshold;
+      resourceName: string;
+    }
+  > = {};
+  for (const balance of prepaymentInfo.balances) {
+    const resourceName = balance.resourceId
+      ? (resources.find(r => r.externalResourceId === balance.resourceId)
+          ?.name ?? balance.resourceId)
+      : 'installation';
+    mappings[balance.resourceId ?? 'installation'] = { balance, resourceName };
+  }
+  for (const threshold of prepaymentInfo.thresholds) {
+    const mapping = mappings[threshold.resourceId ?? 'installation'];
+    if (mapping) {
+      mapping.threshold = threshold;
+    } else {
+      const resourceName = threshold.resourceId
+        ? (resources.find(r => r.externalResourceId === threshold.resourceId)
+            ?.name ?? threshold.resourceId)
+        : 'installation';
+      mappings[threshold.resourceId ?? 'installation'] = {
+        threshold,
+        resourceName,
+      };
+    }
+  }
+
+  output.log(
+    `${chalk.bold(`Balances and thresholds for ${integrationSlug}`)}:`
+  );
+
+  for (const key in mappings) {
+    const mapping = mappings[key];
+    const name = mapping.resourceName;
+    const balance = mapping.balance;
+    const threshold = mapping.threshold;
+
+    output.log(`● ${name}`);
+    if (balance) {
+      output.log(
+        `    Balance: ${formattedCurrency(balance.currencyValueInCents)}`
+      );
+    }
+    if (threshold) {
+      output.log(
+        `    Threshold: Spend ${formattedCurrency(threshold.purchaseAmountInCents)} if balance goes below ${formattedCurrency(threshold.minimumAmountInCents)}`
+      );
+    }
+  }
+}
+
+function formattedCurrency(amountInCents: number) {
+  return Intl.NumberFormat('en-US', {
+    style: 'currency',
+    currency: 'USD',
+  }).format(amountInCents / 100);
+}

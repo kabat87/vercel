@@ -1,0 +1,15 @@
+{
+  "probes": [
+    {
+      "path": "/api",
+      "mustContain": "pip:RANDOMNESS_PLACEHOLDER",
+      "logMustContain": "Python version \"3.7\" detected in Pipfile.lock is invalid and will be ignored.",
+      "responseHeaders": {
+        "content-type": "text/html"
+      }
+    },
+    {
+      "logMustContain": "Using python version: 3.12"
+    }
+  ]
+}

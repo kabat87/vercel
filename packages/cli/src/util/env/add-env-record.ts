@@ -1,34 +1,49 @@
-import { Output } from '../output';
-import Client from '../client';
-import {
+import type Client from '../client';
+import type {
   ProjectEnvTarget,
   ProjectEnvVariable,
   ProjectEnvType,
-} from '../../types';
+} from '@vercel-internals/types';
+import { PROJECT_ENV_TARGET } from '@vercel-internals/constants';
+import output from '../../output-manager';
 
 export default async function addEnvRecord(
-  output: Output,
   client: Client,
   projectId: string,
+  upsert: string,
   type: ProjectEnvType,
   key: string,
   value: string,
-  targets: ProjectEnvTarget[],
-  gitBranch: string
+  targets: string[],
+  gitBranch: string,
+  visibility?: ProjectEnvVariable['visibility']
 ): Promise<void> {
+  const actionWord = upsert ? 'Overriding' : 'Adding';
   output.debug(
-    `Adding ${type} Environment Variable ${key} to ${targets.length} targets`
+    `${actionWord} ${type} Environment Variable ${key} to ${targets.length} targets`
   );
+  const target: ProjectEnvTarget[] = [];
+  const customEnvironmentIds: string[] = [];
+  for (const t of targets) {
+    const arr = PROJECT_ENV_TARGET.includes(t as ProjectEnvTarget)
+      ? target
+      : customEnvironmentIds;
+    arr.push(t);
+  }
   const body: Omit<ProjectEnvVariable, 'id'> = {
     type,
     key,
     value,
-    target: targets,
+    target,
+    customEnvironmentIds:
+      customEnvironmentIds.length > 0 ? customEnvironmentIds : undefined,
     gitBranch: gitBranch || undefined,
+    ...(visibility !== undefined ? { visibility } : {}),
   };
-  const url = `/v7/projects/${projectId}/env`;
+  const args = upsert ? `?upsert=${upsert}` : '';
+  const url = `/v10/projects/${projectId}/env${args}`;
   await client.fetch(url, {
     method: 'POST',
-    body: JSON.stringify(body),
+    body,
   });
 }

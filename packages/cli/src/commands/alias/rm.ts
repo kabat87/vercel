@@ -1,44 +1,45 @@
 import chalk from 'chalk';
 import ms from 'ms';
-import table from 'text-table';
-import Client from '../../util/client';
+import table from '../../util/output/table';
+import type Client from '../../util/client';
 import getScope from '../../util/get-scope';
 import removeAliasById from '../../util/alias/remove-alias-by-id';
 import stamp from '../../util/output/stamp';
-import strlen from '../../util/strlen';
-import confirm from '../../util/input/confirm';
 import findAliasByAliasOrId from '../../util/alias/find-alias-by-alias-or-id';
-
-import { Alias } from '../../types';
-import { Output } from '../../util/output';
 import { isValidName } from '../../util/is-valid-name';
 import { getCommandName } from '../../util/pkg-name';
+import { AliasRemoveTelemetryClient } from '../../util/telemetry/commands/alias/remove';
+import output from '../../output-manager';
+import type { Alias } from '@vercel-internals/types';
+import { parseArguments } from '../../util/get-args';
+import { getFlagsSpecification } from '../../util/get-flags-specification';
+import { printError } from '../../util/error';
+import { removeSubcommand } from './command';
 
-type Options = {
-  '--yes': boolean;
-};
+export default async function rm(client: Client, argv: string[]) {
+  let parsedArguments;
 
-export default async function rm(
-  client: Client,
-  opts: Partial<Options>,
-  args: string[]
-) {
-  const { output } = client;
-
-  let contextName = null;
+  const flagsSpecification = getFlagsSpecification(removeSubcommand.options);
 
   try {
-    ({ contextName } = await getScope(client));
+    parsedArguments = parseArguments(argv, flagsSpecification);
   } catch (err) {
-    if (err.code === 'NOT_AUTHORIZED' || err.code === 'TEAM_DELETED') {
-      output.error(err.message);
-      return 1;
-    }
-
-    throw err;
+    printError(err);
+    return 1;
   }
 
+  const { args, flags: opts } = parsedArguments;
+
+  const { contextName } = await getScope(client);
+  const telemetryClient = new AliasRemoveTelemetryClient({
+    opts: {
+      store: client.telemetryEventStore,
+    },
+  });
+  telemetryClient.trackCliFlagYes(opts['--yes']);
+
   const [aliasOrId] = args;
+  telemetryClient.trackCliArgumentAlias(aliasOrId);
 
   if (args.length !== 1) {
     output.error(
@@ -60,7 +61,7 @@ export default async function rm(
     return 1;
   }
 
-  const alias = await findAliasByAliasOrId(output, client, aliasOrId);
+  const alias = await findAliasByAliasOrId(client, aliasOrId);
 
   if (!alias) {
     output.error(
@@ -71,21 +72,17 @@ export default async function rm(
   }
 
   const removeStamp = stamp();
-  if (!opts['--yes'] && !(await confirmAliasRemove(output, alias))) {
-    output.log('Aborted');
+  if (!opts['--yes'] && !(await confirmAliasRemove(client, alias))) {
+    output.log('Canceled');
     return 0;
   }
 
   await removeAliasById(client, alias.uid);
-  console.log(
-    `${chalk.cyan('> Success!')} Alias ${chalk.bold(
-      alias.alias
-    )} removed ${removeStamp()}`
-  );
+  output.success(`Alias ${chalk.bold(alias.alias)} removed ${removeStamp()}`);
   return 0;
 }
 
-async function confirmAliasRemove(output: Output, alias: Alias) {
+async function confirmAliasRemove(client: Client, alias: Alias) {
   const srcUrl = alias.deployment
     ? chalk.underline(alias.deployment.url)
     : null;
@@ -97,14 +94,10 @@ async function confirmAliasRemove(output: Output, alias: Alias) {
         chalk.gray(`${ms(Date.now() - alias.createdAt)} ago`),
       ],
     ],
-    {
-      align: ['l', 'l', 'r'],
-      hsep: ' '.repeat(4),
-      stringLength: strlen,
-    }
+    { hsep: 4 }
   );
 
-  output.log(`The following alias will be removed permanently`);
+  output.log('The following alias will be removed permanently');
   output.print(`  ${tbl}\n`);
-  return confirm(chalk.red('Are you sure?'), false);
+  return client.input.confirm(chalk.red('Are you sure?'), false);
 }

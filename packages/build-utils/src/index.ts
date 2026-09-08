@@ -1,14 +1,27 @@
 import FileBlob from './file-blob';
 import FileFsRef from './file-fs-ref';
 import FileRef from './file-ref';
-import { Lambda, createLambda, getLambdaOptionsFromFunction } from './lambda';
-import { Prerender } from './prerender';
-import download, { DownloadedFiles, isSymbolicLink } from './fs/download';
+import {
+  Lambda,
+  createLambda,
+  getLambdaOptionsFromFunction,
+  sanitizeConsumerName,
+} from './lambda';
+import { NodejsLambda, type NodejsLambdaOptions } from './nodejs-lambda';
+import { Prerender, type PrerenderInitialMetadata } from './prerender';
+import download, {
+  downloadFile,
+  DownloadedFiles,
+  isSymbolicLink,
+  isDirectory,
+  isExternalSymlink,
+  isExternalSymlinkTarget,
+  getSymlinkTarget,
+} from './fs/download';
 import getWriteableDirectory from './fs/get-writable-directory';
 import glob, { GlobOptions } from './fs/glob';
 import rename from './fs/rename';
 import {
-  execAsync,
   spawnAsync,
   execCommand,
   spawnCommand,
@@ -20,34 +33,62 @@ import {
   runBundleInstall,
   runPipInstall,
   runShellScript,
+  runCustomInstallCommand,
+  resetCustomInstallCommandSet,
+  getEnvForPackageManager,
   getNodeVersion,
+  getPathForPackageManager,
+  detectPackageManager,
   getSpawnOptions,
   getNodeBinPath,
+  getNodeBinPaths,
   scanParentDirs,
+  findPackageJson,
+  traverseUpDirectories,
+  PipInstallResult,
+  NpmInstallOutput,
+  type CliType,
 } from './fs/run-user-scripts';
 import {
   getLatestNodeVersion,
   getDiscontinuedNodeVersions,
+  getSupportedNodeVersion,
+  isBunVersion,
+  getSupportedBunVersion,
 } from './fs/node-version';
-import { NowBuildError } from './errors';
-import streamToBuffer from './fs/stream-to-buffer';
-import shouldServe from './should-serve';
+import streamToBuffer, { streamToBufferChunks } from './fs/stream-to-buffer';
+import { getOrCreateBunBinary } from './fs/bun-helpers';
 import debug from './debug';
+import getIgnoreFilter from './get-ignore-filter';
+import { getPlatformEnv } from './get-platform-env';
+import { getPrefixedEnvVars } from './get-prefixed-env-vars';
+import {
+  getServiceUrlEnvVars,
+  getExperimentalServiceUrlEnvVars,
+} from './get-service-url-env-vars';
+import { cloneEnv } from './clone-env';
+import { hardLinkDir } from './hard-link-dir';
+import { getNodeExecPath } from './get-node-exec-path';
+import { validateNpmrc } from './validate-npmrc';
+
+export type { NodejsLambdaOptions, PrerenderInitialMetadata };
+export type { LambdaAffinity } from './lambda';
 
 export {
   FileBlob,
   FileFsRef,
   FileRef,
   Lambda,
+  NodejsLambda,
   createLambda,
   Prerender,
   download,
+  downloadFile,
   DownloadedFiles,
   getWriteableDirectory,
   glob,
   GlobOptions,
   rename,
-  execAsync,
   spawnAsync,
   getScriptName,
   installDependencies,
@@ -56,73 +97,209 @@ export {
   spawnCommand,
   walkParentDirs,
   getNodeBinPath,
+  getNodeBinPaths,
+  getNodeExecPath,
+  getSupportedNodeVersion,
+  isBunVersion,
+  getSupportedBunVersion,
+  getOrCreateBunBinary,
+  detectPackageManager,
   runNpmInstall,
+  NpmInstallOutput,
   runBundleInstall,
   runPipInstall,
+  PipInstallResult,
   runShellScript,
+  runCustomInstallCommand,
+  resetCustomInstallCommandSet,
+  getEnvForPackageManager,
   getNodeVersion,
+  getPathForPackageManager,
   getLatestNodeVersion,
   getDiscontinuedNodeVersions,
   getSpawnOptions,
+  getPlatformEnv,
+  getPrefixedEnvVars,
+  getServiceUrlEnvVars,
+  getExperimentalServiceUrlEnvVars,
   streamToBuffer,
-  shouldServe,
+  streamToBufferChunks,
   debug,
   isSymbolicLink,
+  isDirectory,
+  isExternalSymlink,
+  isExternalSymlinkTarget,
+  getSymlinkTarget,
   getLambdaOptionsFromFunction,
+  sanitizeConsumerName,
   scanParentDirs,
+  findPackageJson,
+  getIgnoreFilter,
+  cloneEnv,
+  hardLinkDir,
+  traverseUpDirectories,
+  validateNpmrc,
+  type CliType,
 };
 
-export {
-  detectBuilders,
-  detectOutputDirectory,
-  detectApiDirectory,
-  detectApiExtensions,
-} from './detect-builders';
-export { detectFramework } from './detect-framework';
-export { DetectorFilesystem } from './detectors/filesystem';
-export { readConfigFile } from './fs/read-config-file';
+export { EdgeFunction } from './edge-function';
+export { ContainerImage } from './container-image';
+export type { ContainerImageConfig } from './container-image';
+export { readConfigFile, getPackageJson } from './fs/read-config-file';
+export { normalizePath } from './fs/normalize-path';
+export { getProvidedRuntime } from './provided-runtime';
 
+export * from './should-serve';
 export * from './schemas';
+export {
+  DEFAULT_MAX_DURATION_LIMIT,
+  SKIP_MAX_DURATION_LIMIT_ENV,
+  getMaxDurationLimit,
+  getMaxDurationSchema,
+} from './max-duration';
+export * from './package-manifest';
+export * from './deploy-manifest';
+export { generateProjectManifest } from './node-diagnostics';
+export {
+  generateRubyProjectManifest,
+  parseGemfileLock,
+} from './ruby-diagnostics';
 export * from './types';
 export * from './errors';
 
-/**
- * Helper function to support both `@vercel` and legacy `@now` official Runtimes.
- */
-export const isOfficialRuntime = (desired: string, name?: string): boolean => {
-  if (typeof name !== 'string') {
-    return false;
-  }
-  return (
-    name === `@vercel/${desired}` ||
-    name === `@now/${desired}` ||
-    name.startsWith(`@vercel/${desired}@`) ||
-    name.startsWith(`@now/${desired}@`)
-  );
-};
+export * from './trace';
 
-export const isStaticRuntime = (name?: string): boolean => {
-  return isOfficialRuntime('static', name);
-};
+export { NODE_VERSIONS } from './fs/node-version';
 
-/**
- * Helper function to support both `VERCEL_` and legacy `NOW_` env vars.
- * Throws an error if *both* env vars are defined.
- */
-export const getPlatformEnv = (name: string): string | undefined => {
-  const vName = `VERCEL_${name}`;
-  const nName = `NOW_${name}`;
-  const v = process.env[vName];
-  const n = process.env[nName];
-  if (typeof v === 'string') {
-    if (typeof n === 'string') {
-      throw new NowBuildError({
-        code: 'CONFLICTING_ENV_VAR_NAMES',
-        message: `Both "${vName}" and "${nName}" env vars are defined. Please only define the "${vName}" env var.`,
-        link: 'https://vercel.link/combining-old-and-new-config',
-      });
-    }
-    return v;
-  }
-  return n;
-};
+export { getInstalledPackageVersion } from './get-installed-package-version';
+export { isPackageInstalled } from './is-package-installed';
+
+export { defaultCachePathGlob } from './default-cache-path-glob';
+
+export { generateNodeBuilderFunctions } from './generate-node-builder-functions';
+
+export {
+  getRegExpFromMatchers,
+  resolveMiddlewareMatcher,
+} from './middleware-matcher';
+
+export {
+  BACKEND_FRAMEWORKS,
+  BACKEND_BUILDERS,
+  UNIFIED_BACKEND_BUILDER,
+  BackendFramework,
+  isBackendFramework,
+  isNodeBackendFramework,
+  isBackendBuilder,
+  isExperimentalBackendsEnabled,
+  isExperimentalBackendsWithoutIntrospectionEnabled,
+  shouldUseExperimentalBackends,
+  PYTHON_FRAMEWORKS,
+  PythonFramework,
+  isPythonFramework,
+} from './framework-helpers';
+
+export * from './node-entrypoint';
+export * from './service-path-utils';
+
+export {
+  getEncryptedEnv,
+  type EncryptedEnvFile,
+} from './process-serverless/get-encrypted-env-file';
+export { getLambdaEnvironment } from './process-serverless/get-lambda-environment';
+export {
+  getLambdaPreloadScripts,
+  type BytecodeCachingOptions,
+} from './process-serverless/get-lambda-preload-scripts';
+export { getLambdaSupportsStreaming } from './process-serverless/get-lambda-supports-streaming';
+
+export {
+  streamToDigestAsync,
+  sha256,
+  md5,
+  type FileDigest,
+} from './fs/stream-to-digest-async';
+
+export {
+  getBuildResultMetadata,
+  type BuildResultMetadata,
+} from './collect-build-result/get-build-result-metadata';
+export {
+  validateBuildResult,
+  SUPPORTED_AL2023_RUNTIMES,
+  type ValidateBuildResultParams,
+  type ValidateBuildResultResult,
+} from './collect-build-result/validate-build-result';
+export { getLambdaByOutputPath } from './collect-build-result/get-lambda-by-output-path';
+export { isRouteMiddleware } from './collect-build-result/is-route-middleware';
+export { getPrerenderChain } from './collect-build-result/get-prerender-chain';
+export {
+  streamWithExtendedPayload,
+  type ExtendedBodyData,
+} from './collect-build-result/stream-with-extended-payload';
+
+export { collectUncompressedSize } from './collect-uncompressed-size';
+
+export {
+  finalizeLambda,
+  type CreateZipResult,
+  type CreateZipFn,
+  type FinalizeLambdaParams,
+  type FinalizeLambdaResult,
+  type TraceFn,
+} from './finalize-lambda';
+
+export {
+  validateLambdaSize,
+  validateUncompressedLambdaSize,
+  FunctionSizeError,
+  MAX_LAMBDA_SIZE,
+  MAX_LAMBDA_UNCOMPRESSED_SIZE,
+  validateEnvWrapperSupport,
+  ENV_WRAPPER_SUPPORTED_FAMILIES,
+} from './validate-lambda-size';
+
+export { validateFrameworkVersion } from './deserialize/validate-framework-version';
+export { hydrateFilesMap } from './deserialize/hydrate-files-map';
+export { createFunctionsIterator } from './deserialize/create-functions-iterator';
+export { maybeReadJSON } from './deserialize/maybe-read-json';
+export {
+  deserializeBuildOutput,
+  validateDeploymentId,
+} from './deserialize/deserialize-build-output';
+export type {
+  DeserializeBuildOutputConfig,
+  DeserializeBuildOutputResult,
+  DeserializeBuildOutputPathOverride,
+  DeserializeBuildOutputOptions,
+  DeserializeBuildOutputLambdaOptions,
+  GroupLambdasOptions,
+  DeserializeBuildOutputSerializedConfig,
+  DeserializeBuildOutputSerializedPrerender,
+} from './deserialize/deserialize-build-output-types';
+
+export {
+  deserializeLambda,
+  type DeserializeLambdaOptions,
+} from './deserialize/deserialize-lambda';
+export { deserializeEdgeFunction } from './deserialize/deserialize-edge-function';
+export type {
+  Properties,
+  SerializedLambda,
+  SerializedNodejsLambda,
+  SerializedEdgeFunction,
+  SerializedFileFsRef,
+  SerializedPrerender,
+} from './deserialize/serialized-types';
+
+export { validateRegularFile } from './collect-build-result/validate-regular-file';
+export { validatePrerender } from './collect-build-result/validate-prerender';
+export { getContentType } from './collect-build-result/get-content-type';
+export {
+  fileToBuildOutputFile,
+  type BuildOutputFile,
+} from './collect-build-result/file-to-build-output-file';
+export {
+  prerenderToBuildOutputFile,
+  type ExtendedPayload,
+} from './collect-build-result/prerender-to-build-output-file';

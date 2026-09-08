@@ -1,0 +1,702 @@
+# @vercel/frameworks
+
+## 3.34.0
+
+### Minor Changes
+
+- f2c588f: Detect projects with both `eve` and `@vercel/factory` dependencies as the new Factory (Eve) framework instead of Eve.
+
+## 3.33.0
+
+### Minor Changes
+
+- 359a57c: Mark the Rust framework as stable. Detection stays keyed on `src/main.rs` so `api/**/*.rs` function projects (which declare a `[[bin]]` per handler) remain framework-less and build zero-config; `[[bin]]`-only servers and cargo workspaces are supported by setting the Rust preset manually. Projects with an explicit output directory (e.g. wasm frontends built with Trunk) keep the static-build path instead of the Rust runtime, while preserving `api/**/*.rs` functions, and committed prebuilt output is served directly when no build command is configured.
+
+## 3.32.0
+
+### Minor Changes
+
+- bd5f1a7: Add standalone server mode for Rust, matching the Go framework preset. A project
+  that is not an `api/**` handler and does not depend on the `vercel_runtime` crate
+  now deploys as a plain HTTP server listening on `$PORT`, adapted to the
+  executable runtime by the shared IPC proxy. The binary comes from `Cargo.toml`;
+  for a multi-binary crate or workspace, point the entrypoint at the binary or set
+  `default-run`.
+
+  Projects using `vercel_runtime` are unaffected. `waitUntil` and request-scoped
+  logs still require `vercel_runtime`. Cargo's `target` directory is now excluded
+  from the files the builder downloads.
+
+## 3.31.0
+
+### Minor Changes
+
+- a7fc7e8: Expose the resolved rewrite destination as the request path observed by standalone Go servers, and warn affected Go projects about the behavior change.
+
+## 3.30.9
+
+### Patch Changes
+
+- b82e2a8: Serve the Dojo, Parcel, Scully, VuePress, Zola and FastHTML preset logos as SVG
+  These were the only six presets still pointing at raster logos. `next/image`
+  skips image optimization for `.svg` sources unless `dangerouslyAllowSVG` is
+  enabled, so these six were the only preset logos routed through the optimizer in
+  consumers such as the project settings framework picker, which made them the only
+  ones that could fail to render. Serving them as vectors puts all presets on the
+  same direct-load path and cuts the six logos from 373 KB to 33 KB.
+
+## 3.30.8
+
+### Patch Changes
+
+- 6d7fbfa: Bump all workspace packages to trigger a full publish from vercel-internal.
+- Updated dependencies [6d7fbfa]
+  - @vercel/error-utils@2.2.1
+
+## 3.30.7
+
+### Patch Changes
+
+- fa14ee9: Mark the Services framework preset as stable.
+
+## 3.30.6
+
+### Patch Changes
+
+- 7bc4db0: [frameworks] Add Lovable platform framework and platform attribute
+
+## 3.30.5
+
+### Patch Changes
+
+- 85c897e: Run framework detection during `vc build` (opt-in via `VERCEL_FRAMEWORK_DETECTION=1`): detect the framework on a project's first deployment (`VERCEL_FIRST_DEPLOYMENT=1`) when none is configured and record it as `detectedFramework` in `builds.json`, cross-check the configured framework against the source code in the background without slowing the build, and validate the build output after it is written. Adds a `detectionConfidence` annotation to framework definitions for detections that are commonly incidental (e.g. Storybook as a devDependency) so they are never suggested as a framework override.
+
+## 3.30.4
+
+### Patch Changes
+
+- d19dbc5: Use circle icons for dark mode and light mode for services and containers
+
+## 3.30.3
+
+### Patch Changes
+
+- 02d8bab: Add services logo
+
+## 3.30.2
+
+### Patch Changes
+
+- acddddf: Update the Container framework logo to use the Box icon.
+
+## 3.30.1
+
+### Patch Changes
+
+- 66be3e0: [services] Refine container detection for `services` / `experimentalServicesV2`.
+
+  - A supplied `entrypoint` infers `runtime: "container"` when it names one of the
+    blessed Dockerfile names: `Dockerfile`, `Containerfile`, `Dockerfile.vercel`,
+    or `Containerfile.vercel`. A suffixed name like `Dockerfile.prod` is not a
+    container entrypoint.
+  - `runtime: "container"` without an `entrypoint` auto-detects one of those same
+    four blessed names in the service root, probing `Dockerfile.vercel`,
+    `Containerfile.vercel`, `Dockerfile`, `Containerfile` (in that order, so a
+    `.vercel` opt-in marker takes precedence over a plain `Dockerfile`).
+  - Removed the prebuilt OCI image reference entrypoint: an `entrypoint` must now
+    name a Dockerfile/Containerfile, otherwise the service errors.
+  - `@vercel/container` recognizes the same blessed set (via a shared
+    `isDockerfileRef`), keeping the builder and the services resolver in sync so
+    the configured Dockerfile entrypoint is honored instead of being ignored in
+    favor of a default `Dockerfile` or treated as a prebuilt image reference.
+  - The `container` framework preset is no longer experimental: a project with a
+    `Dockerfile.vercel` / `Containerfile.vercel` marker is detected as a
+    container without `VERCEL_USE_EXPERIMENTAL_FRAMEWORKS`.
+
+## 3.30.0
+
+### Minor Changes
+
+- 09743c6: Support deploying any project as a container via a `Dockerfile.vercel` or `Containerfile.vercel` marker. A new experimental `container` framework preset detects these files and is listed first so it takes precedence over all other frameworks — a project that also looks like (e.g.) a Next.js app will deploy as a container when one of these markers is present. As an experimental framework it is gated behind `VERCEL_USE_EXPERIMENTAL_FRAMEWORKS`. The `@vercel/container` builder now recognizes the `.vercel` markers, auto-discovers them when its entrypoint is `<detect>`, and supports root (non-service) container deploys.
+
+## 3.29.1
+
+### Patch Changes
+
+- 3b273ff: lowercase Eve to eve in framework preset
+
+## 3.29.0
+
+### Minor Changes
+
+- 3d8df16: Add bun preset.
+
+### Patch Changes
+
+- 2fd14e0: Replace placeholder Eve framework logos with the official triangle mark used in Eve docs.
+- 68c2fd7: Graduate Eve from experimental frameworks so detection and deploys no longer require `VERCEL_USE_EXPERIMENTAL_FRAMEWORKS`.
+
+## 3.28.1
+
+### Patch Changes
+
+- 4421ad9: Allow the Node framework preset to work without a `package.json`. The `node`
+  framework is now detected from a `server.*` entrypoint alone, and the
+  `@vercel/backends` builder defaults the module format to ESM (`"module"`) when
+  no `package.json` is present instead of erroring with "Unable to resolve format".
+
+## 3.28.0
+
+### Minor Changes
+
+- 4bd58f2: Add Eve as an experimental framework declaration alongside Ash.
+
+### Patch Changes
+
+- b98053e: Change label for Sanity v2
+
+## 3.27.0
+
+### Minor Changes
+
+- c0f1229: Update Sanity branding (new tagline, dark mode logo, demo URL) and broaden framework detection to cover Sanity v3, v4, and v5 via the `sanity` package. Move the legacy v2 entry to its own `sanity-v2` slug (with the example moved to `examples/sanity-v2`).
+
+### Patch Changes
+
+- Updated dependencies [fddeb55]
+  - @vercel/error-utils@2.2.0
+
+## 3.26.1
+
+### Patch Changes
+
+- 0dbb8e5: Detect TanStack Start projects without requiring a top-level `nitro` dependency by matching Start packages directly.
+
+## 3.26.0
+
+### Minor Changes
+
+- 51785a6: Add Ash framework preset
+
+## 3.25.1
+
+### Patch Changes
+
+- c95a7ca: Move framework import screenshots from Cloudinary (`assets.vercel.com`) to Vercel Blob. The four affected entries (Next.js, Nuxt, SvelteKit, SvelteKit legacy) now point at `https://py8fhxnkzwtsqdo9.public.blob.vercel-storage.com/front/import/*.png`. Same images, different host — consumers see no behavior change.
+
+## 3.25.0
+
+### Minor Changes
+
+- c56f851: Upgrade to TypeScript 5.9
+
+### Patch Changes
+
+- Updated dependencies [c56f851]
+  - @vercel/error-utils@2.1.0
+
+## 3.24.2
+
+### Patch Changes
+
+- 09d9000: Fix the frameworks demo URL public-access test to check the public `/_logs` route instead of looking up alias hosts through the deployments API.
+
+## 3.24.1
+
+### Patch Changes
+
+- Add actix framework preset ([#15752](https://github.com/vercel/vercel/pull/15752))
+
+## 3.24.0
+
+### Minor Changes
+
+- Support configuration via vercel.toml ([#15750](https://github.com/vercel/vercel/pull/15750))
+
+### Patch Changes
+
+- remove experimental flag on node preset ([#15628](https://github.com/vercel/vercel/pull/15628))
+
+## 3.23.0
+
+### Minor Changes
+
+- Add Mastra framework preset ([#15076](https://github.com/vercel/vercel/pull/15076))
+
+## 3.22.0
+
+### Minor Changes
+
+- Simplify and streamline python builder logic ([#15696](https://github.com/vercel/vercel/pull/15696))
+
+### Patch Changes
+
+- Switch to using smol-toml for toml parsing ([#15730](https://github.com/vercel/vercel/pull/15730))
+
+## 3.21.1
+
+### Patch Changes
+
+- [go] remove experimental flag on "go" frameworks preset ([#15435](https://github.com/vercel/vercel/pull/15435))
+
+## 3.21.0
+
+### Minor Changes
+
+- Make the generic "python" framework and the Django framework not experimental ([#15429](https://github.com/vercel/vercel/pull/15429))
+
+## 3.20.0
+
+### Minor Changes
+
+- Add a content filter for manage.py for django framework detection. ([#15348](https://github.com/vercel/vercel/pull/15348))
+
+- Detect django framework when manage.py is found. ([#15314](https://github.com/vercel/vercel/pull/15314))
+
+## 3.19.1
+
+### Patch Changes
+
+- Rename fetch to nodeFetch when importing from node-fetch ([#15232](https://github.com/vercel/vercel/pull/15232))
+
+## 3.19.0
+
+### Minor Changes
+
+- Add django experimental framework. ([#15196](https://github.com/vercel/vercel/pull/15196))
+
+## 3.18.0
+
+### Minor Changes
+
+- Make experimental multi-service autodetection work with SvelteKit. ([#15040](https://github.com/vercel/vercel/pull/15040))
+
+## 3.17.1
+
+### Patch Changes
+
+- [services] remove empty detectors ([#14914](https://github.com/vercel/vercel/pull/14914))
+
+## 3.17.0
+
+### Minor Changes
+
+- Add experimental Go runtime framework preset. ([#14865](https://github.com/vercel/vercel/pull/14865))
+
+  This adds support for deploying standalone Go HTTP servers (using `package main` with `func main()`) in addition to the existing serverless function pattern. The preset supports:
+
+  - `main.go` at project root (simple projects)
+  - `cmd/api/main.go` (API servers)
+  - `cmd/server/main.go` (HTTP servers)
+
+  The Go application must listen on the port specified by the `PORT` environment variable.
+
+## 3.16.1
+
+### Patch Changes
+
+- Generic node framework preset ([#14779](https://github.com/vercel/vercel/pull/14779))
+
+- experimental rust runtime framework preset ([#14765](https://github.com/vercel/vercel/pull/14765))
+
+## 3.16.0
+
+### Minor Changes
+
+- [ruby] Add experimental Ruby runtime framework preset ([#14762](https://github.com/vercel/vercel/pull/14762))
+
+  Also fixed a bug in the Ruby version parsing where `ruby "~> 3.3.x"` in Gemfile would fail due to a trailing space not being trimmed after removing the `~>` prefix.
+
+## 3.15.7
+
+### Patch Changes
+
+- [experimental-services] Add "services" as experimental framework preset ([#14648](https://github.com/vercel/vercel/pull/14648))
+
+- [frameworks] experimental framework flagging ([#14646](https://github.com/vercel/vercel/pull/14646))
+
+- [python] experimental python runtime framework preset ([#14646](https://github.com/vercel/vercel/pull/14646))
+
+## 3.15.6
+
+### Patch Changes
+
+- [frameworks] experimental framework flagging ([#14637](https://github.com/vercel/vercel/pull/14637))
+
+## 3.15.5
+
+### Patch Changes
+
+- Add zero-config support for Koa.js ([#14567](https://github.com/vercel/vercel/pull/14567))
+
+## 3.15.4
+
+### Patch Changes
+
+- Use `workspace:*` for workspace dependencies ([#14396](https://github.com/vercel/vercel/pull/14396))
+
+## 3.15.3
+
+### Patch Changes
+
+- Make Nitro supersede Vite in detection ([#14179](https://github.com/vercel/vercel/pull/14179))
+
+## 3.15.2
+
+### Patch Changes
+
+- [python] make flask framework detection case insensitive ([#14197](https://github.com/vercel/vercel/pull/14197))
+
+## 3.15.1
+
+### Patch Changes
+
+- Fix express logos ([#13783](https://github.com/vercel/vercel/pull/13783))
+
+## 3.15.0
+
+### Minor Changes
+
+- Add TanStack Start framework preset ([#14175](https://github.com/vercel/vercel/pull/14175))
+
+## 3.14.1
+
+### Patch Changes
+
+- Add Elysia framework ([#14164](https://github.com/vercel/vercel/pull/14164))
+
+## 3.14.0
+
+### Minor Changes
+
+- Add zero-config support for Fastify ([#14120](https://github.com/vercel/vercel/pull/14120))
+
+## 3.13.0
+
+### Minor Changes
+
+- Add root main as entrypoint for NestJS ([#14105](https://github.com/vercel/vercel/pull/14105))
+
+## 3.12.0
+
+### Minor Changes
+
+- Update nitro framework detection to detect nitro package ([#14103](https://github.com/vercel/vercel/pull/14103))
+
+### Patch Changes
+
+- Add support for additional entrypoints in NestJS ([#14103](https://github.com/vercel/vercel/pull/14103))
+
+## 3.11.1
+
+### Patch Changes
+
+- [python] flask zero-config ([#14055](https://github.com/vercel/vercel/pull/14055))
+
+## 3.11.0
+
+### Minor Changes
+
+- Add zero config support for NestJS ([#14009](https://github.com/vercel/vercel/pull/14009))
+
+## 3.10.0
+
+### Minor Changes
+
+- Add h3 example ([#14021](https://github.com/vercel/vercel/pull/14021))
+
+### Patch Changes
+
+- [python] fastapi route redirects fix ([#14027](https://github.com/vercel/vercel/pull/14027))
+
+- [python] Use static builder for /public for FastAPI ([#14027](https://github.com/vercel/vercel/pull/14027))
+
+## 3.9.3
+
+### Patch Changes
+
+- [python] update fastapi logo ([#13982](https://github.com/vercel/vercel/pull/13982))
+
+## 3.9.2
+
+### Patch Changes
+
+- Update info around H3 framework ([#13957](https://github.com/vercel/vercel/pull/13957))
+
+## 3.9.1
+
+### Patch Changes
+
+- [python] framework demo + removed experimental ([#13959](https://github.com/vercel/vercel/pull/13959))
+
+## 3.9.0
+
+### Minor Changes
+
+- Add h3 zero config support ([#13942](https://github.com/vercel/vercel/pull/13942))
+
+## 3.8.5
+
+### Patch Changes
+
+- [python] FastAPI entrypoint discovery ([#13914](https://github.com/vercel/vercel/pull/13914))
+
+## 3.8.4
+
+### Patch Changes
+
+- This updates `Nuxt.js` -> `Nuxt`, detects Nuxt if the nightly version is installed, and updates the development command to nuxt dev. ([#13606](https://github.com/vercel/vercel/pull/13606))
+
+## 3.8.3
+
+### Patch Changes
+
+- Adds FastAPI to the list of auto-detected frameworks ([#13877](https://github.com/vercel/vercel/pull/13877))
+
+## 3.8.2
+
+### Patch Changes
+
+- Add .cts support to express and hono builders ([#13828](https://github.com/vercel/vercel/pull/13828))
+
+- - Expand framework detection to src/app and src/server files. ([#13828](https://github.com/vercel/vercel/pull/13828))
+  - Improve handling when multiple entrypoints are detected.
+
+## 3.8.1
+
+### Patch Changes
+
+- Add support for app.js as a server entrypoint ([#13798](https://github.com/vercel/vercel/pull/13798))
+
+## 3.8.0
+
+### Minor Changes
+
+- Add xmcp zero-config Framework Preset ([#13770](https://github.com/vercel/vercel/pull/13770))
+
+## 3.7.7
+
+### Patch Changes
+
+- Add Express to frameworks detection ([#13754](https://github.com/vercel/vercel/pull/13754))
+
+## 3.7.6
+
+### Patch Changes
+
+- Fix issue where .mjs files weren't transpiled properly for Hono ([#13658](https://github.com/vercel/vercel/pull/13658))
+
+## 3.7.5
+
+### Patch Changes
+
+- Support `server.ts` for hono entrypoint ([#13638](https://github.com/vercel/vercel/pull/13638))
+
+## 3.7.4
+
+### Patch Changes
+
+- Adds framework detection and an associated builder for Hono. ([#13594](https://github.com/vercel/vercel/pull/13594))
+
+## 3.7.3
+
+### Patch Changes
+
+- No longer inject 404 route for react router ([#13571](https://github.com/vercel/vercel/pull/13571))
+
+## 3.7.2
+
+### Patch Changes
+
+- Reverting support for `preferredRegion` ([#13566](https://github.com/vercel/vercel/pull/13566))
+
+## 3.7.1
+
+### Patch Changes
+
+- [frameworks] use correct output dir for nitro ([#13541](https://github.com/vercel/vercel/pull/13541))
+
+## 3.7.0
+
+### Minor Changes
+
+- Add Nitro to framework list ([#13472](https://github.com/vercel/vercel/pull/13472))
+
+## 3.6.4
+
+### Patch Changes
+
+- [frameworks] updated Docusaurus to match out framework naming standards ([#13333](https://github.com/vercel/vercel/pull/13333))
+
+## 3.6.3
+
+### Patch Changes
+
+- Rename SvelteKit (v1) ([#13255](https://github.com/vercel/vercel/pull/13255))
+
+## 3.6.2
+
+### Patch Changes
+
+- Replace Ember Mascot with Ember Framework Logo ([#13109](https://github.com/vercel/vercel/pull/13109))
+
+- Updates the [Astro](https://astro.build) logo ([#13112](https://github.com/vercel/vercel/pull/13112))
+
+## 3.6.1
+
+### Patch Changes
+
+- Enable "demo" property for "react-router" framework ([#13008](https://github.com/vercel/vercel/pull/13008))
+
+## 3.6.0
+
+### Minor Changes
+
+- Add "react-router" framework entry ([#12932](https://github.com/vercel/vercel/pull/12932))
+
+## 3.5.0
+
+### Minor Changes
+
+- Make vite detection supersede ionic-react ([#12880](https://github.com/vercel/vercel/pull/12880))
+
+## 3.4.0
+
+### Minor Changes
+
+- [frameworks] pass `$PORT` to dev command for newer svelte apps ([#12696](https://github.com/vercel/vercel/pull/12696))
+
+## 3.3.1
+
+### Patch Changes
+
+- Updated dependencies [[`79fbf1c95f4fa9bfe6af17aa3e13cf18424fc521`](https://github.com/vercel/vercel/commit/79fbf1c95f4fa9bfe6af17aa3e13cf18424fc521)]:
+  - @vercel/error-utils@2.0.3
+
+## 3.3.0
+
+### Minor Changes
+
+- [frameworks] Make FastHTML detector more specific ([#12065](https://github.com/vercel/vercel/pull/12065))
+
+## 3.2.0
+
+### Minor Changes
+
+- [fs-detectors] Adds new detector for Sanity v3 ([#11991](https://github.com/vercel/vercel/pull/11991))
+
+## 3.1.1
+
+### Patch Changes
+
+- Improvements to "fasthtml" framework preset ([#11900](https://github.com/vercel/vercel/pull/11900))
+
+## 3.1.0
+
+### Minor Changes
+
+- Add FastHTML framework preset ([#11889](https://github.com/vercel/vercel/pull/11889))
+
+## 3.0.3
+
+### Patch Changes
+
+- Update SvelteKit v1 devCommand ([#11494](https://github.com/vercel/vercel/pull/11494))
+
+## 3.0.2
+
+### Patch Changes
+
+- Update framework detection to support SolidStart v1 ([#11308](https://github.com/vercel/vercel/pull/11308))
+
+## 3.0.1
+
+### Patch Changes
+
+- Swap jest for vitest in CLI unit tests ([#11302](https://github.com/vercel/vercel/pull/11302))
+
+## 3.0.0
+
+### Major Changes
+
+- Make "remix" framework preset supersede "vite" ([#11031](https://github.com/vercel/vercel/pull/11031))
+
+## 2.0.6
+
+### Patch Changes
+
+- Update nuxt logo ([#10977](https://github.com/vercel/vercel/pull/10977))
+
+## 2.0.5
+
+### Patch Changes
+
+- This new screenshot matches the template. It removes the version number so this screenshot will not go stale. ([#10921](https://github.com/vercel/vercel/pull/10921))
+
+## 2.0.4
+
+### Patch Changes
+
+- Update placeholder for Nuxt to be correct command. ([#10873](https://github.com/vercel/vercel/pull/10873))
+
+## 2.0.3
+
+### Patch Changes
+
+- update Angular output path discovery ([#10678](https://github.com/vercel/vercel/pull/10678))
+
+- Updated dependencies [[`34dd9c091`](https://github.com/vercel/vercel/commit/34dd9c0918585cf6d3b04bddd9158978b0b4192f)]:
+  - @vercel/error-utils@2.0.2
+
+## 2.0.2
+
+### Patch Changes
+
+- Add `bun install` placeholder ([#10492](https://github.com/vercel/vercel/pull/10492))
+
+## 2.0.1
+
+### Patch Changes
+
+- move some frameworks deps to dependencies ([#10380](https://github.com/vercel/vercel/pull/10380))
+
+- Updated dependencies [[`96f99c714`](https://github.com/vercel/vercel/commit/96f99c714715651b85eb7a03f58ecc9e1316d156)]:
+  - @vercel/error-utils@2.0.1
+
+## 2.0.0
+
+### Major Changes
+
+- BREAKING CHANGE: Drop Node.js 14, bump minimum to Node.js 16 ([#10369](https://github.com/vercel/vercel/pull/10369))
+
+### Minor Changes
+
+- Add "supersedes" prop to Framework interface ([#10345](https://github.com/vercel/vercel/pull/10345))
+
+## 1.6.0
+
+### Minor Changes
+
+- [frameworks] Amend Hugo default `buildCommand` to exclude drafts enabled flag ([#7326](https://github.com/vercel/vercel/pull/7326))
+
+## 1.5.1
+
+### Patch Changes
+
+- Add "(v1)" suffix to "hydrogen" preset ([#10320](https://github.com/vercel/vercel/pull/10320))
+
+- Use parenthesis on Docusaurus "name" fields ([#10324](https://github.com/vercel/vercel/pull/10324))
+
+## 1.5.0
+
+### Minor Changes
+
+- Add `ignorePackageJsonScript` configuration for Framework command settings to ignore the `package.json` script. ([#10228](https://github.com/vercel/vercel/pull/10228))
+
+  Enable this mode for Storybook's `buildCommand`, since it should not invoke the "build" script, which is most likely designated for the frontend app build.
+
+## 1.4.3
+
+### Patch Changes
+
+- [frameworks] Update `saber.land` to `saber.egoist.dev` ([#10148](https://github.com/vercel/vercel/pull/10148))

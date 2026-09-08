@@ -2,23 +2,31 @@ import Ajv from 'ajv';
 import assert from 'assert';
 import { join } from 'path';
 import { existsSync } from 'fs';
-import { isString } from 'util';
-import fetch from 'node-fetch';
-import { URL, URLSearchParams } from 'url';
+import nodeFetch from 'node-fetch';
+import { URL } from 'url';
 import frameworkList from '../src/frameworks';
+
+// bump timeout for Windows as network can be slower
+vi.setConfig({ testTimeout: 15 * 1000, hookTimeout: 15 * 1000 });
+
+const logoPrefix = 'https://api-frameworks.vercel.sh/framework-logos/';
+const isString = (value: unknown): value is string => typeof value === 'string';
 
 const SchemaFrameworkDetectionItem = {
   type: 'array',
   items: [
     {
       type: 'object',
-      required: ['path'],
+      required: [],
       additionalProperties: false,
       properties: {
         path: {
           type: 'string',
         },
         matchContent: {
+          type: 'string',
+        },
+        matchPackage: {
           type: 'string',
         },
       },
@@ -34,10 +42,26 @@ const SchemaSettings = {
       additionalProperties: false,
       properties: {
         value: {
+          type: ['string', 'null'],
+        },
+        placeholder: {
+          type: 'string',
+        },
+      },
+    },
+    {
+      type: 'object',
+      required: ['value', 'ignorePackageJsonScript'],
+      additionalProperties: false,
+      properties: {
+        value: {
           type: 'string',
         },
         placeholder: {
           type: 'string',
+        },
+        ignorePackageJsonScript: {
+          type: 'boolean',
         },
       },
     },
@@ -54,24 +78,40 @@ const SchemaSettings = {
   ],
 };
 
+const RouteSchema = {
+  type: 'array',
+  items: {
+    properties: {
+      src: { type: 'string' },
+      dest: { type: 'string' },
+      status: { type: 'number' },
+      handle: { type: 'string' },
+      headers: { type: 'object' },
+      continue: { type: 'boolean' },
+    },
+  },
+};
+
 const Schema = {
   type: 'array',
   items: {
     type: 'object',
+    additionalProperties: false,
     required: [
       'name',
       'slug',
       'logo',
       'description',
       'settings',
-      'buildCommand',
-      'devCommand',
+      'getOutputDirName',
     ],
     properties: {
       name: { type: 'string' },
       slug: { type: ['string', 'null'] },
       sort: { type: 'number' },
       logo: { type: 'string' },
+      darkModeLogo: { type: 'string' },
+      screenshot: { type: 'string' },
       demo: { type: 'string' },
       tagline: { type: 'string' },
       website: { type: 'string' },
@@ -116,6 +156,26 @@ const Schema = {
           outputDirectory: SchemaSettings,
         },
       },
+      getOutputDirName: {
+        isFunction: true,
+      },
+      defaultRoutes: {
+        oneOf: [{ isFunction: true }, RouteSchema],
+      },
+      defaulHeaders: {
+        type: 'array',
+        items: {
+          properties: {
+            source: { type: 'string' },
+            regex: { type: 'string' },
+            headers: { type: 'object' },
+            continue: { type: 'boolean' },
+          },
+        },
+      },
+      disableRootMiddleware: {
+        type: 'boolean',
+      },
       recommendedIntegrations: {
         type: 'array',
         items: {
@@ -138,38 +198,81 @@ const Schema = {
 
       dependency: { type: 'string' },
       cachePattern: { type: 'string' },
-      buildCommand: { type: ['string', 'null'] },
-      devCommand: { type: ['string', 'null'] },
       defaultVersion: { type: 'string' },
+      supersedes: { type: 'array', items: { type: 'string' } },
+      experimental: { type: 'boolean' },
+      runtimeFramework: { type: 'boolean' },
+      detectionConfidence: { type: 'string', enum: ['weak', 'strong'] },
+      platform: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['name', 'logo'],
+        properties: {
+          name: { type: 'string' },
+          logo: { type: 'string' },
+        },
+      },
     },
   },
 };
 
-async function getDeployment(host: string) {
-  const query = new URLSearchParams();
-  query.set('url', host);
-  const res = await fetch(
-    `https://api.vercel.com/v11/deployments/get?${query}`
+async function isDemoPublic(demoUrl: string) {
+  const logsUrl = new URL('/_logs', demoUrl);
+  const res = await nodeFetch(logsUrl.toString(), {
+    redirect: 'manual',
+  });
+  const location = res.headers.get('location');
+
+  return (
+    res.status >= 300 &&
+    res.status < 400 &&
+    location === `https://vercel.com/deployments/${logsUrl.host}/logs`
   );
-  const body = await res.json();
-  return body;
 }
 
 describe('frameworks', () => {
+  const skipExamples = [
+    'dojo',
+    'saber',
+    'gridsome',
+    'sanity',
+    'scully',
+    'solidstart',
+    'sanity-v2', // https://linear.app/vercel/issue/ZERO-3238/unskip-tests-failing-due-to-node-16-removal
+    'vuepress', // https://linear.app/vercel/issue/ZERO-3238/unskip-tests-failing-due-to-node-16-removal
+    'hydrogen',
+    'storybook',
+    'eve', // examples/fixtures live in github.com/vercel/ash
+    'factory-eve', // Factory variant, no dedicated example
+    'tanstack-start-lovable', // platform variant, no dedicated example
+    'services', // project-level preset, no dedicated framework example
+  ];
+
+  it('marks Services as stable', () => {
+    const services = frameworkList.find(f => f.slug === 'services');
+
+    expect(services).toBeDefined();
+    expect(services?.experimental).toBeUndefined();
+  });
+
   it('ensure there is an example for every framework', async () => {
     const root = join(__dirname, '..', '..', '..');
     const getExample = (name: string) => join(root, 'examples', name);
 
     const result = frameworkList
+      .filter(f => !f.experimental) // Skip experimental frameworks
+      .filter(f => !f.runtimeFramework) // Skip runtime frameworks (e.g. Python, Go)
       .map(f => f.slug)
       .filter(isString)
+      .filter(slug => !skipExamples.includes(slug))
       .filter(f => existsSync(getExample(f)) === false);
 
     expect(result).toEqual([]);
   });
 
   it('ensure schema', async () => {
-    const ajv = new Ajv();
+    const ajv = getValidator();
+
     const result = ajv.validate(Schema, frameworkList);
 
     if (ajv.errors) {
@@ -179,14 +282,48 @@ describe('frameworks', () => {
     expect(result).toBe(true);
   });
 
-  it('ensure logo', async () => {
-    const missing = frameworkList
+  it('ensure logo starts with url prefix', async () => {
+    const invalid = frameworkList
       .map(f => f.logo)
-      .filter(url => {
-        const prefix =
-          'https://raw.githubusercontent.com/vercel/vercel/main/packages/frameworks/logos/';
-        const name = url.replace(prefix, '');
-        return existsSync(join(__dirname, '..', 'logos', name)) === false;
+      .filter(logo => {
+        return logo && !logo.startsWith(logoPrefix);
+      });
+
+    expect(invalid).toEqual([]);
+  });
+
+  it('ensure darkModeLogo starts with url prefix', async () => {
+    const invalid = frameworkList
+      .map(f => f.darkModeLogo)
+      .filter(darkModeLogo => {
+        return darkModeLogo && !darkModeLogo.startsWith(logoPrefix);
+      });
+
+    expect(invalid).toEqual([]);
+  });
+
+  it('ensure platform logo starts with url prefix', async () => {
+    const invalid = frameworkList
+      .map(f => (f as { platform?: { logo: string } }).platform?.logo)
+      .filter(logo => {
+        return logo && !logo.startsWith(logoPrefix);
+      });
+
+    expect(invalid).toEqual([]);
+  });
+
+  it('ensure logo file exists in ./packages/frameworks/logos/', async () => {
+    const missing = frameworkList
+      .flatMap(f => [
+        f.logo,
+        f.darkModeLogo,
+        (f as { platform?: { logo: string } }).platform?.logo,
+      ])
+      .filter(isString)
+      .filter(logo => {
+        const filename = logo.slice(logoPrefix.length);
+        const filepath = join(__dirname, '..', 'logos', filename);
+        return existsSync(filepath) === false;
       });
 
     expect(missing).toEqual([]);
@@ -218,14 +355,25 @@ describe('frameworks', () => {
       frameworkList
         .filter(f => typeof f.demo === 'string')
         .map(async f => {
-          const url = new URL(f.demo!);
-          const deployment = await getDeployment(url.hostname);
           assert.equal(
-            deployment.public,
+            await isDemoPublic(f.demo!),
             true,
-            `Demo URL ${f.demo} is not "public"`
+            `Demo URL ${f.demo} is not "public". Disable "build logs and source protection" in project settings.`
           );
         })
     );
   });
 });
+
+function getValidator() {
+  const ajv = new Ajv();
+
+  ajv.addKeyword('isFunction', {
+    compile: shouldMatch => data => {
+      const matches = typeof data === 'function';
+      return (shouldMatch && matches) || (!shouldMatch && !matches);
+    },
+  });
+
+  return ajv;
+}

@@ -1,0 +1,246 @@
+# @vercel/oidc
+
+## 3.3.5
+
+### Patch Changes
+
+- @vercel/oidc@3.8.5
+
+## 3.3.4
+
+### Patch Changes
+
+- Updated dependencies [2da7809]
+  - @vercel/oidc@3.8.4
+
+## 3.3.3
+
+### Patch Changes
+
+- @vercel/oidc@3.8.3
+
+## 3.3.2
+
+### Patch Changes
+
+- 6d7fbfa: Bump all workspace packages to trigger a full publish from vercel-internal.
+- Updated dependencies [6d7fbfa]
+  - @vercel/oidc@3.8.2
+
+## 3.3.1
+
+### Patch Changes
+
+- @vercel/oidc@3.8.1
+
+## 3.3.0
+
+### Minor Changes
+
+- d29a8f9: Cache exchanged OIDC tokens in memory, keyed by a hash of the source token, audience, and jti, so repeated exchanges reuse the result instead of calling the token-exchange endpoint every time. Cached tokens are evicted when the API-provided expiry passes, and the cache is bounded with least-recently-used eviction to avoid unbounded growth. Add a `skipCache` option (surfaced as `skipTokenCache` on `awsCredentialsProvider`) to bypass the cache. `jti` and the cache-skip flags are now only accepted alongside an `audience`, since they only take effect during a token exchange.
+
+### Patch Changes
+
+- Updated dependencies [d29a8f9]
+  - @vercel/oidc@3.8.0
+
+## 3.2.1
+
+### Patch Changes
+
+- Updated dependencies [fb93ff6]
+  - @vercel/oidc@3.7.1
+
+## 3.2.0
+
+### Minor Changes
+
+- 415fde0: Add optional `audience` and `jti` parameters to exchange Vercel OIDC tokens for use with AWS STS and other providers.
+
+### Patch Changes
+
+- Updated dependencies [415fde0]
+  - @vercel/oidc@3.7.0
+
+## 3.1.5
+
+### Patch Changes
+
+- @vercel/oidc@3.6.2
+
+## 3.1.4
+
+### Patch Changes
+
+- Updated dependencies [01cf6c2]
+  - @vercel/oidc@3.6.1
+
+## 3.1.3
+
+### Patch Changes
+
+- Updated dependencies [fddeb55]
+  - @vercel/oidc@3.6.0
+
+## 3.1.2
+
+### Patch Changes
+
+- Updated dependencies [5a700dc]
+  - @vercel/oidc@3.5.0
+
+## 3.1.1
+
+### Patch Changes
+
+- ae20217: Upgrade to TypeScript 5.9
+- Updated dependencies [ae20217]
+  - @vercel/oidc@3.4.1
+
+## 3.1.0
+
+### Minor Changes
+
+- c56f851: Upgrade to TypeScript 5.9
+
+### Patch Changes
+
+- Updated dependencies [c56f851]
+  - @vercel/oidc@3.4.0
+
+## 3.0.10
+
+### Patch Changes
+
+- Updated dependencies [bf07448]
+  - @vercel/oidc@3.3.1
+
+## 3.0.9
+
+### Patch Changes
+
+- 56c9f89: add missing prettier dev dependency
+- Updated dependencies [24686d0]
+- Updated dependencies [56c9f89]
+  - @vercel/oidc@3.3.0
+
+## 3.0.8
+
+### Patch Changes
+
+- Pin `typedoc-plugin-markdown` to `3.15.2` and `typedoc-plugin-mdn-links` to `3.0.3` to match the version used by `@vercel/edge`. The previous `4.1.2` version requires `typedoc@0.26.x` as a peer dependency but was paired with `typedoc@0.24.6`, which caused CI failures whenever pnpm hoisted the 4.x plugin (the plugin calls `app.internationalization.addTranslations`, which does not exist in typedoc 0.24). The choice of which plugin version got hoisted was non-deterministic, which is why the failure appeared as flaky `Build @vercel/<pkg>` steps in CI. ([#16072](https://github.com/vercel/vercel/pull/16072))
+
+- Updated dependencies [[`2aa78415831fe89d1b21dd89704706bd1ad5e78d`](https://github.com/vercel/vercel/commit/2aa78415831fe89d1b21dd89704706bd1ad5e78d)]:
+  - @vercel/oidc@3.2.1
+
+## 3.0.7
+
+### Patch Changes
+
+- Updated dependencies [[`3760ea1e97fdc45dae36c64138023e1b1a075467`](https://github.com/vercel/vercel/commit/3760ea1e97fdc45dae36c64138023e1b1a075467)]:
+  - @vercel/oidc@3.2.0
+
+## 3.0.6
+
+### Patch Changes
+
+- Updated dependencies [[`abdec3599b6897da76b90f2348a33e3c6c188353`](https://github.com/vercel/vercel/commit/abdec3599b6897da76b90f2348a33e3c6c188353), [`b9eae1d7c9f618355c6179eb58afb3c54318a046`](https://github.com/vercel/vercel/commit/b9eae1d7c9f618355c6179eb58afb3c54318a046)]:
+  - @vercel/oidc@3.1.0
+
+## 3.0.5
+
+### Patch Changes
+
+- Updated dependencies [[`77f5410794f22afb5fe3e4c204555f238c2850b3`](https://github.com/vercel/vercel/commit/77f5410794f22afb5fe3e4c204555f238c2850b3)]:
+  - @vercel/oidc@3.0.5
+
+## 3.0.4
+
+### Patch Changes
+
+- Updated dependencies [[`4221033be06182c11c9fe153a58810a2a393c3ce`](https://github.com/vercel/vercel/commit/4221033be06182c11c9fe153a58810a2a393c3ce)]:
+  - @vercel/oidc@3.0.4
+
+## 3.0.3
+
+### Patch Changes
+
+- Updated dependencies [[`bcf9c18da437d9566eeff1fdaedb11abb00c080c`](https://github.com/vercel/vercel/commit/bcf9c18da437d9566eeff1fdaedb11abb00c080c)]:
+  - @vercel/oidc@3.0.3
+
+## 3.0.2
+
+### Patch Changes
+
+- Updated dependencies [[`29c2da6ff0118254bf9f6a5aa436cf95267d2d0a`](https://github.com/vercel/vercel/commit/29c2da6ff0118254bf9f6a5aa436cf95267d2d0a)]:
+  - @vercel/oidc@3.0.2
+
+## 3.0.1
+
+### Patch Changes
+
+- Updated dependencies [[`da6ca6d80915221b7f60cd711e4fada41a828e4c`](https://github.com/vercel/vercel/commit/da6ca6d80915221b7f60cd711e4fada41a828e4c), [`da6ca6d80915221b7f60cd711e4fada41a828e4c`](https://github.com/vercel/vercel/commit/da6ca6d80915221b7f60cd711e4fada41a828e4c), [`da6ca6d80915221b7f60cd711e4fada41a828e4c`](https://github.com/vercel/vercel/commit/da6ca6d80915221b7f60cd711e4fada41a828e4c)]:
+  - @vercel/oidc@3.0.1
+
+## 3.0.0
+
+### Major Changes
+
+- Drop Node.js 18, bump minimum to Node.js 20 ([#13856](https://github.com/vercel/vercel/pull/13856))
+
+### Patch Changes
+
+- Updated dependencies [[`d1ca3ed3ac1b9830403dc9dc3520e963ef8bec8e`](https://github.com/vercel/vercel/commit/d1ca3ed3ac1b9830403dc9dc3520e963ef8bec8e)]:
+  - @vercel/oidc@3.0.0
+
+## 2.0.2
+
+### Patch Changes
+
+- Updated dependencies [[`821e4b8e8eded000b3d4e864594730e8741ef522`](https://github.com/vercel/vercel/commit/821e4b8e8eded000b3d4e864594730e8741ef522)]:
+  - @vercel/oidc@2.0.2
+
+## 2.0.1
+
+### Patch Changes
+
+- Fix package versions for oidc-aws-credentials-provider, vercel/functions, and publish the next version of vercel/oidc ([#13765](https://github.com/vercel/vercel/pull/13765))
+
+- Updated dependencies [[`2f5244647dc7d2c81bb688035952d4d45b6d707e`](https://github.com/vercel/vercel/commit/2f5244647dc7d2c81bb688035952d4d45b6d707e)]:
+  - @vercel/oidc@2.0.1
+
+## 2.0.3
+
+### Patch Changes
+
+- Fix dependency ([#13726](https://github.com/vercel/vercel/pull/13726))
+
+## 2.0.2
+
+### Patch Changes
+
+- Update dependency ([#13722](https://github.com/vercel/vercel/pull/13722))
+
+## 2.0.1
+
+### Patch Changes
+
+- Updated dependencies [[`a133e534e7dfd785beeeb0dcafed8d2c991e9f11`](https://github.com/vercel/vercel/commit/a133e534e7dfd785beeeb0dcafed8d2c991e9f11)]:
+  - @vercel/oidc@2.1.0
+
+## 2.0.0
+
+### Major Changes
+
+- extract oidc and aws oidc credential helpers from @vercel/functions into @vercel/oidc and @vercel/oidc-aws-credentials-provider. @vercel/functions re-exports the new functions as deprecated to maintain backwards compatibility. ([#13548](https://github.com/vercel/vercel/pull/13548))
+
+### Patch Changes
+
+- Updated dependencies [[`fa8d4c76ea50c4844031f56209b21845818212fc`](https://github.com/vercel/vercel/commit/fa8d4c76ea50c4844031f56209b21845818212fc)]:
+  - @vercel/oidc@2.0.0
+
+## 1.0.0
+
+### Major Changes
+
+- Initial release ([#13548](https://github.com/vercel/vercel/pull/13548))

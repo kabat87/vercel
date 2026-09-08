@@ -1,23 +1,31 @@
 import fs from 'fs';
-import os from 'os';
 import AJV from 'ajv';
-import chalk from 'chalk';
-import { join } from 'path';
+import { join, relative } from 'path';
 import { ensureDir } from 'fs-extra';
 import { promisify } from 'util';
 
 import getProjectByIdOrName from '../projects/get-project-by-id-or-name';
-import Client from '../client';
-import { ProjectNotFound } from '../errors-ts';
-import getUser from '../get-user';
-import getTeamById from '../teams/get-team-by-id';
-import { Output } from '../output';
-import { Project, ProjectLinkResult } from '../../types';
-import { Org, ProjectLink } from '../../types';
-import { prependEmoji, emoji, EmojiLabel } from '../emoji';
-import { isDirectory } from '../config/global-path';
+import getOrgById from './get-org-by-id';
+import type Client from '../client';
+import { InvalidToken, isAPIError, ProjectNotFound } from '../errors-ts';
+import type {
+  Project,
+  ProjectLinked,
+  ProjectLinkResult,
+  Org,
+  ProjectLink,
+} from '@vercel-internals/types';
+import { prependEmoji, emoji, type EmojiLabel } from '../emoji';
+import { isDirectory } from '../fs';
 import { NowBuildError, getPlatformEnv } from '@vercel/build-utils';
 import outputCode from '../output/code';
+import { isErrnoException, isError } from '@vercel/error-utils';
+import { findProjectsFromPath, getRepoLink } from '../link/repo';
+import { addToGitIgnore } from '../link/add-to-gitignore';
+import type { RepoProjectConfig } from '../link/repo';
+import output from '../../output-manager';
+import { printAlignedLabel } from '../output/print-aligned-label';
+import { resolveProjectCwd } from './find-project-root';
 
 const readFile = promisify(fs.readFile);
 const writeFile = promisify(fs.writeFile);
@@ -26,6 +34,40 @@ export const VERCEL_DIR = '.vercel';
 export const VERCEL_DIR_FALLBACK = '.now';
 export const VERCEL_DIR_README = 'README.txt';
 export const VERCEL_DIR_PROJECT = 'project.json';
+export const VERCEL_DIR_REPO = 'repo.json';
+
+export interface OwnerLookupUnavailableProjectLinked extends ProjectLinked {
+  orgId?: string;
+  ownerLookupUnavailable: true;
+  projectRootDirectory?: string;
+}
+
+export function isOwnerLookupUnavailableLink(
+  link: ProjectLinked
+): link is OwnerLookupUnavailableProjectLinked {
+  return (
+    'ownerLookupUnavailable' in link && link.ownerLookupUnavailable === true
+  );
+}
+
+export interface RemoteLookupSkippedProjectLinked extends ProjectLinked {
+  org: Org & { slug: '' };
+  remoteLookupSkipped: true;
+}
+
+export function isRemoteLookupSkippedLink(
+  link: ProjectLinked
+): link is RemoteLookupSkippedProjectLinked {
+  return 'remoteLookupSkipped' in link && link.remoteLookupSkipped === true;
+}
+
+function isOwnerLookupUnavailableError(error: unknown): boolean {
+  return (
+    isAPIError(error) &&
+    error.status === 403 &&
+    error.code === 'team_unauthorized'
+  );
+}
 
 const linkSchema = {
   type: 'object',
@@ -39,6 +81,10 @@ const linkSchema = {
       type: 'string',
       minLength: 1,
     },
+    projectName: {
+      type: 'string',
+      minLength: 1,
+    },
   },
 };
 
@@ -48,7 +94,7 @@ const linkSchema = {
  *
  * Throws an error if *both* `.vercel` and `.now` directories exist.
  */
-export function getVercelDirectory(cwd: string = process.cwd()): string {
+export function getVercelDirectory(cwd: string): string {
   const possibleDirs = [join(cwd, VERCEL_DIR), join(cwd, VERCEL_DIR_FALLBACK)];
   const existingDirs = possibleDirs.filter(d => isDirectory(d));
   if (existingDirs.length > 1) {
@@ -62,64 +108,290 @@ export function getVercelDirectory(cwd: string = process.cwd()): string {
   return existingDirs[0] || possibleDirs[0];
 }
 
-async function getLink(path?: string): Promise<ProjectLink | null> {
-  const dir = getVercelDirectory(path);
-  return getLinkFromDir(dir);
+export async function getProjectLink(
+  client: Client,
+  path: string,
+  projectName?: string,
+  projectNameIsExplicit?: boolean
+): Promise<ProjectLink | null> {
+  // Prefer an explicit per-directory link (`.vercel/project.json`) over a
+  // repository-level link (`.vercel/repo.json`). This prevents scenarios where
+  // a freshly-created local link (e.g. after `vc link`) is ignored and the
+  // user is re-prompted to select a repo-linked project again.
+  // When `projectNameIsExplicit` is true, the caller is resolving a user-
+  // supplied `--project` value, so mismatched local links must not win.
+  const dirLink = await getLinkFromDir(getVercelDirectory(path));
+  if (dirLink) {
+    if (!projectNameIsExplicit || !projectName) {
+      return dirLink;
+    }
+
+    if (
+      dirLink.projectId === projectName ||
+      dirLink.projectName === projectName
+    ) {
+      return dirLink;
+    }
+  }
+  return await getProjectLinkFromRepoLink(
+    client,
+    path,
+    projectName,
+    projectNameIsExplicit
+  );
 }
 
-async function getLinkFromDir(dir: string): Promise<ProjectLink | null> {
+async function getProjectLinkFromRepoLink(
+  client: Client,
+  path: string,
+  projectName?: string,
+  projectNameIsExplicit?: boolean
+): Promise<ProjectLink | null> {
+  const repoLink = await getRepoLink(client, path);
+  if (!repoLink?.repoConfig) {
+    return null;
+  }
+  const projects = findProjectsFromPath(
+    repoLink.repoConfig.projects,
+    relative(repoLink.rootPath, path)
+  );
+  let project: RepoProjectConfig | undefined;
+
+  if (projectName && projectNameIsExplicit) {
+    project = repoLink.repoConfig.projects.find(
+      p => p.id === projectName || p.name === projectName
+    );
+  } else if (projects.length === 1) {
+    project = projects[0];
+  } else {
+    const selectableProjects =
+      projects.length > 0 ? projects : repoLink.repoConfig.projects;
+
+    // If --project flag was provided, match by ID or name
+    if (projectName) {
+      project = selectableProjects.find(
+        p => p.id === projectName || p.name === projectName
+      );
+    }
+
+    // Fall back to interactive selection if no project was found
+    if (!project) {
+      if (client.nonInteractive) {
+        if (selectableProjects.length === 1) {
+          project = selectableProjects[0];
+        } else {
+          return null;
+        }
+      } else {
+        project = await client.input.select({
+          message: `Please select a Project:`,
+          choices: selectableProjects.map(p => ({
+            value: p,
+            name: p.name,
+          })),
+        });
+      }
+    }
+  }
+  if (project) {
+    // Prefer project-level orgId, fall back to top-level for backwards compat
+    const orgId = project.orgId ?? repoLink.repoConfig.orgId;
+    if (!orgId) {
+      const projectInfo = [
+        project.name ? `name: "${project.name}"` : '',
+        project.directory ? `directory: "${project.directory}"` : '',
+      ]
+        .filter(Boolean)
+        .join(', ');
+      const details = projectInfo ? ` Project: { ${projectInfo} }.` : '';
+      throw new Error(
+        `Could not determine org ID from repo.json config at "${repoLink.repoConfigPath}".${details} Please re-link the repository.`
+      );
+    }
+    return {
+      repoRoot: repoLink.rootPath,
+      orgId,
+      projectId: project.id,
+      projectName: project.name,
+      projectRootDirectory: project.directory,
+    };
+  }
+  return null;
+}
+
+export async function getLinkFromDir<T = ProjectLink>(
+  dir: string
+): Promise<T | null> {
   try {
     const json = await readFile(join(dir, VERCEL_DIR_PROJECT), 'utf8');
 
     const ajv = new AJV();
-    const link: ProjectLink = JSON.parse(json);
+    const link: T = JSON.parse(json);
 
     if (!ajv.validate(linkSchema, link)) {
+      const raw = link as Record<string, unknown>;
+      const projectId = raw.projectId;
+      const orgId = raw.orgId;
+      const hasPlainLinkIds =
+        typeof projectId === 'string' &&
+        projectId.length > 0 &&
+        typeof orgId === 'string' &&
+        orgId.length > 0;
+      if (!hasPlainLinkIds) {
+        // `vercel pull` with a repo-level link writes settings-only `project.json`
+        // (see writeProjectSettings). Treat as no per-directory link and fall
+        // back to `.vercel/repo.json` resolution.
+        return null;
+      }
       throw new Error(
         `Project Settings are invalid. To link your project again, remove the ${dir} directory.`
       );
     }
 
     return link;
-  } catch (error) {
+  } catch (err: unknown) {
     // link file does not exists, project is not linked
-    if (['ENOENT', 'ENOTDIR'].includes(error.code)) {
+    if (
+      isErrnoException(err) &&
+      err.code &&
+      ['ENOENT', 'ENOTDIR'].includes(err.code)
+    ) {
       return null;
     }
 
     // link file can't be read
-    if (error.name === 'SyntaxError') {
+    if (isError(err) && err.name === 'SyntaxError') {
       throw new Error(
         `Project Settings could not be retrieved. To link your project again, remove the ${dir} directory.`
       );
     }
 
-    throw error;
+    throw err;
   }
 }
 
-async function getOrgById(client: Client, orgId: string): Promise<Org | null> {
-  if (orgId.startsWith('team_')) {
-    const team = await getTeamById(client, orgId);
-    if (!team) return null;
-    return { type: 'team', id: team.id, slug: team.slug };
+/**
+ * True when `cwd` is already linked locally: a `.vercel/project.json` in this
+ * directory, or a repo.json project whose root directory contains `cwd`.
+ * Invalid link files are treated as not linked.
+ *
+ * Unlike `getProjectLink`, this never prompts to disambiguate repo projects.
+ */
+export async function hasLocalProjectLink(
+  client: Client,
+  cwd: string
+): Promise<boolean> {
+  try {
+    if (await getLinkFromDir(getVercelDirectory(cwd))) {
+      return true;
+    }
+  } catch {
+    // Invalid or conflicting project.json — still check repo.json.
   }
 
-  const user = await getUser(client);
-  if (user.uid !== orgId) return null;
-  return { type: 'user', id: orgId, slug: user.username };
+  try {
+    const repoLink = await getRepoLink(client, cwd);
+    if (!repoLink?.repoConfig) {
+      return false;
+    }
+    const projects = findProjectsFromPath(
+      repoLink.repoConfig.projects,
+      relative(repoLink.rootPath, cwd)
+    );
+    return projects.length > 0;
+  } catch {
+    return false;
+  }
 }
+
+async function hasProjectLink(
+  client: Client,
+  projectLink: ProjectLink,
+  path: string
+): Promise<boolean> {
+  // "linked" via env vars?
+  const VERCEL_ORG_ID = getPlatformEnv('ORG_ID');
+  const VERCEL_PROJECT_ID = getPlatformEnv('PROJECT_ID');
+  if (
+    VERCEL_ORG_ID === projectLink.orgId &&
+    VERCEL_PROJECT_ID === projectLink.projectId
+  ) {
+    return true;
+  }
+
+  // linked via `repo.json`?
+  const repoLink = await getRepoLink(client, path);
+  if (repoLink?.repoConfig) {
+    const matchingProject = repoLink.repoConfig.projects.find(
+      p => p.id === projectLink.projectId
+    );
+    if (matchingProject) {
+      // Prefer project-level orgId, fall back to top-level for backwards compat
+      const orgId = matchingProject.orgId ?? repoLink.repoConfig.orgId;
+      if (!orgId) {
+        throw new Error(
+          `Invalid "repo.json": missing "orgId" for project "${matchingProject.id}" and no top-level "orgId" is defined.`
+        );
+      }
+      if (orgId === projectLink.orgId) {
+        return true;
+      }
+    }
+  }
+
+  // if the project is already linked, we skip linking
+  const link = await getLinkFromDir(getVercelDirectory(path));
+  if (
+    link &&
+    link.orgId === projectLink.orgId &&
+    link.projectId === projectLink.projectId
+  ) {
+    return true;
+  }
+
+  return false;
+}
+
+export interface GetLinkedProjectOptions {
+  cwd?: string;
+  projectName?: string;
+  projectNameIsExplicit?: boolean;
+  scopeIsExplicit?: boolean;
+  /**
+   * Allows deploying with a project-scoped token, which can fetch the
+   * linked project, but cannot fetch the owning user/team.
+   */
+  allowOwnerLookupFallback?: boolean;
+  /** Uses local link metadata without fetching the owner or project. */
+  skipRemoteLookup?: boolean;
+}
+
+export type ProjectLinkResultWithOrgId = ProjectLinkResult & {
+  orgId?: string;
+  projectRootDirectory?: string;
+};
 
 export async function getLinkedProject(
   client: Client,
-  path?: string
-): Promise<ProjectLinkResult> {
-  const { output } = client;
+  options: GetLinkedProjectOptions = {}
+): Promise<ProjectLinkResultWithOrgId> {
+  let path = options.cwd ?? client.cwd;
+  path = await resolveProjectCwd(path);
+
   const VERCEL_ORG_ID = getPlatformEnv('ORG_ID');
   const VERCEL_PROJECT_ID = getPlatformEnv('PROJECT_ID');
   const shouldUseEnv = Boolean(VERCEL_ORG_ID && VERCEL_PROJECT_ID);
+  const projectName = options.projectName;
+  const projectNameIsExplicit = options.projectNameIsExplicit === true;
+  const explicitProjectName = projectNameIsExplicit ? projectName : undefined;
+  const hasExplicitProject = Boolean(explicitProjectName);
+  const shouldUseEnvContext = shouldUseEnv && !hasExplicitProject;
 
-  if ((VERCEL_ORG_ID || VERCEL_PROJECT_ID) && !shouldUseEnv) {
+  if (
+    !hasExplicitProject &&
+    (VERCEL_ORG_ID || VERCEL_PROJECT_ID) &&
+    !shouldUseEnv
+  ) {
     output.error(
       `You specified ${
         VERCEL_ORG_ID ? '`VERCEL_ORG_ID`' : '`VERCEL_PROJECT_ID`'
@@ -130,33 +402,173 @@ export async function getLinkedProject(
     return { status: 'error', exitCode: 1 };
   }
 
-  const link =
-    VERCEL_ORG_ID && VERCEL_PROJECT_ID
-      ? { orgId: VERCEL_ORG_ID, projectId: VERCEL_PROJECT_ID }
-      : await getLink(path);
+  let link: ProjectLink | null;
+  let explicitlyResolvedProject: Project | null = null;
+  let orgId: string | undefined;
+  if (explicitProjectName) {
+    const hasExplicitScope = options.scopeIsExplicit === true;
+    const matchingLocalLink =
+      hasExplicitScope || shouldUseEnv
+        ? null
+        : await getProjectLink(client, path, explicitProjectName, true);
+    const fallbackOrgId = shouldUseEnv
+      ? VERCEL_ORG_ID
+      : (matchingLocalLink?.orgId ?? client.config.currentTeam);
+    const lookupOrgId = hasExplicitScope
+      ? client.config.currentTeam
+      : fallbackOrgId;
+    orgId = lookupOrgId;
+    const apiProject = await getProjectByIdOrName(
+      client,
+      explicitProjectName,
+      lookupOrgId
+    );
+    explicitlyResolvedProject =
+      apiProject instanceof ProjectNotFound ? null : apiProject;
+    if (explicitlyResolvedProject === null) {
+      link = null;
+    } else {
+      const resolvedOrgId =
+        explicitlyResolvedProject.accountId ??
+        lookupOrgId ??
+        matchingLocalLink?.orgId;
+      let localLink =
+        matchingLocalLink?.projectId === explicitlyResolvedProject.id
+          ? matchingLocalLink
+          : null;
+      if (!localLink) {
+        try {
+          localLink = await getProjectLink(
+            client,
+            path,
+            explicitlyResolvedProject.id,
+            true
+          );
+        } catch (err) {
+          output.debug(
+            `Ignoring local project metadata after explicit project resolution: ${err}`
+          );
+        }
+      }
+      link = resolvedOrgId
+        ? {
+            ...(localLink?.projectId === explicitlyResolvedProject.id &&
+            localLink.orgId === resolvedOrgId
+              ? localLink
+              : {}),
+            projectId: explicitlyResolvedProject.id,
+            orgId: resolvedOrgId,
+          }
+        : null;
+    }
+  } else {
+    link = shouldUseEnvContext
+      ? { orgId: VERCEL_ORG_ID!, projectId: VERCEL_PROJECT_ID! }
+      : await getProjectLink(client, path, projectName, projectNameIsExplicit);
+    if (link) {
+      orgId = link.orgId;
+    }
+  }
 
   if (!link) {
-    return { status: 'not_linked', org: null, project: null };
+    return { status: 'not_linked', org: null, project: null, orgId };
+  }
+
+  if (options.skipRemoteLookup && link.projectName) {
+    const settings = (link as ProjectLink & { settings?: Partial<Project> })
+      .settings;
+    // Repository links use "." to mean the repository root. The Project API
+    // represents that same setting as null, so never forward the local marker.
+    const localRootDirectory =
+      link.projectRootDirectory ?? settings?.rootDirectory ?? null;
+    const rootDirectory =
+      localRootDirectory === '.' ? null : localRootDirectory;
+    const project: Project = {
+      ...settings,
+      id: link.projectId,
+      accountId: link.orgId,
+      name: link.projectName,
+      createdAt: settings?.createdAt ?? 0,
+      updatedAt: settings?.updatedAt ?? settings?.createdAt ?? 0,
+      rootDirectory,
+    };
+
+    const localProjectLink: RemoteLookupSkippedProjectLinked = {
+      status: 'linked',
+      org: {
+        type: link.orgId.startsWith('team_') ? 'team' : 'user',
+        id: link.orgId,
+        slug: '',
+      },
+      project,
+      repoRoot: link.repoRoot,
+      remoteLookupSkipped: true,
+    };
+
+    return {
+      ...localProjectLink,
+      projectRootDirectory: link.projectRootDirectory,
+      orgId: link.orgId,
+    };
   }
 
   output.spinner('Retrieving project…', 1000);
   let org: Org | null = null;
   let project: Project | ProjectNotFound | null = null;
+  let ownerLookupUnavailable = false;
   try {
-    [org, project] = await Promise.all([
+    const [orgResult, projectResult] = await Promise.allSettled([
       getOrgById(client, link.orgId),
-      getProjectByIdOrName(client, link.projectId, link.orgId),
+      explicitlyResolvedProject
+        ? Promise.resolve(explicitlyResolvedProject)
+        : getProjectByIdOrName(client, link.projectId, link.orgId),
     ]);
-  } catch (err) {
-    if (err?.status === 403) {
+
+    if (orgResult.status === 'fulfilled') {
+      org = orgResult.value;
+    } else if (
+      isAPIError(orgResult.reason) &&
+      (orgResult.reason.status === 404 ||
+        orgResult.reason.code === 'not_found' ||
+        orgResult.reason.code === 'mock_unimplemented')
+    ) {
+      org = null;
+    } else if (
+      options.allowOwnerLookupFallback &&
+      isOwnerLookupUnavailableError(orgResult.reason)
+    ) {
+      ownerLookupUnavailable = true;
+    } else {
+      throw orgResult.reason;
+    }
+
+    if (projectResult.status === 'fulfilled') {
+      project = projectResult.value;
+    } else if (
+      isAPIError(projectResult.reason) &&
+      (projectResult.reason.status === 404 ||
+        projectResult.reason.code === 'not_found' ||
+        projectResult.reason.code === 'mock_unimplemented')
+    ) {
+      project = new ProjectNotFound(link.projectId);
+    } else {
+      throw projectResult.reason;
+    }
+  } catch (err: unknown) {
+    if (isAPIError(err) && err.status === 403) {
       output.stopSpinner();
-      throw new NowBuildError({
-        message: `Could not retrieve Project Settings. To link your Project, remove the ${outputCode(
-          VERCEL_DIR
-        )} directory and deploy again.`,
-        code: 'PROJECT_UNAUTHORIZED',
-        link: 'https://vercel.link/cannot-load-project-settings',
-      });
+
+      if (err.missingToken || err.invalidToken) {
+        throw new InvalidToken(client.authConfig.tokenSource);
+      } else if (err.code === 'forbidden' || err.code === 'team_unauthorized') {
+        throw new NowBuildError({
+          message: `Could not retrieve Project Settings. To link your Project, remove the ${outputCode(
+            VERCEL_DIR
+          )} directory and deploy again.`,
+          code: 'PROJECT_UNAUTHORIZED',
+          link: 'https://vercel.link/cannot-load-project-settings',
+        });
+      }
     }
 
     // Not a special case 403, we should still throw it
@@ -165,106 +577,162 @@ export async function getLinkedProject(
     output.stopSpinner();
   }
 
+  if (ownerLookupUnavailable) {
+    if (project && !(project instanceof ProjectNotFound)) {
+      const ownerId = project.accountId || link.orgId;
+      const ownerLookupUnavailableLink: OwnerLookupUnavailableProjectLinked = {
+        status: 'linked',
+        org: {
+          type: ownerId.startsWith('team_') ? 'team' : 'user',
+          id: ownerId,
+          slug: ownerId,
+        },
+        project,
+        repoRoot: link.repoRoot,
+        projectRootDirectory: link.projectRootDirectory,
+        orgId: link.orgId,
+        ownerLookupUnavailable: true,
+      };
+      return ownerLookupUnavailableLink;
+    }
+  }
+
   if (!org || !project || project instanceof ProjectNotFound) {
-    if (shouldUseEnv) {
+    if (shouldUseEnvContext) {
       output.error(
         `Project not found (${JSON.stringify({
           VERCEL_PROJECT_ID,
           VERCEL_ORG_ID,
         })})\n`
       );
-      return { status: 'error', exitCode: 1 };
-    } else {
-      output.print(
-        prependEmoji(
-          'Your Project was either deleted, transferred to a new Team, or you don’t have access to it anymore.\n',
-          emoji('warning')
-        )
-      );
+      return { status: 'error', exitCode: 1, orgId };
     }
 
-    return { status: 'not_linked', org: null, project: null };
+    output.print(
+      prependEmoji(
+        'Your Project was either deleted, transferred to a new Team, or you don’t have access to it anymore.\n',
+        emoji('warning')
+      )
+    );
+    return {
+      status: 'not_linked',
+      org: null,
+      project: null,
+      orgId: link.orgId,
+    };
   }
 
-  return { status: 'linked', org, project };
+  return {
+    status: 'linked',
+    org,
+    project,
+    repoRoot: link.repoRoot,
+    projectRootDirectory: link.projectRootDirectory,
+    orgId: link.orgId,
+  };
+}
+
+const VERCEL_DIR_README_CONTENT = `> Why do I have a folder named ".vercel" in my project?
+The ".vercel" folder is created when you link a directory to a Vercel project.
+
+> What does the "project.json" file contain?
+The "project.json" file contains:
+- The ID of the Vercel project that you linked ("projectId")
+- The ID of the user or team your Vercel project is owned by ("orgId")
+
+> Should I commit the ".vercel" folder?
+No, you should not share the ".vercel" folder with anyone.
+Upon creation, it will be automatically added to your ".gitignore" file.
+`;
+
+export async function writeReadme(path: string) {
+  await writeFile(
+    join(path, VERCEL_DIR, VERCEL_DIR_README),
+    VERCEL_DIR_README_CONTENT
+  );
 }
 
 export async function linkFolderToProject(
-  output: Output,
+  client: Client,
   path: string,
   projectLink: ProjectLink,
   projectName: string,
   orgSlug: string,
-  successEmoji: EmojiLabel = 'link'
+  successEmoji: EmojiLabel = 'link',
+  autoConfirm: boolean = false,
+  pullEnv: boolean = true,
+  resultLabel: 'Linked' | 'Created' = 'Linked'
 ) {
-  const VERCEL_ORG_ID = getPlatformEnv('ORG_ID');
-  const VERCEL_PROJECT_ID = getPlatformEnv('PROJECT_ID');
-
-  // if defined, skip linking
-  if (VERCEL_ORG_ID || VERCEL_PROJECT_ID) {
-    return;
-  }
-
   // if the project is already linked, we skip linking
-  const link = await getLink(path);
-  if (
-    link &&
-    link.orgId === projectLink.orgId &&
-    link.projectId === projectLink.projectId
-  ) {
+  if (await hasProjectLink(client, projectLink, path)) {
     return;
   }
 
   try {
     await ensureDir(join(path, VERCEL_DIR));
-  } catch (error) {
-    if (error.code === 'ENOTDIR') {
+  } catch (err: unknown) {
+    if (isErrnoException(err) && err.code === 'ENOTDIR') {
       // folder couldn't be created because
       // we're deploying a static file
       return;
     }
-    throw error;
+    throw err;
   }
 
   await writeFile(
     join(path, VERCEL_DIR, VERCEL_DIR_PROJECT),
-    JSON.stringify(projectLink)
+    JSON.stringify({
+      ...projectLink,
+      projectName,
+    })
   );
 
-  await writeFile(
-    join(path, VERCEL_DIR, VERCEL_DIR_README),
-    await readFile(join(__dirname, 'VERCEL_DIR_README.txt'), 'utf8')
-  );
+  await writeReadme(path);
 
-  // update .gitignore
-  let isGitIgnoreUpdated = false;
-  try {
-    const gitIgnorePath = join(path, '.gitignore');
+  // update .gitignore (silent — git status surfaces the change on demand)
+  await addToGitIgnore(path);
 
-    const gitIgnore = await readFile(gitIgnorePath, 'utf8').catch(() => null);
-    const EOL = gitIgnore && gitIgnore.includes('\r\n') ? '\r\n' : os.EOL;
+  output.print('\n');
+  printAlignedLabel(resultLabel, `${orgSlug}/${projectName}`, { gutter: '✓' });
 
-    if (!gitIgnore || !gitIgnore.split(EOL).includes(VERCEL_DIR)) {
-      await writeFile(
-        gitIgnorePath,
-        gitIgnore
-          ? `${gitIgnore}${EOL}${VERCEL_DIR}${EOL}`
-          : `${VERCEL_DIR}${EOL}`
-      );
-      isGitIgnoreUpdated = true;
-    }
-  } catch (error) {
-    // ignore errors since this is non-critical
+  if (!pullEnv) {
+    return;
   }
 
-  output.print(
-    prependEmoji(
-      `Linked to ${chalk.bold(
-        `${orgSlug}/${projectName}`
-      )} (created ${VERCEL_DIR}${
-        isGitIgnoreUpdated ? ' and added it to .gitignore' : ''
-      })`,
-      emoji(successEmoji)
-    ) + '\n'
-  );
+  // Skip env pull prompt in CI/non-TTY and in `--non-interactive` (agents, scripts).
+  if (!client.stdin.isTTY || client.nonInteractive) {
+    return;
+  }
+
+  output.print('\n');
+
+  const pullEnvConfirmed =
+    autoConfirm ||
+    (await client.input.confirm(
+      'Pull development environment variables into .env.local?',
+      true
+    ));
+
+  if (pullEnvConfirmed) {
+    const originalCwd = client.cwd;
+    try {
+      client.cwd = path;
+
+      const args = autoConfirm ? ['--yes'] : [];
+      const { default: pull } = await import('../../commands/env/pull');
+      const exitCode = await pull(client, args, 'vercel-cli:link');
+
+      if (exitCode !== 0) {
+        output.error(
+          'Failed to pull environment variables. You can run `vc env pull` manually.'
+        );
+      }
+    } catch (_error) {
+      output.error(
+        'Failed to pull environment variables. You can run `vc env pull` manually.'
+      );
+    } finally {
+      client.cwd = originalCwd;
+    }
+  }
 }

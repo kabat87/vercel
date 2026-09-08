@@ -1,67 +1,99 @@
+const os = require('os');
+const path = require('path');
 const fs = require('fs-extra');
-const { glob, getWriteableDirectory } = require('@vercel/build-utils');
+const json5 = require('json5');
+const { glob } = require('@vercel/build-utils');
 
-function runAnalyze(wrapper, context) {
-  if (wrapper.analyze) {
-    return wrapper.analyze(context);
-  }
+exports.createRunBuildLambda = function (builder) {
+  // Track every workPath we create so they can be deleted once tests are
+  // done with them. Without this, each build leaks a full Next.js build
+  // (node_modules + .next output) into os.tmpdir(), which exhausts the
+  // ~14 GB free disk on GitHub-hosted runners during long e2e chunks.
+  const testScopedDirs = [];
+  const hookScopedDirs = [];
+  let insideTest = false;
 
-  return 'this-is-a-fake-analyze-result-from-default-analyze';
-}
-
-async function runBuildLambda(inputPath) {
-  const inputFiles = await glob('**', inputPath);
-  const nowJsonRef = inputFiles['vercel.json'] || inputFiles['now.json'];
-
-  if (typeof expect !== 'undefined') {
-    expect(nowJsonRef).toBeDefined();
-  }
-  const nowJson = require(nowJsonRef.fsPath);
-  const build = nowJson.builds[0];
-
-  if (typeof expect !== 'undefined') {
-    expect(build.src.includes('*')).toBeFalsy();
-  }
-  const entrypoint = build.src.replace(/^\//, ''); // strip leftmost slash
-
-  if (typeof expect !== 'undefined') {
-    expect(inputFiles[entrypoint]).toBeDefined();
-  }
-  inputFiles[entrypoint].digest =
-    'this-is-a-fake-digest-for-non-default-analyze';
-  const wrapper = require(build.use);
-
-  const analyzeResult = runAnalyze(wrapper, {
-    files: inputFiles,
-    entrypoint,
-    config: build.config,
-  });
-
-  const workPath = await fs.realpath(await getWriteableDirectory());
-  const buildResult = await wrapper.build({
-    files: inputFiles,
-    entrypoint,
-    config: build.config,
-    workPath,
-  });
-  const { output } = buildResult;
-
-  // Windows support
-  if (output) {
-    buildResult.output = Object.keys(output).reduce(
-      (result, path) => ({
-        ...result,
-        [path.replace(/\\/g, '/')]: output[path],
-      }),
-      {}
+  const remove = async dirs => {
+    await Promise.all(
+      dirs.splice(0).map(dir =>
+        fs.remove(dir).catch(() => {
+          /* best-effort cleanup */
+        })
+      )
     );
+  };
+
+  if (typeof beforeEach !== 'undefined') {
+    beforeEach(() => {
+      insideTest = true;
+    });
+  }
+  if (typeof afterEach !== 'undefined') {
+    afterEach(async () => {
+      insideTest = false;
+      await remove(testScopedDirs);
+    });
+  }
+  if (typeof afterAll !== 'undefined') {
+    afterAll(async () => {
+      await remove(hookScopedDirs);
+      await remove(testScopedDirs);
+    });
   }
 
-  return {
-    analyzeResult,
-    buildResult,
-    workPath,
-  };
-}
+  return async inputPath => {
+    const inputFiles = await glob('**', inputPath);
+    const nowJsonRef = inputFiles['vercel.json'] || inputFiles['now.json'];
 
-module.exports = runBuildLambda;
+    if (typeof expect !== 'undefined') {
+      expect(nowJsonRef).toBeDefined();
+    }
+    const nowJson = json5.parse(await fs.readFile(nowJsonRef.fsPath, 'utf8'));
+    const build = nowJson.builds[0];
+
+    if (typeof expect !== 'undefined') {
+      expect(build.src.includes('*')).toBeFalsy();
+    }
+    const entrypoint = build.src.replace(/^\//, ''); // strip leftmost slash
+
+    if (typeof expect !== 'undefined') {
+      expect(inputFiles[entrypoint]).toBeDefined();
+    }
+    let workPath = path.join(
+      os.tmpdir(),
+      `vercel-${Date.now()}-${Math.floor(Math.random() * 100)}`
+    );
+    await fs.ensureDir(workPath);
+
+    workPath = await fs.realpath(workPath);
+    (insideTest ? testScopedDirs : hookScopedDirs).push(workPath);
+    console.log('building in', workPath);
+
+    const buildResult = await builder.build({
+      files: inputFiles,
+      entrypoint,
+      config: {
+        ...build.config,
+        ...(nowJson.functions && { functions: nowJson.functions }),
+      },
+      workPath,
+    });
+    const { output } = buildResult;
+
+    // Windows support
+    if (output) {
+      buildResult.output = Object.keys(output).reduce(
+        (result, path) => ({
+          ...result,
+          [path.replace(/\\/g, '/')]: output[path],
+        }),
+        {}
+      );
+    }
+
+    return {
+      buildResult,
+      workPath,
+    };
+  };
+};

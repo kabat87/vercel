@@ -1,0 +1,786 @@
+import { isErrnoException } from '@vercel/error-utils';
+import { createRequire } from 'module';
+import { readFileSync, lstatSync, readlinkSync, statSync } from 'fs';
+import {
+  basename,
+  dirname,
+  join,
+  relative,
+  resolve,
+  sep,
+  parse as parsePath,
+  extname,
+} from 'path';
+import { Project } from 'ts-morph';
+import { nodeFileTrace } from '@vercel/nft';
+import nftResolveDependency from '@vercel/nft/out/resolve-dependency';
+import {
+  glob,
+  download,
+  FileBlob,
+  FileFsRef,
+  EdgeFunction,
+  NodejsLambda,
+  runNpmInstall,
+  runPackageJsonScript,
+  getNodeVersion,
+  debug,
+  isSymbolicLink,
+  walkParentDirs,
+  execCommand,
+  getEnvForPackageManager,
+  scanParentDirs,
+  isBunVersion,
+  getReportedServiceType,
+} from '@vercel/build-utils';
+import type {
+  File,
+  Files,
+  Meta,
+  Config,
+  BuildV3,
+  NodeVersion,
+  BuildResultV3,
+} from '@vercel/build-utils';
+import { getConfig, type BaseFunctionConfig } from '@vercel/static-config';
+
+import { Register, register } from './typescript';
+import { generateProjectManifest } from './diagnostics';
+import {
+  edgeMiddlewareDeprecationWarning,
+  entrypointToOutputPath,
+  getRegExpFromMatchers,
+  isEdgeRuntime,
+  resolveMiddlewareMatcher,
+  resolveMiddlewareRuntime,
+  validateMiddlewareRuntime,
+} from './utils';
+
+interface DownloadOptions {
+  files: Files;
+  entrypoint: string;
+  workPath: string;
+  config: Config;
+  meta: Meta;
+  considerBuildCommand: boolean;
+}
+
+const require_ = createRequire(__filename);
+
+const libPathRegEx = /^node_modules|[/\\]node_modules[/\\]/;
+
+async function downloadInstallAndBundle({
+  files,
+  entrypoint,
+  workPath,
+  config,
+  meta,
+  considerBuildCommand,
+}: DownloadOptions) {
+  const downloadedFiles = await download(files, workPath, meta);
+  const entrypointFsDirname = join(workPath, dirname(entrypoint));
+  const nodeVersion = await getNodeVersion(
+    entrypointFsDirname,
+    undefined,
+    config,
+    meta
+  );
+
+  const {
+    cliType,
+    lockfilePath,
+    lockfileVersion,
+    packageJsonPackageManager,
+    packageJsonDevEngines,
+    turboSupportsCorepackHome,
+  } = await scanParentDirs(entrypointFsDirname, true);
+
+  const spawnEnv = getEnvForPackageManager({
+    cliType,
+    lockfileVersion,
+    packageJsonPackageManager,
+    packageJsonDevEngines,
+    nodeVersion,
+    env: process.env,
+    turboSupportsCorepackHome,
+    projectCreatedAt: config.projectSettings?.createdAt,
+  });
+
+  const installCommand = config.projectSettings?.installCommand;
+  if (typeof installCommand === 'string' && considerBuildCommand) {
+    if (installCommand.trim()) {
+      console.log(`Running "install" command: \`${installCommand}\`...`);
+      await execCommand(installCommand, {
+        env: spawnEnv,
+        cwd: entrypointFsDirname,
+      });
+    } else {
+      console.log(`Skipping "install" command...`);
+    }
+  } else {
+    await runNpmInstall(
+      entrypointFsDirname,
+      [],
+      { env: spawnEnv },
+      meta,
+      config.projectSettings?.createdAt
+    );
+  }
+  const entrypointPath = downloadedFiles[entrypoint].fsPath;
+  return {
+    entrypointPath,
+    entrypointFsDirname,
+    nodeVersion,
+    spawnEnv,
+    cliType,
+    lockfilePath,
+    lockfileVersion,
+  };
+}
+
+function renameTStoJS(path: string) {
+  if (path.endsWith('.ts')) {
+    return path.slice(0, -3) + '.js';
+  }
+  if (path.endsWith('.tsx')) {
+    return path.slice(0, -4) + '.js';
+  }
+  if (path.endsWith('.mts')) {
+    return path.slice(0, -4) + '.mjs';
+  }
+  if (path.endsWith('.cts')) {
+    return path.slice(0, -4) + '.cjs';
+  }
+  return path;
+}
+
+async function compile(
+  workPath: string,
+  baseDir: string,
+  entrypointPath: string,
+  config: Config,
+  meta: Meta,
+  nodeVersion: NodeVersion,
+  isEdgeFunction: boolean
+): Promise<{
+  preparedFiles: Files;
+  shouldAddSourcemapSupport: boolean;
+}> {
+  const inputFiles = new Set<string>([entrypointPath]);
+  const preparedFiles: Files = {};
+  const sourceCache = new Map<string, string | Buffer | null>();
+  const fsCache = new Map<string, File>();
+  const tsCompiled = new Set<string>();
+  const pkgCache = new Map<string, { type?: string }>();
+
+  let shouldAddSourcemapSupport = false;
+
+  if (config.includeFiles) {
+    const includeFiles =
+      typeof config.includeFiles === 'string'
+        ? [config.includeFiles]
+        : config.includeFiles;
+
+    for (const pattern of includeFiles) {
+      const files = await glob(pattern, workPath);
+      await Promise.all(
+        Object.values(files).map(async entry => {
+          const { fsPath } = entry;
+          const relPath = relative(baseDir, fsPath);
+          fsCache.set(relPath, entry);
+          preparedFiles[relPath] = entry;
+        })
+      );
+    }
+  }
+
+  let tsCompile: Register;
+  async function compileTypeScript(
+    path: string,
+    source: string
+  ): Promise<string> {
+    const relPath = relative(baseDir, path);
+    if (!tsCompile) {
+      tsCompile = register({
+        basePath: workPath, // The base is the same as root now.json dir
+        project: path, // Resolve tsconfig.json from entrypoint dir
+        rootDir: baseDir,
+        files: true, // Include all files such as global `.d.ts`
+        nodeVersionMajor: nodeVersion.major,
+      });
+    }
+    const { code, map } = await tsCompile(source, path);
+    tsCompiled.add(relPath);
+    preparedFiles[renameTStoJS(relPath) + '.map'] = new FileBlob({
+      data: JSON.stringify(map),
+    });
+    source = code;
+    shouldAddSourcemapSupport = true;
+    return source;
+  }
+  const isBun = isBunVersion(nodeVersion);
+
+  const conditions = isEdgeFunction
+    ? ['edge-light', 'browser', 'module', 'import', 'require']
+    : isBun
+      ? ['bun']
+      : undefined;
+
+  const { fileList, esmFileList, warnings } = await nodeFileTrace(
+    [...inputFiles],
+    {
+      base: baseDir,
+      processCwd: workPath,
+      ts: true,
+      mixedModules: true,
+      moduleSyncCatchall: true,
+      conditions,
+      resolve(id, parent, job, cjsResolve) {
+        const normalizedWasmImports = id.replace(/\.wasm\?module$/i, '.wasm');
+        return nftResolveDependency(
+          normalizedWasmImports,
+          parent,
+          job,
+          cjsResolve
+        );
+      },
+      ignore: config.excludeFiles,
+      async readFile(fsPath) {
+        const relPath = relative(baseDir, fsPath);
+
+        // If this file has already been read then return from the cache
+        const cached = sourceCache.get(relPath);
+        if (typeof cached !== 'undefined') return cached;
+
+        try {
+          let entry: File | undefined;
+          let source: string | Buffer = readFileSync(fsPath);
+
+          const { mode } = lstatSync(fsPath);
+          if (isSymbolicLink(mode)) {
+            entry = new FileFsRef({ fsPath, mode });
+          }
+
+          if (isEdgeFunction && basename(fsPath) === 'package.json') {
+            // For Edge Functions, patch "main" field to prefer "browser" or "module"
+            const pkgJson = JSON.parse(source.toString());
+            for (const prop of ['browser', 'module']) {
+              const val = pkgJson[prop];
+              if (typeof val === 'string') {
+                debug(`Using "${prop}" field in ${fsPath}`);
+                pkgJson.main = val;
+
+                // Create the `entry` with the original so that the output is unmodified
+                if (!entry) {
+                  entry = new FileBlob({ data: source, mode });
+                }
+
+                // Return the modified `package.json` to nft
+                source = JSON.stringify(pkgJson);
+                break;
+              }
+            }
+          }
+
+          if (
+            (fsPath.endsWith('.ts') && !fsPath.endsWith('.d.ts')) ||
+            fsPath.endsWith('.tsx') ||
+            fsPath.endsWith('.mts') ||
+            fsPath.endsWith('.cts')
+          ) {
+            source = await compileTypeScript(fsPath, source.toString());
+          }
+
+          if (!entry) {
+            entry = new FileBlob({ data: source, mode });
+          }
+          fsCache.set(relPath, entry);
+          sourceCache.set(relPath, source);
+          return source;
+        } catch (error: unknown) {
+          if (
+            isErrnoException(error) &&
+            (error.code === 'ENOENT' || error.code === 'EISDIR')
+          ) {
+            // `null` represents a not found
+            sourceCache.set(relPath, null);
+            return null;
+          }
+          throw error;
+        }
+      },
+    }
+  );
+  for (const warning of warnings) {
+    debug(`Warning from trace: ${warning.message}`);
+  }
+  for (const path of fileList) {
+    let entry = fsCache.get(path);
+    if (!entry) {
+      const fsPath = resolve(baseDir, path);
+      const { mode } = lstatSync(fsPath);
+      if (isSymbolicLink(mode)) {
+        entry = new FileFsRef({ fsPath, mode });
+      } else {
+        const source = readFileSync(fsPath);
+        entry = new FileBlob({ data: source, mode });
+      }
+    }
+    if (isSymbolicLink(entry.mode) && entry.type === 'FileFsRef') {
+      // ensure the symlink target is added to the file list
+      const symlinkTarget = relative(
+        baseDir,
+        resolve(dirname(entry.fsPath), readlinkSync(entry.fsPath))
+      );
+      if (
+        !symlinkTarget.startsWith('..' + sep) &&
+        !fileList.has(symlinkTarget)
+      ) {
+        const stats = statSync(resolve(baseDir, symlinkTarget));
+        if (stats.isFile()) {
+          fileList.add(symlinkTarget);
+        }
+      }
+    }
+
+    if (tsCompiled.has(path)) {
+      preparedFiles[renameTStoJS(path)] = entry;
+    } else {
+      preparedFiles[path] = entry;
+    }
+  }
+
+  // Compile ES Modules into CommonJS
+  const esmPaths = [...esmFileList].filter(
+    file =>
+      !file.endsWith('.ts') &&
+      !file.endsWith('.tsx') &&
+      !file.endsWith('.mts') &&
+      !file.endsWith('.mjs') &&
+      !file.match(libPathRegEx)
+  );
+  const babelCompileEnabled =
+    !isEdgeFunction || process.env.VERCEL_EDGE_NO_BABEL !== '1';
+  if (babelCompileEnabled && esmPaths.length) {
+    const babelCompile = (await import('./babel.js')).compile;
+    for (const path of esmPaths) {
+      const pathDir = join(workPath, dirname(path));
+      if (!pkgCache.has(pathDir)) {
+        const pathToPkg = await walkParentDirs({
+          base: workPath,
+          start: pathDir,
+          filename: 'package.json',
+        });
+        const pkg = pathToPkg ? require_(pathToPkg) : {};
+        pkgCache.set(pathDir, pkg);
+      }
+      const pkg = pkgCache.get(pathDir) || {};
+      if (pkg.type === 'module' && path.endsWith('.js')) {
+        // Found parent package.json indicating this file is already ESM
+        // so we should not transpile to CJS.
+        // https://nodejs.org/api/packages.html#packages_type
+        continue;
+      }
+      const filename = basename(path);
+      const { data: source } = await FileBlob.fromStream({
+        stream: preparedFiles[path].toStream(),
+      });
+
+      if (!meta.compiledToCommonJS) {
+        meta.compiledToCommonJS = true;
+        console.warn(
+          'Warning: Node.js functions are compiled from ESM to CommonJS. If this is not intended, add "type": "module" to your package.json file.'
+        );
+      }
+      console.log(`Compiling "${filename}" from ESM to CommonJS...`);
+      const { code, map } = babelCompile(filename, String(source));
+      shouldAddSourcemapSupport = true;
+      preparedFiles[path] = new FileBlob({
+        data: `${code}\n//# sourceMappingURL=${filename}.map`,
+      });
+      delete map.sourcesContent;
+      preparedFiles[path + '.map'] = new FileBlob({
+        data: JSON.stringify(map),
+      });
+    }
+  }
+
+  return {
+    preparedFiles,
+    shouldAddSourcemapSupport,
+  };
+}
+
+function getAWSLambdaHandler(entrypoint: string, config: Config) {
+  if (config.awsLambdaHandler) {
+    return config.awsLambdaHandler as string;
+  }
+
+  if (process.env.NODEJS_AWS_HANDLER_NAME) {
+    const { dir, name } = parsePath(entrypoint);
+    return `${dir}${dir ? sep : ''}${name}.${
+      process.env.NODEJS_AWS_HANDLER_NAME
+    }`;
+  }
+
+  return '';
+}
+
+// Track whether bundling routes have already been emitted so they are only
+// included once across all bundled entrypoint builds.
+let bundlingRoutesEmitted = false;
+
+/** @internal Reset bundling routes state between test runs. */
+export function _resetBundlingRoutesEmitted() {
+  bundlingRoutesEmitted = false;
+}
+
+export const build = async ({
+  files,
+  entrypoint,
+  shim,
+  useWebApi,
+  workPath,
+  repoRootPath,
+  config = {},
+  meta = {},
+  service,
+  span,
+  considerBuildCommand = false,
+  entrypointCallback,
+  checks = () => {},
+}: Parameters<BuildV3>[0] & {
+  shim?: (handler: string) => string;
+  useWebApi?: boolean;
+  considerBuildCommand?: boolean;
+  /**
+   * This is called once any user build scripts have run so that the entrypoint can be detected
+   * from files that may have been created by the build script.
+   */
+  entrypointCallback?: () => Promise<string>;
+  checks?: (project: { config: Config; isBun: boolean }) => void;
+}): Promise<BuildResultV3> => {
+  const baseDir = repoRootPath || workPath;
+  const awsLambdaHandler = getAWSLambdaHandler(entrypoint, config);
+
+  const {
+    entrypointPath: _entrypointPath,
+    entrypointFsDirname,
+    nodeVersion,
+    spawnEnv,
+    cliType,
+    lockfilePath,
+    lockfileVersion,
+  } = await downloadInstallAndBundle({
+    files,
+    entrypoint,
+    workPath,
+    config,
+    meta,
+    considerBuildCommand,
+  });
+
+  let entrypointPath = _entrypointPath;
+
+  const projectBuildCommand = config.projectSettings?.buildCommand;
+
+  // For traditional api-folder builds, the `build` script or project build command isn't used.
+  // but we're reusing the node builder for hono and express, where they should be treated as the
+  // primary builder
+  if (projectBuildCommand && considerBuildCommand) {
+    await execCommand(projectBuildCommand, {
+      // Yarn v2 PnP mode may be activated, so force
+      // "node-modules" linker style
+      env: {
+        YARN_NODE_LINKER: 'node-modules',
+        ...spawnEnv,
+      },
+
+      cwd: workPath,
+    });
+  } else {
+    const possibleScripts = considerBuildCommand
+      ? ['vercel-build', 'now-build', 'build']
+      : ['vercel-build', 'now-build'];
+
+    await runPackageJsonScript(
+      entrypointFsDirname,
+      possibleScripts,
+      { env: spawnEnv },
+      config.projectSettings?.createdAt
+    );
+  }
+  if (entrypointCallback) {
+    const entrypoint = await entrypointCallback();
+    entrypointPath = join(entrypointFsDirname, entrypoint);
+    const functionConfig = config.functions?.[entrypoint];
+    if (functionConfig) {
+      const normalizeArray = (value: any) =>
+        Array.isArray(value) ? value : value ? [value] : [];
+
+      config.includeFiles = [
+        ...normalizeArray(config.includeFiles),
+        ...normalizeArray(functionConfig.includeFiles),
+      ];
+      config.excludeFiles = [
+        ...normalizeArray(config.excludeFiles),
+        ...normalizeArray(functionConfig.excludeFiles),
+      ];
+    }
+  }
+
+  const isMiddleware = config.middleware === true;
+
+  const project = new Project();
+  const staticConfig = getConfig(project, entrypointPath, undefined, span);
+
+  const runtime = staticConfig?.runtime;
+  validateMiddlewareRuntime(
+    runtime,
+    entrypoint,
+    isMiddleware ? config.middlewareRuntime : undefined
+  );
+
+  let isEdgeFunction = false;
+  if (isMiddleware) {
+    const middleware = resolveMiddlewareRuntime({
+      configuredRuntime: runtime,
+      middlewareRuntime: config.middlewareRuntime,
+      projectCreatedAt: config.projectSettings?.createdAt,
+      isDev: meta.isDev,
+      env: process.env,
+    });
+    isEdgeFunction = middleware.runtime === 'edge';
+    debug(
+      `Middleware runtime for "${entrypoint}": ${middleware.runtime} (${middleware.reason})`
+    );
+    if (isEdgeFunction) {
+      console.warn(edgeMiddlewareDeprecationWarning(entrypoint));
+    }
+  } else if (runtime) {
+    isEdgeFunction = isEdgeRuntime(runtime);
+  }
+
+  checks({
+    config,
+    isBun: isBunVersion(nodeVersion),
+  });
+
+  debug('Tracing input files...');
+  const traceTime = Date.now();
+  const { preparedFiles, shouldAddSourcemapSupport } = await compile(
+    workPath,
+    baseDir,
+    entrypointPath,
+    config,
+    meta,
+    nodeVersion,
+    isEdgeFunction
+  );
+  debug(`Trace complete [${Date.now() - traceTime}ms]`);
+
+  let routes: BuildResultV3['routes'];
+  let output: BuildResultV3['output'] | undefined;
+
+  let handler = renameTStoJS(relative(baseDir, entrypointPath));
+  const outputPath = entrypointToOutputPath(entrypoint, config.zeroConfig);
+
+  // Add a `route` for Middleware
+  if (isMiddleware) {
+    // Middleware is a catch-all for all paths unless a `matcher` property is defined
+    const matcher = resolveMiddlewareMatcher(
+      config.middlewareMatcher,
+      staticConfig?.matcher,
+      entrypoint
+    );
+    const src = getRegExpFromMatchers(matcher);
+
+    const middlewareRawSrc: string[] = [];
+    if (matcher) {
+      if (Array.isArray(matcher)) {
+        middlewareRawSrc.push(...matcher);
+      } else {
+        middlewareRawSrc.push(matcher as string);
+      }
+    }
+
+    routes = [
+      {
+        src,
+        middlewareRawSrc,
+        middlewarePath: outputPath,
+        continue: true,
+        override: true,
+      },
+    ];
+  }
+
+  if (shim) {
+    const handlerFilename = basename(handler);
+    const handlerDir = dirname(handler);
+    const extension = extname(handlerFilename);
+    const extMap: Record<string, string> = {
+      '.ts': '.js',
+      '.mts': '.mjs',
+      '.mjs': '.mjs',
+      '.cjs': '.cjs',
+      '.js': '.js',
+    };
+    const ext = extMap[extension];
+    if (!ext) {
+      throw new Error(`Unsupported extension for ${entrypoint}`);
+    }
+    const filename = `shim${ext}`;
+    const shimHandler =
+      handlerDir === '.' ? filename : join(handlerDir, filename);
+    preparedFiles[shimHandler] = new FileBlob({
+      data: shim(handlerFilename),
+    });
+    handler = shimHandler;
+  }
+
+  if (isEdgeFunction) {
+    output = new EdgeFunction({
+      entrypoint: handler,
+      files: preparedFiles,
+      regions: staticConfig?.regions,
+      deploymentTarget: 'v8-worker',
+    });
+  } else {
+    // "nodejs" runtime is the default
+    const shouldAddHelpers = !(
+      config.helpers === false || process.env.NODEJS_HELPERS === '0'
+    );
+
+    // AWS custom handlers can't stream responses. The canonical gate
+    // lives in `@vercel/build-utils`'s `getLambdaSupportsStreaming`, but
+    // the build-container picks that up on its own rollout cadence —
+    // until then this build-time signal is what protects users on the
+    // Node builder. Keep this in sync with the central gate.
+    let supportsResponseStreaming: boolean | undefined;
+    if (awsLambdaHandler) {
+      supportsResponseStreaming = false;
+    } else if (
+      (staticConfig?.supportsResponseStreaming ??
+        staticConfig?.experimentalResponseStreaming) === true
+    ) {
+      supportsResponseStreaming = true;
+    }
+
+    const enableBundling =
+      process.env.VERCEL_API_FUNCTION_BUNDLING === '1' &&
+      config.zeroConfig === true &&
+      !isMiddleware &&
+      !isEdgeFunction;
+
+    if (enableBundling) {
+      // All bundleable lambdas share this identical handler file so that
+      // groupLambdas can match their handler field and digest, grouping
+      // them into a single Lambda. At runtime, the shared handler uses
+      // x-matched-path to route to the correct user entrypoint.
+      const bundledHandlerName = '___vc_bundled_api_handler.js';
+      const entrypointPrefix = relative(baseDir, workPath).split(sep).join('/');
+      preparedFiles[bundledHandlerName] = new FileBlob({
+        data: readFileSync(
+          join(dirname(__filename), 'bundling-handler.js'),
+          'utf8'
+        ).replace(
+          'process.env.VERCEL_ENTRYPOINT_PREFIX',
+          JSON.stringify(entrypointPrefix)
+        ),
+      });
+      handler = bundledHandlerName;
+
+      // Inject x-matched-path as a request header so the bundled handler
+      // knows which entrypoint to invoke. These routes are identical for
+      // every bundled entrypoint, so only emit them once to avoid
+      // inflating the route table during route merging.
+      if (!bundlingRoutesEmitted) {
+        bundlingRoutesEmitted = true;
+        routes = [
+          { handle: 'hit' },
+          {
+            src: '/index(?:/)?',
+            transforms: [
+              {
+                type: 'request.headers' as const,
+                op: 'set' as const,
+                target: { key: 'x-matched-path' },
+                args: '/',
+              },
+            ],
+            continue: true,
+            important: true,
+          },
+          {
+            src: '/((?!index$).*?)(?:/)?',
+            transforms: [
+              {
+                type: 'request.headers' as const,
+                op: 'set' as const,
+                target: { key: 'x-matched-path' },
+                args: '/$1',
+              },
+            ],
+            continue: true,
+            important: true,
+          },
+        ];
+      }
+    }
+
+    output = new NodejsLambda({
+      files: preparedFiles,
+      handler,
+      experimentalAllowBundling: enableBundling || undefined,
+      architecture: staticConfig?.architecture,
+      runtime: nodeVersion.runtime,
+      useWebApi: isMiddleware ? true : (useWebApi ?? staticConfig?.useWebApi),
+      shouldAddHelpers: isMiddleware ? false : shouldAddHelpers,
+      shouldAddSourcemapSupport,
+      awsLambdaHandler,
+      supportsResponseStreaming,
+      maxDuration: staticConfig?.maxDuration,
+      regions: normalizeRequestedRegions(
+        staticConfig?.preferredRegion ?? staticConfig?.regions
+      ),
+      shouldDisableAutomaticFetchInstrumentation:
+        process.env.VERCEL_TRACING_DISABLE_AUTOMATIC_FETCH_INSTRUMENTATION ===
+        '1',
+    });
+  }
+
+  try {
+    await generateProjectManifest({
+      workPath,
+      nodeVersion,
+      cliType,
+      lockfilePath,
+      lockfileVersion,
+      framework: config.framework ?? undefined,
+      serviceType: service ? getReportedServiceType(service) : undefined,
+    });
+  } catch (err) {
+    debug(
+      `Failed to write node manifest: ${err instanceof Error ? err.message : String(err)}`
+    );
+  }
+
+  return { routes, output };
+};
+
+function normalizeRequestedRegions(
+  regions: BaseFunctionConfig['regions'] | BaseFunctionConfig['preferredRegion']
+): NodejsLambda['regions'] {
+  if (regions === 'all') {
+    return ['all'];
+  } else if (regions === 'auto' || regions === 'default') {
+    return undefined;
+  }
+
+  if (typeof regions === 'string') {
+    return [regions];
+  }
+
+  return regions;
+}

@@ -1,64 +1,115 @@
-#!/usr/bin/env node
+import { isErrnoException, isError, errorToString } from '@vercel/error-utils';
 
 try {
   // Test to see if cwd has been deleted before
   // importing 3rd party packages that might need cwd.
   process.cwd();
-} catch (e) {
-  if (e && e.message && e.message.includes('uv_cwd')) {
-    console.error('Error! The current working directory does not exist.');
+} catch (err: unknown) {
+  if (isError(err) && err.message.includes('uv_cwd')) {
+    // biome-ignore lint/suspicious/noConsole: intentional console usage
+    console.error('Error: The current working directory does not exist.');
     process.exit(1);
   }
 }
 
+{
+  const SILENCED_ERRORS = [
+    'DeprecationWarning: The `punycode` module is deprecated. Please use a userland alternative instead.',
+  ];
+
+  // biome-ignore lint/suspicious/noConsole: intentional console usage
+  const originalError = console.error;
+  console.error = (msg: unknown) => {
+    const isSilencedError = SILENCED_ERRORS.some(
+      error => typeof msg === 'string' && msg.includes(error)
+    );
+    if (isSilencedError) {
+      return;
+    }
+    originalError(msg);
+  };
+}
+
 import { join } from 'path';
-import { existsSync, lstatSync } from 'fs';
-import sourceMap from '@zeit/source-map-support';
+import { existsSync } from 'fs';
 import { mkdirp } from 'fs-extra';
 import chalk from 'chalk';
+import semver from 'semver';
 import epipebomb from 'epipebomb';
-import updateNotifier from 'update-notifier';
+import getLatestVersion, {
+  fetchLatestVersion,
+  updateLatestVersionCache,
+} from './util/get-latest-version';
 import { URL } from 'url';
-import * as Sentry from '@sentry/node';
+import { getSentry } from './util/get-sentry';
 import hp from './util/humanize-path';
-import commands from './commands';
+import { commands, commandNames } from './commands';
+import { handleCommandTypo } from './util/handle-command-typo';
+import { matchesCliApiTag } from './util/openapi/matches-cli-api-tag';
+import { tryOpenApiFallback } from './util/openapi';
 import pkg from './util/pkg';
-import createOutput from './util/output';
 import cmd from './util/output/cmd';
-import info from './util/output/info';
-import error from './util/output/error';
 import param from './util/output/param';
 import highlight from './util/output/highlight';
-import getArgs from './util/get-args';
+import { parseArguments } from './util/get-args';
 import getUser from './util/get-user';
+import { isAppPrincipalEnabled, resolveAppTokenScope } from './util/app';
 import getTeams from './util/teams/get-teams';
+import getTeamByIdOrSlug from './util/teams/get-team-by-id-or-slug';
 import Client from './util/client';
-import { handleError } from './util/error';
+import { setFetchDispatcher } from './util/fetch';
+import { printError } from './util/error';
 import reportError from './util/report-error';
-import getConfig from './util/get-config';
+import earlyGetConfig from './util/get-config';
 import * as configFiles from './util/config/files';
 import getGlobalPathConfig from './util/config/global-path';
-import {
-  getDefaultConfig,
-  getDefaultAuthConfig,
-} from './util/config/get-default';
+import { getDefaultAuthConfig, defaultGlobalConfig } from '@vercel/cli-config';
 import * as ERRORS from './util/errors-ts';
 import { APIError } from './util/errors-ts';
-import { SENTRY_DSN } from './util/constants';
 import getUpdateCommand from './util/get-update-command';
-import { metrics, shouldCollectMetrics } from './util/metrics';
-import { getCommandName, getTitleName } from './util/pkg-name';
-import doLoginPrompt from './util/login/prompt';
-import { GlobalConfig } from './types';
-import { VercelConfig } from '@vercel/client';
-
-const isCanary = pkg.version.includes('canary');
-
-// Checks for available update and returns an instance
-const notifier = updateNotifier({
-  pkg,
-  distTag: isCanary ? 'canary' : 'latest',
-});
+import { executeUpgrade } from './util/upgrade';
+import {
+  canAutoUpdate,
+  hasAutoUpdatePreference,
+  isNativeBinaryInstall,
+  isVersionPinned,
+  setAutoUpdate,
+} from './util/updates';
+import { getTitleName } from './util/pkg-name';
+import { BUILD_LABEL } from './util/constants';
+import promptMissingCredentials from './util/login/prompt-missing-credentials';
+import type {
+  AuthConfig,
+  GlobalConfig,
+  Team,
+  User,
+} from '@vercel-internals/types';
+import type { VercelConfig } from '@vercel/client';
+import box from './util/output/box';
+import { TelemetryEventStore } from './util/telemetry';
+import { RootTelemetryClient } from './util/telemetry/root';
+import { readVercelPluginActiveSessionMarker } from './util/telemetry/vercel-plugin';
+import { help } from './args';
+import { checkTelemetryStatus } from './util/telemetry/check-status';
+import output from './output-manager';
+import {
+  shouldPrintVersionBanner,
+  wantsMachineReadableOutput,
+} from './util/output-format';
+import { checkGuidanceStatus } from './util/guidance/check-status';
+import { determineAgent } from '@vercel/detect-agent';
+import {
+  getLinkFromDir,
+  getVercelDirectory,
+  hasLocalProjectLink,
+} from './util/projects/link';
+import {
+  getPlatformEnv,
+  Span,
+  type Reporter,
+  type TraceEvent,
+} from '@vercel/build-utils';
+import { mkdir, writeFile } from 'fs/promises';
 
 const VERCEL_DIR = getGlobalPathConfig();
 const VERCEL_CONFIG_PATH = configFiles.getConfigFilePath();
@@ -66,52 +117,129 @@ const VERCEL_AUTH_CONFIG_PATH = configFiles.getAuthConfigFilePath();
 
 const GLOBAL_COMMANDS = new Set(['help']);
 
+// Check if proxy environment variables are configured
+function hasProxyConfig(): boolean {
+  return [
+    'HTTP_PROXY',
+    'HTTPS_PROXY',
+    'http_proxy',
+    'https_proxy',
+    'ALL_PROXY',
+    'all_proxy',
+  ].some(v => process.env[v]);
+}
+
+/*
+  By default, node throws EPIPE errors if process.stdout is being written to
+  and a user runs it through a pipe that gets closed while the process is still outputting
+  (eg, the simple case of piping a node app through head).
+
+  This suppresses those errors.
+*/
 epipebomb();
 
-sourceMap.install();
-
-// Configure the error reporting system
-Sentry.init({
-  dsn: SENTRY_DSN,
-  release: `vercel-cli@${pkg.version}`,
-  environment: isCanary ? 'canary' : 'stable',
-});
-
 let client: Client;
-let debug: (s: string) => void = () => {};
+let resolvedCommandForUpdate: string | undefined;
+
+// Register global error handlers early to catch errors during initialization.
+// Sentry is lazily initialized only when an error actually occurs.
+const handleRejection = async (err: any) => {
+  if (err) {
+    if (err instanceof Error) {
+      await handleUnexpected(err);
+    } else {
+      output.error(`An unexpected rejection occurred\n  ${err}`);
+      await reportError(await getSentry(), client, err);
+    }
+  } else {
+    output.error('An unexpected empty rejection occurred');
+  }
+
+  process.exit(1);
+};
+
+const handleUnexpected = async (err: Error) => {
+  const { message } = err;
+
+  // We do not want to render errors about Sentry not being reachable
+  if (message.includes('sentry') && message.includes('ENOTFOUND')) {
+    output.debug(`Sentry is not reachable: ${err}`);
+    return;
+  }
+
+  output.error(`An unexpected error occurred!\n${err.stack}`);
+  await reportError(await getSentry(), client, err);
+
+  process.exit(1);
+};
+
+process.on('unhandledRejection', handleRejection);
+process.on('uncaughtException', handleUnexpected);
+
+// Emit plugin hint when running inside Claude Code
+if (process.env.CLAUDECODE) {
+  process.stderr.write(
+    '<claude-code-hint v="1" type="plugin" value="vercel@claude-plugins-official" />\n'
+  );
+}
+
+// Snapshot before any command has a chance to mutate process.env
+const SHOULD_CHECK_FOR_UPDATES =
+  !process.env.NO_UPDATE_NOTIFIER && !process.env.VERCEL;
+
+let { isTTY } = process.stdout;
+
 let apiUrl = 'https://api.vercel.com';
 
+class InMemoryReporter implements Reporter {
+  public events: TraceEvent[] = [];
+  report(event: TraceEvent) {
+    this.events.push(event);
+  }
+}
+
 const main = async () => {
-  const { isTTY } = process.stdout;
+  const traceReporter = new InMemoryReporter();
+  const rootSpan = new Span({ name: 'vc.cli', reporter: traceReporter });
+  const isTelemetryFlushCommand =
+    process.argv[2] === 'telemetry' && process.argv[3] === 'flush';
 
-  let argv;
+  if (process.env.FORCE_TTY === '1') {
+    isTTY = true;
+    process.stdout.isTTY = true;
+    process.stdin.isTTY = true;
+  }
 
-  try {
-    argv = getArgs(
+  const parseInitialArgs = () =>
+    parseArguments(
       process.argv,
       {
         '--version': Boolean,
         '-v': '--version',
-        '--debug': Boolean,
-        '-d': '--debug',
+        '--changelog': Boolean,
+        '--non-interactive': Boolean,
       },
       { permissive: true }
     );
-  } catch (err) {
-    handleError(err);
+
+  let parsedArgs: ReturnType<typeof parseInitialArgs>;
+
+  try {
+    parsedArgs = parseInitialArgs();
+    const isDebugging = parsedArgs.flags['--debug'];
+    const isNoColor = parsedArgs.flags['--no-color'];
+    output.initialize({
+      debug: isDebugging,
+      noColor: isNoColor,
+    });
+  } catch (err: unknown) {
+    printError(err);
     return 1;
   }
 
-  const isDebugging = argv['--debug'];
-  const output = createOutput({ debug: isDebugging });
-
-  debug = output.debug;
-
-  const localConfigPath = argv['--local-config'];
-  let localConfig: VercelConfig | Error | undefined = await getConfig(
-    output,
-    localConfigPath
-  );
+  const localConfigPath = parsedArgs.flags['--local-config'];
+  let localConfig: VercelConfig | Error | undefined =
+    await earlyGetConfig(localConfigPath);
 
   if (localConfig instanceof ERRORS.CantParseJSONFile) {
     output.error(`Couldn't parse JSON file ${localConfig.meta.file}.`);
@@ -136,294 +264,441 @@ const main = async () => {
     return 1;
   }
 
-  // Print update information, if available
-  if (notifier.update && notifier.update.latest !== pkg.version && isTTY) {
-    const { latest } = notifier.update;
-    console.log(
-      info(
-        `${chalk.black.bgCyan('UPDATE AVAILABLE')} ` +
-          `Run ${cmd(
-            await getUpdateCommand()
-          )} to install ${getTitleName()} CLI ${latest}`
-      )
-    );
-
-    console.log(
-      info(
-        `Changelog: https://github.com/vercel/vercel/releases/tag/vercel@${latest}`
-      )
-    );
-  }
-
   // The second argument to the command can be:
   //
   //  * a path to deploy (as in: `vercel path/`)
   //  * a subcommand (as in: `vercel ls`)
-  const targetOrSubcommand = argv._[2];
+  const targetOrSubcommand =
+    parsedArgs.args[2] ||
+    (parsedArgs.flags['--changelog'] ? 'changelog' : undefined);
+  const subSubCommand = parsedArgs.args[3];
 
-  output.print(
-    `${chalk.grey(
-      `${getTitleName()} CLI ${pkg.version}${
-        targetOrSubcommand === 'dev' ? ' dev (beta)' : ''
-      }${
-        isCanary || targetOrSubcommand === 'dev'
-          ? ' — https://vercel.com/feedback'
-          : ''
-      }`
-    )}\n`
-  );
+  // If empty, leave this code here for easy adding of beta commands later
+  const betaCommands: string[] = ['api', 'crons', 'curl', 'kms', 'webhooks'];
+  // Short build label stamped by CI for non-release builds (e.g. "pr-115"
+  // from "pr-115 abc1234"). The full label is shown by `vc --version`.
+  const shortBuildLabel = BUILD_LABEL ? ` (${BUILD_LABEL.split(' ')[0]})` : '';
+  const versionBanner = isNativeBinaryInstall()
+    ? `${getTitleName()} CLI ${pkg.version}${shortBuildLabel}`
+    : `${getTitleName()} CLI ${pkg.version}${shortBuildLabel} (Node.js ${process.versions.node})`;
+  const msg =
+    targetOrSubcommand && betaCommands.includes(targetOrSubcommand)
+      ? `${versionBanner} | ${targetOrSubcommand} is in beta — https://vercel.com/feedback`
+      : versionBanner;
+  if (shouldPrintVersionBanner(targetOrSubcommand, process.argv)) {
+    output.print(`${chalk.dim(msg)}\n`);
+  }
 
   // Handle `--version` directly
-  if (!targetOrSubcommand && argv['--version']) {
+  if (!targetOrSubcommand && parsedArgs.flags['--version']) {
+    // biome-ignore lint/suspicious/noConsole: intentional console usage
     console.log(pkg.version);
+    return 0;
+  }
+
+  // Handle bare `-h` directly
+  const bareHelpOption = !targetOrSubcommand && parsedArgs.flags['--help'];
+  const bareHelpSubcommand = targetOrSubcommand === 'help' && !subSubCommand;
+  if (bareHelpOption || bareHelpSubcommand) {
+    output.print(help());
     return 0;
   }
 
   // Ensure that the Vercel global configuration directory exists
   try {
     await mkdirp(VERCEL_DIR);
-  } catch (err) {
-    console.error(
-      error(
-        `${
-          'An unexpected error occurred while trying to create the ' +
-          `global directory "${hp(VERCEL_DIR)}" `
-        }${err.message}`
-      )
+  } catch (err: unknown) {
+    output.error(
+      `An unexpected error occurred while trying to create the global directory "${hp(
+        VERCEL_DIR
+      )}" ${errorToString(err)}`
     );
-  }
-
-  let migrated = false;
-  let configExists;
-
-  try {
-    configExists = existsSync(VERCEL_CONFIG_PATH);
-  } catch (err) {
-    console.error(
-      error(
-        `${
-          'An unexpected error occurred while trying to find the ' +
-          `config file "${hp(VERCEL_CONFIG_PATH)}" `
-        }${err.message}`
-      )
-    );
-
-    return 0;
-  }
-
-  let config: GlobalConfig | null = null;
-
-  if (configExists) {
-    try {
-      config = configFiles.readConfigFile();
-    } catch (err) {
-      console.error(
-        error(
-          `${
-            'An unexpected error occurred while trying to read the ' +
-            `config in "${hp(VERCEL_CONFIG_PATH)}" `
-          }${err.message}`
-        )
-      );
-
-      return 1;
-    }
-
-    // This is from when Vercel CLI supported
-    // multiple providers. In that case, we really
-    // need to migrate.
-    if (
-      // @ts-ignore
-      config.sh ||
-      // @ts-ignore
-      config.user ||
-      // @ts-ignore
-      typeof config.user === 'object' ||
-      typeof config.currentTeam === 'object'
-    ) {
-      configExists = false;
-    }
-  }
-
-  if (!configExists) {
-    const results = await getDefaultConfig(config);
-
-    config = results.config;
-    migrated = results.migrated;
-
-    try {
-      configFiles.writeToConfigFile(config);
-    } catch (err) {
-      console.error(
-        error(
-          `${
-            'An unexpected error occurred while trying to write the ' +
-            `default config to "${hp(VERCEL_CONFIG_PATH)}" `
-          }${err.message}`
-        )
-      );
-
-      return 1;
-    }
-  }
-
-  let authConfigExists;
-
-  try {
-    authConfigExists = existsSync(VERCEL_AUTH_CONFIG_PATH);
-  } catch (err) {
-    console.error(
-      error(
-        `${
-          'An unexpected error occurred while trying to find the ' +
-          `auth file "${hp(VERCEL_AUTH_CONFIG_PATH)}" `
-        }${err.message}`
-      )
-    );
-
     return 1;
   }
 
-  let authConfig = null;
-
-  const subcommandsWithoutToken = ['login', 'logout', 'help', 'init', 'update'];
-
-  if (authConfigExists) {
-    try {
-      authConfig = configFiles.readAuthConfigFile();
-    } catch (err) {
-      console.error(
-        error(
-          `${
-            'An unexpected error occurred while trying to read the ' +
-            `auth config in "${hp(VERCEL_AUTH_CONFIG_PATH)}" `
-          }${err.message}`
-        )
+  let config: GlobalConfig;
+  try {
+    config = configFiles.readConfigFile();
+  } catch (err: unknown) {
+    if (isErrnoException(err) && err.code === 'ENOENT') {
+      config = defaultGlobalConfig;
+      try {
+        configFiles.writeToConfigFile(config);
+      } catch (err: unknown) {
+        output.error(
+          `An unexpected error occurred while trying to save the config to "${hp(
+            VERCEL_CONFIG_PATH
+          )}" ${errorToString(err)}`
+        );
+        return 1;
+      }
+    } else {
+      output.error(
+        `An unexpected error occurred while trying to read the config in "${hp(
+          VERCEL_CONFIG_PATH
+        )}" ${errorToString(err)}`
       );
-
       return 1;
     }
+  }
 
-    // This is from when Vercel CLI supported
-    // multiple providers. In that case, we really
-    // need to migrate.
-    // @ts-ignore
-    if (authConfig.credentials) {
-      authConfigExists = false;
-    }
+  // Check for explicit tokens before reading persisted credentials so CI/headless
+  // usage does not depend on local auth storage such as an OS keyring.
+  let tokenSource: 'flag' | 'env' | undefined;
+  let explicitToken: string | undefined;
+  if (typeof parsedArgs.flags['--token'] === 'string') {
+    explicitToken = parsedArgs.flags['--token'];
+    tokenSource = 'flag';
+  } else if (process.env.VERCEL_TOKEN) {
+    explicitToken = process.env.VERCEL_TOKEN;
+    tokenSource = 'env';
+  }
+
+  let authConfig: AuthConfig;
+  if (tokenSource) {
+    authConfig = getDefaultAuthConfig();
   } else {
-    const results = await getDefaultAuthConfig(authConfig);
-
-    authConfig = results.config;
-    migrated = results.migrated;
-
     try {
-      configFiles.writeToAuthConfigFile(authConfig);
-    } catch (err) {
-      console.error(
-        error(
-          `${
-            'An unexpected error occurred while trying to write the ' +
-            `default config to "${hp(VERCEL_AUTH_CONFIG_PATH)}" `
-          }${err.message}`
-        )
-      );
-      return 1;
+      authConfig = configFiles.readAuthConfigFile(config);
+    } catch (err: unknown) {
+      if (isErrnoException(err) && err.code === 'ENOENT') {
+        authConfig = getDefaultAuthConfig();
+      } else {
+        output.error(
+          `An unexpected error occurred while trying to read the auth config in "${hp(
+            VERCEL_AUTH_CONFIG_PATH
+          )}" ${errorToString(err)}`
+        );
+        return 1;
+      }
     }
   }
 
-  // Let the user know we migrated the config
-  if (migrated) {
-    const directory = param(hp(VERCEL_DIR));
-    debug(
-      `The credentials and configuration within the ${directory} directory were upgraded`
-    );
+  const telemetryEventStore = new TelemetryEventStore({
+    isDebug: process.env.VERCEL_TELEMETRY_DEBUG === '1',
+    config: config.telemetry,
+    cliDevice: isTelemetryFlushCommand
+      ? undefined
+      : {
+          filePath: join(VERCEL_DIR, 'telemetry-device.json'),
+        },
+    cliSession: isTelemetryFlushCommand
+      ? undefined
+      : {
+          filePath: join(VERCEL_DIR, 'telemetry-session.json'),
+        },
+  });
+
+  checkTelemetryStatus({
+    config,
+  });
+
+  if (process.env.FF_GUIDANCE_MODE) {
+    checkGuidanceStatus({
+      config,
+    });
   }
 
-  if (typeof argv['--api'] === 'string') {
-    apiUrl = argv['--api'];
+  const telemetry = new RootTelemetryClient({
+    opts: {
+      store: telemetryEventStore,
+    },
+  });
+
+  const { isAgent, agent: detectedAgent } = await determineAgent();
+  telemetry.trackInvocationId(telemetryEventStore.currentInvocationId);
+  telemetry.trackDeviceId(telemetryEventStore.currentDeviceId);
+  const vercelPluginMarker = readVercelPluginActiveSessionMarker();
+  if (vercelPluginMarker) {
+    telemetry.trackVercelPluginActiveSession();
+    telemetry.trackVercelPluginVersion(vercelPluginMarker.pluginVersion);
+  }
+  telemetry.trackAgenticUse(detectedAgent?.name);
+  telemetry.trackCPUs();
+  telemetry.trackPlatform();
+  telemetry.trackArch();
+  telemetry.trackCIVendorName();
+  telemetry.trackStdinIsTTY(process.stdin?.isTTY === true);
+  telemetry.trackVersion(pkg.version);
+  telemetry.trackCliOptionCwd(parsedArgs.flags['--cwd']);
+  telemetry.trackCliOptionLocalConfig(parsedArgs.flags['--local-config']);
+  telemetry.trackCliOptionGlobalConfig(parsedArgs.flags['--global-config']);
+  telemetry.trackCliFlagDebug(parsedArgs.flags['--debug']);
+  telemetry.trackCliFlagNoColor(parsedArgs.flags['--no-color']);
+  telemetry.trackCliOptionScope(parsedArgs.flags['--scope']);
+  telemetry.trackCliOptionToken(parsedArgs.flags['--token']);
+  telemetry.trackCliOptionTeam(parsedArgs.flags['--team']);
+  telemetry.trackCliOptionApi(parsedArgs.flags['--api']);
+
+  let earlyGetUserPromise: Promise<User | undefined> | undefined;
+  let telemetrySaved = false;
+
+  const getStringProperty = (
+    value: unknown,
+    key: string
+  ): string | undefined => {
+    if (typeof value === 'object' && value !== null && key in value) {
+      const property = (value as Record<string, unknown>)[key];
+      if (typeof property === 'string') {
+        return property;
+      }
+    }
+
+    return undefined;
+  };
+
+  const getNumberProperty = (
+    value: unknown,
+    key: string
+  ): number | undefined => {
+    if (typeof value === 'object' && value !== null && key in value) {
+      const property = (value as Record<string, unknown>)[key];
+      if (typeof property === 'number') {
+        return property;
+      }
+    }
+
+    return undefined;
+  };
+
+  const trackAgenticErrorTelemetry = (err: unknown) => {
+    if (!isAgent) {
+      return;
+    }
+
+    telemetry.trackErrorStatus(getNumberProperty(err, 'status'));
+    telemetry.trackErrorCode(getStringProperty(err, 'code'));
+    telemetry.trackErrorSlug(getStringProperty(err, 'slug'));
+    telemetry.trackErrorAction(getStringProperty(err, 'action'));
+
+    const serverMessage =
+      getStringProperty(err, 'serverMessage') ??
+      (isError(err) ? err.message : undefined);
+    telemetry.trackErrorServerMessage(serverMessage);
+  };
+
+  const saveTelemetry = async () => {
+    if (telemetrySaved) {
+      return;
+    }
+
+    const postCommandSpan = rootSpan.child('vc.postCommand');
+
+    telemetryEventStore.updateTeamId(
+      client?.config.currentTeam ?? config.currentTeam
+    );
+    telemetryEventStore.updateUserId(
+      client?.authConfig.userId ?? authConfig.userId
+    );
+    if (!telemetryEventStore.hasUserId) {
+      const getUserSpan = postCommandSpan.child('vc.postCommand.getUser');
+      try {
+        const user = await earlyGetUserPromise;
+        if (user) {
+          telemetryEventStore.updateUserId(user.id);
+        }
+      } catch {
+        // best-effort for telemetry
+      } finally {
+        getUserSpan.stop();
+      }
+    }
+
+    try {
+      const envProjectId = getPlatformEnv('PROJECT_ID');
+      if (envProjectId) {
+        telemetryEventStore.updateProjectId(envProjectId);
+      } else {
+        const cwdForProjectId =
+          client?.cwd ||
+          (typeof parsedArgs.flags['--cwd'] === 'string'
+            ? parsedArgs.flags['--cwd']
+            : process.cwd());
+        const link = await getLinkFromDir(getVercelDirectory(cwdForProjectId));
+        if (link) {
+          telemetryEventStore.updateProjectId(link.projectId);
+        }
+      }
+    } catch {
+      // best-effort for telemetry — project may not be linked
+    }
+    telemetry.trackProjectId(telemetryEventStore.currentProjectId);
+
+    await telemetryEventStore.save();
+    postCommandSpan.stop();
+    telemetrySaved = true;
+  };
+
+  const finishWithExitCode = async (code: number) => {
+    await saveTelemetry();
+    return code;
+  };
+
+  if (typeof parsedArgs.flags['--api'] === 'string') {
+    apiUrl = parsedArgs.flags['--api'];
   } else if (config && config.api) {
     apiUrl = config.api;
   }
 
   try {
-    // eslint-disable-next-line no-new
     new URL(apiUrl);
-  } catch (err) {
+  } catch (_err: unknown) {
     output.error(`Please provide a valid URL instead of ${highlight(apiUrl)}.`);
-    return 1;
+    return finishWithExitCode(1);
   }
 
-  if (!config) {
-    output.error(`Vercel global config was not loaded.`);
-    return 1;
+  // Shared API `Client` instance for all sub-commands to utilize.
+  // Non-interactive when: --non-interactive is set, or agent is detected (and no TTY). Explicit --non-interactive=false overrides agent detection.
+  const stdinIsTTY = process.stdin?.isTTY === true;
+  const nonInteractiveFlag = parsedArgs.flags['--non-interactive'] === true;
+  const argv = process.argv;
+  const explicitNonInteractiveFalse =
+    argv.includes('--non-interactive=false') ||
+    (argv.includes('--non-interactive') &&
+      argv[argv.indexOf('--non-interactive') + 1] === 'false');
+  const nonInteractive = explicitNonInteractiveFalse
+    ? false
+    : nonInteractiveFlag || (isAgent && !stdinIsTTY);
+
+  output.debug(
+    `Agent/TTY/nonInteractive: isAgent=${isAgent} agentName=${detectedAgent?.name ?? 'none'} stdin.isTTY=${String(process.stdin?.isTTY)} --non-interactive=${nonInteractiveFlag} explicitFalse=${explicitNonInteractiveFalse} => nonInteractive=${nonInteractive}`
+  );
+
+  // Only load proxy support if proxy env vars are configured (saves startup time).
+  if (hasProxyConfig()) {
+    const { EnvProxyDispatcher } = await import('./util/fetch-proxy');
+    setFetchDispatcher(new EnvProxyDispatcher());
   }
 
-  // Shared API `Client` instance for all sub-commands to utilize
   client = new Client({
     apiUrl,
-    output,
+    stdin: process.stdin,
+    stdout: process.stdout,
+    stderr: output.stream,
     config,
     authConfig,
     localConfig,
+    localConfigPath,
     argv: process.argv,
+    telemetryEventStore,
+    isAgent,
+    agentName: detectedAgent?.name,
+    nonInteractive,
   });
 
-  let subcommand;
+  client.rootSpan = rootSpan;
 
+  // The `--cwd` flag is respected for all sub-commands
+  if (parsedArgs.flags['--cwd']) {
+    client.cwd = parsedArgs.flags['--cwd'];
+  }
+  const { cwd } = client;
+
+  let defaultDeploy = false;
+  // Gets populated to the subcommand name when a built-in is
+  // provided, otherwise it remains undefined for an extension
+  let subcommand: string | undefined = undefined;
+  let userSuppliedSubCommand: string = '';
   // Check if we are deploying something
   if (targetOrSubcommand) {
-    const targetPath = join(process.cwd(), targetOrSubcommand);
+    const targetPath = join(cwd, targetOrSubcommand);
     const targetPathExists = existsSync(targetPath);
     const subcommandExists =
       GLOBAL_COMMANDS.has(targetOrSubcommand) ||
       commands.has(targetOrSubcommand);
 
-    if (targetPathExists && subcommandExists) {
-      const fileType = lstatSync(targetPath).isDirectory()
-        ? 'subdirectory'
-        : 'file';
-      const plural = targetOrSubcommand + 's';
-      const singular = targetOrSubcommand.endsWith('s')
-        ? targetOrSubcommand.slice(0, -1)
-        : '';
-      let alternative = '';
-      if (commands.has(plural)) {
-        alternative = plural;
-      } else if (commands.has(singular)) {
-        alternative = singular;
-      }
-      console.error(
-        error(
-          `The supplied argument ${param(targetOrSubcommand)} is ambiguous.` +
-            `\nIf you wish to deploy the ${fileType} ${param(
-              targetOrSubcommand
-            )}, first run "cd ${targetOrSubcommand}". ` +
-            (alternative
-              ? `\nIf you wish to use the subcommand ${param(
-                  targetOrSubcommand
-                )}, use ${param(alternative)} instead.`
-              : '')
-        )
+    if (
+      targetPathExists &&
+      subcommandExists &&
+      !parsedArgs.flags['--cwd'] &&
+      !process.env.NOW_BUILDER &&
+      !wantsMachineReadableOutput(targetOrSubcommand, process.argv) &&
+      !(await hasLocalProjectLink(client, cwd))
+    ) {
+      output.warn(
+        `Did you mean to deploy the subdirectory "${targetOrSubcommand}"? ` +
+          `Use \`vc --cwd ${targetOrSubcommand}\` instead.`
       );
-      return 1;
     }
 
     if (subcommandExists) {
-      debug(`user supplied known subcommand: "${targetOrSubcommand}"`);
+      output.debug(`user supplied known subcommand: "${targetOrSubcommand}"`);
       subcommand = targetOrSubcommand;
+      userSuppliedSubCommand = targetOrSubcommand;
     } else {
-      debug('user supplied a possible target for deployment');
-      subcommand = 'deploy';
+      output.debug(
+        'user supplied a possible target for deployment or an extension'
+      );
+      if (
+        process.env.VERCEL_AUTO_API &&
+        (await matchesCliApiTag(targetOrSubcommand))
+      ) {
+        output.debug(
+          `first token "${targetOrSubcommand}" matches an OpenAPI tag; routing to api`
+        );
+        const tag = targetOrSubcommand;
+        const result = await tryOpenApiFallback(
+          client,
+          parsedArgs.args.slice(3),
+          async () => tag
+        );
+        return finishWithExitCode(result ?? 1);
+      } else if (targetPathExists) {
+        subcommand = 'deploy';
+        userSuppliedSubCommand = targetOrSubcommand;
+        output.debug(
+          `first token "${targetOrSubcommand}" is an existing path; routing to deploy`
+        );
+      }
     }
   } else {
-    debug('user supplied no target, defaulting to deploy');
+    output.debug('user supplied no target, defaulting to deploy');
     subcommand = 'deploy';
+    defaultDeploy = true;
   }
 
   if (subcommand === 'help') {
-    subcommand = argv._[3] || 'deploy';
+    telemetry.trackCliCommandHelp('help');
+    subcommand = subSubCommand || 'deploy';
     client.argv.push('-h');
+  }
+
+  const subcommandsWithoutToken = [
+    'login',
+    'logout',
+    'help',
+    'init',
+    'build',
+    'changelog',
+    'deploy',
+    'sandbox',
+    'telemetry',
+    'upgrade',
+    'version',
+    'skills',
+    'agent',
+    'whoami',
+  ];
+
+  if (process.env.FF_GUIDANCE_MODE) {
+    subcommandsWithoutToken.push('guidance');
+  }
+
+  if (
+    subcommand === 'dev' &&
+    (client.argv.includes('--local') || client.argv.includes('-L'))
+  ) {
+    subcommandsWithoutToken.push('dev');
+  }
+
+  if (subcommand === 'flags' && subSubCommand === 'prepare') {
+    subcommandsWithoutToken.push('flags');
+  }
+
+  // Apply VERCEL_TOKEN after telemetry so env-provided tokens are not reported
+  // as if the user supplied `--token` on the command line.
+  if (tokenSource === 'env' && explicitToken) {
+    parsedArgs.flags['--token'] = explicitToken;
   }
 
   // Prompt for login if there is no current token
@@ -431,45 +706,23 @@ const main = async () => {
     (!authConfig || !authConfig.token) &&
     !client.argv.includes('-h') &&
     !client.argv.includes('--help') &&
-    !argv['--token'] &&
+    typeof parsedArgs.flags['--token'] !== 'string' &&
+    subcommand &&
     !subcommandsWithoutToken.includes(subcommand)
   ) {
-    if (isTTY) {
-      output.log(info(`No existing credentials found. Please log in:`));
-      const result = await doLoginPrompt(client);
-
-      // The login function failed, so it returned an exit code
-      if (typeof result === 'number') {
-        return result;
-      }
-
-      if (result.teamId) {
-        // SSO login, so set the current scope to the appropriate Team
-        client.config.currentTeam = result.teamId;
-      } else {
-        delete client.config.currentTeam;
-      }
-
-      // When `result` is a string it's the user's authentication token.
-      // It needs to be saved to the configuration file.
-      client.authConfig.token = result.token;
-
-      configFiles.writeToAuthConfigFile(client.authConfig);
-      configFiles.writeToConfigFile(client.config);
-
-      output.debug(`Saved credentials in "${hp(VERCEL_DIR)}"`);
-    } else {
-      output.prettyError({
-        message:
-          'No existing credentials found. Please run ' +
-          `${getCommandName('login')} or pass ${param('--token')}`,
-        link: 'https://err.sh/vercel/no-credentials-found',
-      });
-      return 1;
+    const result = await promptMissingCredentials(
+      client,
+      trackAgenticErrorTelemetry
+    );
+    if (result !== 0) {
+      return finishWithExitCode(result);
     }
   }
 
-  if (typeof argv['--token'] === 'string' && subcommand === 'switch') {
+  if (
+    typeof parsedArgs.flags['--token'] === 'string' &&
+    subcommand === 'switch'
+  ) {
     output.prettyError({
       message: `This command doesn't work with ${param(
         '--token'
@@ -477,11 +730,11 @@ const main = async () => {
       link: 'https://err.sh/vercel/no-token-allowed',
     });
 
-    return 1;
+    return finishWithExitCode(1);
   }
 
-  if (typeof argv['--token'] === 'string') {
-    const token = argv['--token'];
+  if (typeof parsedArgs.flags['--token'] === 'string') {
+    const token: string = parsedArgs.flags['--token'];
 
     if (token.length === 0) {
       output.prettyError({
@@ -489,7 +742,7 @@ const main = async () => {
         link: 'https://err.sh/vercel/missing-token-value',
       });
 
-      return 1;
+      return finishWithExitCode(1);
     }
 
     const invalid = token.match(/(\W)/g);
@@ -504,10 +757,10 @@ const main = async () => {
         link: 'https://err.sh/vercel/invalid-token-value',
       });
 
-      return 1;
+      return finishWithExitCode(1);
     }
 
-    client.authConfig = { token, skipWrite: true };
+    client.authConfig = { token, skipWrite: true, tokenSource };
 
     // Don't use team from config if `--token` was set
     if (client.config && client.config.currentTeam) {
@@ -515,7 +768,7 @@ const main = async () => {
     }
   }
 
-  if (argv['--team']) {
+  if (parsedArgs.flags['--team']) {
     output.warn(
       `The ${param('--team')} option is deprecated. Please use ${param(
         '--scope'
@@ -523,171 +776,514 @@ const main = async () => {
     );
   }
 
-  const targetCommand = commands.get(subcommand);
-  const scope = argv['--scope'] || argv['--team'] || localConfig?.scope;
+  let targetCommand =
+    typeof subcommand === 'string' ? commands.get(subcommand) : undefined;
+  const scope =
+    parsedArgs.flags['--scope'] ||
+    parsedArgs.flags['--team'] ||
+    localConfig?.scope;
+  const separatorIndex = client.argv.indexOf('--');
+  const cliArgs =
+    separatorIndex === -1 ? client.argv : client.argv.slice(0, separatorIndex);
+  const buildNeedsRemoteProjectScope =
+    targetCommand === 'build' &&
+    cliArgs.some(arg => arg === '--project' || arg.startsWith('--project='));
 
   if (
     typeof scope === 'string' &&
     targetCommand !== 'login' &&
-    targetCommand !== 'dev' &&
-    !(targetCommand === 'teams' && argv._[3] !== 'invite')
+    (targetCommand !== 'build' || buildNeedsRemoteProjectScope) &&
+    targetCommand !== 'sandbox'
   ) {
     let user = null;
 
     try {
       user = await getUser(client);
-    } catch (err) {
-      if (err.code === 'NOT_AUTHORIZED') {
-        output.prettyError({
-          message: `You do not have access to the specified account`,
-          link: 'https://err.sh/vercel/scope-not-accessible',
-        });
-
-        return 1;
+      telemetryEventStore.updateUserId(user.id);
+    } catch (err: unknown) {
+      if (err instanceof Error) {
+        output.debug(err.stack || err.toString());
       }
 
-      console.error(error('Not able to load user'));
-      return 1;
+      // App tokens cannot fetch the user; resolve the scope against the
+      // token's own team instead.
+      const appTokenScopeResolved =
+        isErrnoException(err) &&
+        err.code === 'NOT_AUTHORIZED' &&
+        isAppPrincipalEnabled() &&
+        (await resolveAppTokenScope(client, scope));
+
+      if (!appTokenScopeResolved) {
+        if (isErrnoException(err) && err.code === 'NOT_AUTHORIZED') {
+          output.prettyError({
+            message: `You do not have access to the specified account`,
+            link: 'https://err.sh/vercel/scope-not-accessible',
+          });
+
+          trackAgenticErrorTelemetry(err);
+          return finishWithExitCode(1);
+        }
+
+        output.error(
+          `Not able to load user because of unexpected error: ${errorToString(err)}`
+        );
+        trackAgenticErrorTelemetry(err);
+        return finishWithExitCode(1);
+      }
     }
 
-    if (user.uid === scope || user.email === scope || user.username === scope) {
-      delete client.config.currentTeam;
-    } else {
-      let teams = [];
+    if (user) {
+      const scopeMatchesUserIdentity =
+        user.id === scope || user.email === scope || user.username === scope;
+
+      let teams: Team[] = [];
 
       try {
         teams = await getTeams(client);
-      } catch (err) {
-        if (err.code === 'not_authorized') {
+      } catch (err: unknown) {
+        // If the scope clearly refers to the user's own identity we don't need
+        // the teams list to resolve it, so swallow any failure and fall through
+        // to personal-account handling. Otherwise the teams list is required, so
+        // surface the error.
+        if (scopeMatchesUserIdentity) {
+          output.debug(
+            `Ignoring failure to load teams; scope matches the current user's identity`
+          );
+        } else if (isErrnoException(err) && err.code === 'not_authorized') {
           output.prettyError({
             message: `You do not have access to the specified team`,
             link: 'https://err.sh/vercel/scope-not-accessible',
           });
 
-          return 1;
-        }
+          trackAgenticErrorTelemetry(err);
+          return finishWithExitCode(1);
+        } else if (isErrnoException(err) && err.code === 'rate_limited') {
+          output.prettyError({
+            message:
+              'Rate limited. Too many requests to the same endpoint: /teams',
+          });
 
-        console.error(error('Not able to load teams'));
-        return 1;
+          trackAgenticErrorTelemetry(err);
+          return finishWithExitCode(1);
+        } else {
+          output.error('Not able to load teams');
+          trackAgenticErrorTelemetry(err);
+          return finishWithExitCode(1);
+        }
       }
 
-      const related =
-        teams && teams.find(team => team.id === scope || team.slug === scope);
+      // A scope string can be ambiguous: a Northstar user's username may also be
+      // the slug of a team they own (the team backing their default scope). In
+      // that case the team must win. Otherwise the user could not target the
+      // team by name because the personal account check would reject it.
+      let related = teams.find(
+        team => team.id === scope || team.slug === scope
+      );
 
-      if (!related) {
+      // The `/teams` list only contains teams where the user is a direct
+      // member. The user can also hold a virtual membership to a team. In
+      // that case the list omits the team, but `GET /teams/:id` still resolves
+      // it. Look up the scope directly before we reject it.
+      if (!related && !scopeMatchesUserIdentity) {
+        try {
+          related = await getTeamByIdOrSlug(client, scope, {
+            useCurrentTeam: false,
+          });
+        } catch (err: unknown) {
+          output.debug(
+            `Direct team lookup for scope "${scope}" failed: ${errorToString(err)}`
+          );
+        }
+      }
+
+      if (related) {
+        client.config.currentTeam = related.id;
+      } else if (scopeMatchesUserIdentity) {
+        if (user.version === 'northstar') {
+          output.error('You cannot set your Personal Account as the scope.');
+          return finishWithExitCode(1);
+        }
+
+        delete client.config.currentTeam;
+      } else {
         output.prettyError({
           message: 'The specified scope does not exist',
           link: 'https://err.sh/vercel/scope-not-existent',
         });
 
-        return 1;
+        return finishWithExitCode(1);
       }
-
-      client.config.currentTeam = related.id;
     }
   }
 
-  const metric = metrics();
   let exitCode;
-  const eventCategory = 'Exit Code';
 
   try {
-    const start = Date.now();
-    let func: any;
-    switch (targetCommand) {
-      case 'alias':
-        func = await import('./commands/alias');
-        break;
-      case 'billing':
-        func = await import('./commands/billing');
-        break;
-      case 'certs':
-        func = await import('./commands/certs');
-        break;
-      case 'deploy':
-        func = await import('./commands/deploy');
-        break;
-      case 'dev':
-        func = await import('./commands/dev');
-        break;
-      case 'dns':
-        func = await import('./commands/dns');
-        break;
-      case 'domains':
-        func = await import('./commands/domains');
-        break;
-      case 'env':
-        func = await import('./commands/env');
-        break;
-      case 'init':
-        func = await import('./commands/init');
-        break;
-      case 'inspect':
-        func = await import('./commands/inspect');
-        break;
-      case 'link':
-        func = await import('./commands/link');
-        break;
-      case 'list':
-        func = await import('./commands/list');
-        break;
-      case 'logs':
-        func = await import('./commands/logs');
-        break;
-      case 'login':
-        func = await import('./commands/login');
-        break;
-      case 'logout':
-        func = await import('./commands/logout');
-        break;
-      case 'projects':
-        func = await import('./commands/projects');
-        break;
-      case 'remove':
-        func = await import('./commands/remove');
-        break;
-      case 'secrets':
-        func = await import('./commands/secrets');
-        break;
-      case 'teams':
-        func = await import('./commands/teams');
-        break;
-      case 'update':
-        func = await import('./commands/update');
-        break;
-      case 'whoami':
-        func = await import('./commands/whoami');
-        break;
-      default:
-        func = null;
-        break;
+    if (!targetCommand) {
+      // Set this for the metrics to record it at the end
+      targetCommand = parsedArgs.args[2];
+
+      // Try to execute as an extension
+      try {
+        const { execExtension } = await import('./util/extension/exec');
+        exitCode = await execExtension(
+          client,
+          targetCommand,
+          parsedArgs.args.slice(3),
+          cwd
+        );
+        telemetry.trackCliExtension();
+      } catch (err: unknown) {
+        if (isErrnoException(err) && err.code === 'ENOENT') {
+          // Check if the user made a typo before falling back to deploy
+          if (
+            handleCommandTypo({
+              command: targetCommand,
+              availableCommands: commandNames,
+            })
+          ) {
+            return 1;
+          }
+          // Fall back to `vc deploy <dir>`
+          targetCommand = subcommand = 'deploy';
+        } else {
+          throw err;
+        }
+      }
     }
 
-    if (!func || !targetCommand) {
-      const sub = param(subcommand);
-      output.error(`The ${sub} subcommand does not exist`);
-      return 1;
+    // Not using an `else` here because if the CLI extension
+    // was not found then we have to fall back to `vc deploy`
+    if (subcommand) {
+      let func: any;
+      switch (targetCommand) {
+        // Priority commands - separate bundles for fast loading
+        case 'deploy':
+          telemetry.trackCliCommandDeploy(userSuppliedSubCommand);
+          telemetry.trackCliDefaultDeploy(defaultDeploy);
+          func = (await import('./commands/deploy/index.js')).default;
+          break;
+        case 'dev':
+          telemetry.trackCliCommandDev(userSuppliedSubCommand);
+          func = (await import('./commands/dev/index.js')).default;
+          break;
+        case 'env':
+          telemetry.trackCliCommandEnv(userSuppliedSubCommand);
+          func = (await import('./commands/env/index.js')).default;
+          break;
+        case 'build':
+          telemetry.trackCliCommandBuild(userSuppliedSubCommand);
+          func = (await import('./commands/build/index.js')).default;
+          break;
+        case 'list':
+          telemetry.trackCliCommandList(userSuppliedSubCommand);
+          func = (await import('./commands/list/index.js')).default;
+          break;
+        case 'link':
+          telemetry.trackCliCommandLink(userSuppliedSubCommand);
+          func = (await import('./commands/link/index.js')).default;
+          break;
+
+        // Non-priority commands - loaded from bulk bundle
+        case 'agent':
+          telemetry.trackCliCommandAgent(userSuppliedSubCommand);
+          func = (await import('./commands-bulk.js')).agent;
+          break;
+        case 'agent-runs':
+          telemetry.trackCliCommandAgentRuns(userSuppliedSubCommand);
+          func = (await import('./commands-bulk.js')).agentRuns;
+          break;
+        case 'ai-gateway':
+          telemetry.trackCliCommandAiGateway(userSuppliedSubCommand);
+          func = (await import('./commands-bulk.js')).aiGateway;
+          break;
+        case 'alias':
+          telemetry.trackCliCommandAlias(userSuppliedSubCommand);
+          func = (await import('./commands-bulk.js')).alias;
+          break;
+        case 'activity':
+          telemetry.trackCliCommandActivity(userSuppliedSubCommand);
+          func = (await import('./commands-bulk.js')).activity;
+          break;
+        case 'alerts':
+          telemetry.trackCliCommandAlerts(userSuppliedSubCommand);
+          func = (await import('./commands-bulk.js')).alerts;
+          break;
+        case 'api':
+          telemetry.trackCliCommandApi(userSuppliedSubCommand);
+          func = (await import('./commands-bulk.js')).api;
+          break;
+        case 'bisect':
+          telemetry.trackCliCommandBisect(userSuppliedSubCommand);
+          func = (await import('./commands-bulk.js')).bisect;
+          break;
+        case 'blob':
+          telemetry.trackCliCommandBlob(userSuppliedSubCommand);
+          func = (await import('./commands-bulk.js')).blob;
+          break;
+        case 'buy':
+          telemetry.trackCliCommandBuy(userSuppliedSubCommand);
+          func = (await import('./commands-bulk.js')).buy;
+          break;
+        case 'init':
+          telemetry.trackCliCommandInit(userSuppliedSubCommand);
+          func = (await import('./commands-bulk.js')).init;
+          break;
+        case 'cache':
+          telemetry.trackCliCommandCache(userSuppliedSubCommand);
+          func = (await import('./commands-bulk.js')).cache;
+          break;
+        case 'connect':
+          telemetry.trackCliCommandConnex(userSuppliedSubCommand);
+          func = (await import('./commands-bulk.js')).connex;
+          break;
+        case 'contract':
+          telemetry.trackCliCommandContract(userSuppliedSubCommand);
+          func = (await import('./commands-bulk.js')).contract;
+          break;
+        case 'certs':
+          telemetry.trackCliCommandCerts(userSuppliedSubCommand);
+          func = (await import('./commands-bulk.js')).certs;
+          break;
+        case 'changelog':
+          telemetry.trackCliCommandChangelog(userSuppliedSubCommand);
+          func = (await import('./commands-bulk.js')).changelog;
+          break;
+        case 'comments':
+          telemetry.trackCliCommandComments(userSuppliedSubCommand);
+          func = (await import('./commands-bulk.js')).comments;
+          break;
+        case 'crons':
+        case 'cron':
+          telemetry.trackCliCommandCrons(userSuppliedSubCommand);
+          func = (await import('./commands-bulk.js')).crons;
+          break;
+        case 'curl':
+          telemetry.trackCliCommandCurl(userSuppliedSubCommand);
+          func = (await import('./commands-bulk.js')).curl;
+          break;
+        case 'dns':
+          telemetry.trackCliCommandDns(userSuppliedSubCommand);
+          func = (await import('./commands-bulk.js')).dns;
+          break;
+        case 'deploy-hooks':
+        case 'deploy-hook':
+          telemetry.trackCliCommandDeployHooks(userSuppliedSubCommand);
+          func = (await import('./commands-bulk.js')).deployHooks;
+          break;
+        case 'global-config':
+          telemetry.trackCliCommandGlobalConfig(userSuppliedSubCommand);
+          func = (await import('./commands-bulk.js')).globalConfig;
+          break;
+        case 'domains':
+          telemetry.trackCliCommandDomains(userSuppliedSubCommand);
+          func = (await import('./commands-bulk.js')).domains;
+          break;
+        case 'firewall':
+          telemetry.trackCliCommandFirewall(userSuppliedSubCommand);
+          func = (await import('./commands-bulk.js')).firewall;
+          break;
+        case 'flags':
+          telemetry.trackCliCommandFlags(userSuppliedSubCommand);
+          func = (await import('./commands-bulk.js')).flags;
+          break;
+        case 'git':
+          telemetry.trackCliCommandGit(userSuppliedSubCommand);
+          func = (await import('./commands-bulk.js')).git;
+          break;
+        case 'guidance':
+          if (process.env.FF_GUIDANCE_MODE) {
+            telemetry.trackCliCommandGuidance(userSuppliedSubCommand);
+            func = (await import('./commands-bulk.js')).guidance;
+            break;
+          } else {
+            func = null;
+            break;
+          }
+        case 'httpstat':
+          telemetry.trackCliCommandHttpstat(userSuppliedSubCommand);
+          func = (await import('./commands-bulk.js')).httpstat;
+          break;
+        case 'install':
+          telemetry.trackCliCommandInstall(userSuppliedSubCommand);
+          func = (await import('./commands-bulk.js')).install;
+          break;
+        case 'integration':
+          telemetry.trackCliCommandIntegration(userSuppliedSubCommand);
+          func = (await import('./commands-bulk.js')).integration;
+          break;
+        case 'integration-resource':
+          telemetry.trackCliCommandIntegrationResource(userSuppliedSubCommand);
+          func = (await import('./commands-bulk.js')).integrationResource;
+          break;
+        case 'kms':
+          telemetry.trackCliCommandKms(userSuppliedSubCommand);
+          func = (await import('./commands-bulk.js')).kms;
+          break;
+        case 'mcp':
+          func = (await import('./commands-bulk.js')).mcp;
+          break;
+        case 'logout':
+          telemetry.trackCliCommandLogout(userSuppliedSubCommand);
+          func = (await import('./commands-bulk.js')).logout;
+          break;
+        case 'login':
+          telemetry.trackCliCommandLogin(userSuppliedSubCommand);
+          func = (c: Client) =>
+            import('./commands-bulk.js').then(m =>
+              m.login(c, { shouldParseArgs: true })
+            );
+          break;
+        case 'inspect':
+          telemetry.trackCliCommandInspect(userSuppliedSubCommand);
+          func = (await import('./commands-bulk.js')).inspect;
+          break;
+        case 'logs':
+          telemetry.trackCliCommandLogs(userSuppliedSubCommand);
+          func = (await import('./commands-bulk.js')).logs;
+          break;
+        case 'metrics':
+          telemetry.trackCliCommandMetrics(userSuppliedSubCommand);
+          func = (await import('./commands-bulk.js')).metrics;
+          break;
+        case 'microfrontends':
+          telemetry.trackCliCommandMicrofrontends(userSuppliedSubCommand);
+          func = (await import('./commands-bulk.js')).microfrontends;
+          break;
+        case 'open':
+          telemetry.trackCliCommandOpen(userSuppliedSubCommand);
+          func = (await import('./commands-bulk.js')).open;
+          break;
+        case 'project':
+          telemetry.trackCliCommandProject(userSuppliedSubCommand);
+          func = (await import('./commands-bulk.js')).project;
+          break;
+        case 'promote':
+          telemetry.trackCliCommandPromote(userSuppliedSubCommand);
+          func = (await import('./commands-bulk.js')).promote;
+          break;
+        case 'pull':
+          telemetry.trackCliCommandPull(userSuppliedSubCommand);
+          func = (await import('./commands-bulk.js')).pull;
+          break;
+        case 'redeploy':
+          telemetry.trackCliCommandRedeploy(userSuppliedSubCommand);
+          func = (await import('./commands-bulk.js')).redeploy;
+          break;
+        case 'redirects':
+          telemetry.trackCliCommandRedirects(userSuppliedSubCommand);
+          func = (await import('./commands-bulk.js')).redirects;
+          break;
+        case 'routes':
+          telemetry.trackCliCommandRoutes(userSuppliedSubCommand);
+          func = (await import('./commands-bulk.js')).routes;
+          break;
+        case 'remove':
+          telemetry.trackCliCommandRemove(userSuppliedSubCommand);
+          func = (await import('./commands-bulk.js')).remove;
+          break;
+        case 'rollback':
+          telemetry.trackCliCommandRollback(userSuppliedSubCommand);
+          func = (await import('./commands-bulk.js')).rollback;
+          break;
+        case 'rr':
+        case 'release':
+        case 'rolling-release':
+          telemetry.trackCliCommandRollingRelease(userSuppliedSubCommand);
+          func = (await import('./commands-bulk.js')).rollingRelease;
+          break;
+        case 'sandbox':
+          telemetry.trackCliCommandSandbox(userSuppliedSubCommand);
+          func = (await import('./commands-bulk.js')).sandbox;
+          break;
+        case 'security':
+          telemetry.trackCliCommandSecurity(userSuppliedSubCommand);
+          func = (await import('./commands-bulk.js')).security;
+          break;
+        case 'skills':
+          telemetry.trackCliCommandSkills(userSuppliedSubCommand);
+          func = (await import('./commands-bulk.js')).skills;
+          break;
+        case 'target':
+          telemetry.trackCliCommandTarget(userSuppliedSubCommand);
+          func = (await import('./commands-bulk.js')).target;
+          break;
+        case 'teams':
+          telemetry.trackCliCommandTeams(userSuppliedSubCommand);
+          func = (await import('./commands-bulk.js')).teams;
+          break;
+        case 'tokens':
+          telemetry.trackCliCommandTokens(userSuppliedSubCommand);
+          func = (await import('./commands-bulk.js')).tokens;
+          break;
+        case 'telemetry':
+          telemetry.trackCliCommandTelemetry(userSuppliedSubCommand);
+          func = (await import('./commands-bulk.js')).telemetry;
+          break;
+        case 'traces':
+          telemetry.trackCliCommandTraces(userSuppliedSubCommand);
+          func = (await import('./commands-bulk.js')).traces;
+          break;
+        case 'upgrade':
+          telemetry.trackCliCommandUpgrade(userSuppliedSubCommand);
+          func = (await import('./commands-bulk.js')).upgrade;
+          break;
+        case 'version':
+          telemetry.trackCliCommandVersion(userSuppliedSubCommand);
+          func = (await import('./commands-bulk.js')).version;
+          break;
+        case 'webhooks':
+          telemetry.trackCliCommandWebhooks(userSuppliedSubCommand);
+          func = (await import('./commands-bulk.js')).webhooks;
+          break;
+        case 'usage':
+          telemetry.trackCliCommandUsage(userSuppliedSubCommand);
+          func = (await import('./commands-bulk.js')).usage;
+          break;
+        case 'vcr':
+          telemetry.trackCliCommandVcr(userSuppliedSubCommand);
+          func = (await import('./commands-bulk.js')).vcr;
+          break;
+        case 'whoami':
+          telemetry.trackCliCommandWhoami(userSuppliedSubCommand);
+          func = (await import('./commands-bulk.js')).whoami;
+          break;
+        default:
+          func = null;
+          break;
+      }
+
+      if (!func || !targetCommand) {
+        if (
+          !handleCommandTypo({
+            command: subcommand,
+            availableCommands: commandNames,
+          })
+        ) {
+          output.error(`The ${param(subcommand)} subcommand does not exist`);
+        }
+        return 1;
+      }
+
+      if (func.default) {
+        func = func.default;
+      }
+
+      if (!telemetryEventStore.hasUserId && !client.authConfig.userId) {
+        earlyGetUserPromise = getUser(client).catch(() => undefined);
+      }
+
+      resolvedCommandForUpdate = targetCommand;
+      exitCode = await rootSpan
+        .child('vc.cli.command', { command: subcommand || 'deploy' })
+        .trace(() => func(client));
     }
+  } catch (err: unknown) {
+    trackAgenticErrorTelemetry(err);
 
-    if (func.default) {
-      func = func.default;
-    }
-
-    exitCode = await func(client);
-    const end = Date.now() - start;
-
-    if (shouldCollectMetrics) {
-      const category = 'Command Invocation';
-
-      metric
-        .timing(category, targetCommand, end, pkg.version)
-        .event(category, targetCommand, pkg.version)
-        .send();
-    }
-  } catch (err) {
-    if (err.code === 'ENOTFOUND') {
+    if (isErrnoException(err) && err.code === 'ENOTFOUND') {
       // Error message will look like the following:
-      // "request to https://api.vercel.com/www/user failed, reason: getaddrinfo ENOTFOUND api.vercel.com"
+      // "request to https://api.vercel.com/v2/user failed, reason: getaddrinfo ENOTFOUND api.vercel.com"
       const matches = /getaddrinfo ENOTFOUND (.*)$/.exec(err.message || '');
       if (matches && matches[1]) {
         const hostname = matches[1];
@@ -697,94 +1293,271 @@ const main = async () => {
           )} could not be resolved. Please verify your internet connectivity and DNS configuration.`
         );
       }
-      output.debug(err.stack);
-      return 1;
+      if (typeof err.stack === 'string') {
+        output.debug(err.stack);
+      }
+      return finishWithExitCode(1);
     }
 
-    if (err.code === 'NOT_AUTHORIZED' || err.code === 'TEAM_DELETED') {
+    if (isErrnoException(err) && err.code === 'ECONNRESET') {
+      // Error message will look like the following:
+      // request to https://api.vercel.com/v2/user failed, reason: socket hang up
+      const matches = /request to https:\/\/(.*?)\//.exec(err.message || '');
+      const hostname = matches?.[1];
+      if (hostname) {
+        output.error(
+          `Connection to ${highlight(
+            hostname
+          )} interrupted. Please verify your internet connectivity and DNS configuration.`
+        );
+      }
+      return finishWithExitCode(1);
+    }
+
+    if (
+      isErrnoException(err) &&
+      (err.code === 'NOT_AUTHORIZED' || err.code === 'TEAM_DELETED')
+    ) {
       output.prettyError(err);
-      return 1;
+      return finishWithExitCode(1);
     }
 
     if (err instanceof APIError && 400 <= err.status && err.status <= 499) {
       err.message = err.serverMessage;
       output.prettyError(err);
-      return 1;
-    }
-
-    if (shouldCollectMetrics) {
-      metric
-        .event(eventCategory, '1', pkg.version)
-        .exception(err.message)
-        .send();
+      return finishWithExitCode(1);
     }
 
     // If there is a code we should not consider the error unexpected
     // but instead show the message. Any error that is handled by this should
     // actually be handled in the sub command instead. Please make sure
     // that happens for anything that lands here. It should NOT bubble up to here.
-    if (err.code) {
-      output.debug(err.stack);
+    if (isErrnoException(err)) {
+      if (typeof err.stack === 'string') {
+        output.debug(err.stack);
+      }
       output.prettyError(err);
     } else {
-      await reportError(Sentry, client, err);
+      await reportError(await getSentry(), client, err);
 
       // Otherwise it is an unexpected error and we should show the trace
       // and an unexpected error message
-      output.error(
-        `An unexpected error occurred in ${subcommand}: ${err.stack}`
-      );
+      output.error(`An unexpected error occurred in ${subcommand}: ${err}`);
     }
 
-    return 1;
+    return finishWithExitCode(1);
   }
 
-  if (shouldCollectMetrics) {
-    metric.event(eventCategory, `${exitCode}`, pkg.version).send();
+  await saveTelemetry();
+
+  rootSpan.stop();
+
+  // Flush trace events to disk. Only `vc build` sets traceDiagnosticsPath,
+  // so traces are not written for other commands (deploy, env, etc.).
+  if (client.traceDiagnosticsPath) {
+    try {
+      await mkdir(join(client.traceDiagnosticsPath, '..'), { recursive: true });
+      await writeFile(
+        client.traceDiagnosticsPath,
+        JSON.stringify(traceReporter.events)
+      );
+    } catch (err) {
+      output.error('Failed to write diagnostics trace file');
+      output.prettyError(err);
+    }
   }
 
   return exitCode;
 };
 
-const handleRejection = async (err: any) => {
-  debug('handling rejection');
+// Start the CLI update check early so the fresh registry lookup runs in
+// parallel with the command, avoiding any perceived delay when the
+// command finishes and the update prompt needs to appear.
+//
+// The notification is NOT consumed here so that if the command crashes, the
+// notification cycle is preserved for the next run.
+let cachedLatest: string | undefined;
+let freshLookupPromise: Promise<string | undefined> | undefined;
 
-  if (err) {
-    if (err instanceof Error) {
-      await handleUnexpected(err);
-    } else {
-      console.error(error(`An unexpected rejection occurred\n  ${err}`));
-      await reportError(Sentry, client, err);
+if (SHOULD_CHECK_FOR_UPDATES && !isNativeBinaryInstall()) {
+  cachedLatest = getLatestVersion({ pkg, consumeNotification: false });
+  if (cachedLatest) {
+    output.debug('Update may be available, fetching fresh version...');
+    freshLookupPromise = fetchLatestVersion({
+      name: pkg.name,
+      timeout: 3000,
+    }).catch(() => undefined);
+  }
+}
+
+/**
+ * Prompts the user to upgrade now and, if they accept, runs the upgrade
+ * and optionally asks about enabling automatic updates.
+ *
+ * @returns The upgrade exit code if the user accepted, otherwise `undefined`.
+ */
+async function promptAndUpgrade(
+  client: Client,
+  targetVersion?: string
+): Promise<number | undefined> {
+  try {
+    const shouldUpgrade = await client.input.confirm(
+      'Would you like to upgrade now?',
+      true
+    );
+
+    if (!shouldUpgrade) return;
+
+    const upgradeExitCode = await executeUpgrade(targetVersion);
+    if (upgradeExitCode === 0 && !hasAutoUpdatePreference(client.config)) {
+      const enableAutoUpdates = await client.input.confirm(
+        'Enable automatic CLI updates for future releases?',
+        false
+      );
+      setAutoUpdate(client, enableAutoUpdates);
     }
-  } else {
-    console.error(error('An unexpected empty rejection occurred'));
+    return upgradeExitCode;
+  } catch (err: unknown) {
+    if (
+      err instanceof Error &&
+      err.message.includes('User force closed the prompt')
+    ) {
+      // User pressed Ctrl+C to dismiss the prompt
+      return;
+    }
+    throw err;
   }
-
-  process.exit(1);
-};
-
-const handleUnexpected = async (err: Error) => {
-  const { message } = err;
-
-  // We do not want to render errors about Sentry not being reachable
-  if (message.includes('sentry') && message.includes('ENOTFOUND')) {
-    debug(`Sentry is not reachable: ${err}`);
-    return;
-  }
-
-  console.error(error(`An unexpected error occurred!\n${err.stack}`));
-  await reportError(Sentry, client, err);
-
-  process.exit(1);
-};
-
-process.on('unhandledRejection', handleRejection);
-process.on('uncaughtException', handleUnexpected);
+}
 
 main()
-  .then(exitCode => {
+  .then(async exitCode => {
+    // Skip the update notification after `vc upgrade`: the process still has
+    // the pre-upgrade version in memory, so it would prompt the user to
+    // upgrade again right after the upgrade completed.
+    // Also skip it entirely while a version is pinned (`vc version use`):
+    // the user explicitly chose this version, so don't nag or auto-update.
+    if (
+      cachedLatest &&
+      resolvedCommandForUpdate !== 'upgrade' &&
+      !(await isVersionPinned())
+    ) {
+      const originalExitCode = typeof exitCode === 'number' ? exitCode : 0;
+
+      // Await the fresh registry lookup to verify the exact version before
+      // presenting it. This is needed for both the auto-update and interactive paths.
+      const fresh = freshLookupPromise ? await freshLookupPromise : undefined;
+      output.debug(`Fresh lookup result: ${fresh ?? 'failed'}`);
+
+      let latest: string | undefined;
+      let userUpToDate = false;
+
+      if (fresh) {
+        updateLatestVersionCache({ name: pkg.name, version: fresh });
+
+        if (semver.lt(pkg.version, fresh)) {
+          latest = fresh;
+        } else {
+          // Cache was stale, user is already on the latest version
+          userUpToDate = true;
+        }
+      }
+
+      // Consume the notification cycle now that the command has completed
+      // and we've determined the update status. If the command had crashed,
+      // this code never runs and the notification is preserved for next time.
+      getLatestVersion({ pkg });
+
+      if (
+        !userUpToDate &&
+        (await canAutoUpdate(
+          client,
+          originalExitCode,
+          resolvedCommandForUpdate
+        ))
+      ) {
+        const upgradeExitCode = await executeUpgrade();
+        process.exitCode = originalExitCode;
+        if (upgradeExitCode !== 0) {
+          output.log(
+            `Automatic update failed. Continuing with original exit code ${originalExitCode}.`
+          );
+        }
+        return;
+      }
+
+      if (latest) {
+        const changelog = `https://github.com/vercel/vercel/releases/tag/vercel%40${latest}`;
+
+        if (isTTY) {
+          // Interactive mode: prompt user to update now
+          const errorMsg =
+            exitCode && exitCode !== 2
+              ? chalk.magenta(
+                  ` The latest update ${chalk.italic(
+                    'may'
+                  )} fix any errors that occurred.`
+                )
+              : '';
+
+          output.print(
+            `\nUpdate available for Vercel CLI (${chalk.gray(
+              `v${pkg.version}`
+            )} → ${chalk.green(`v${latest}`)})${errorMsg}\n`
+          );
+          output.print(
+            `Changelog: ${output.link(changelog, changelog, { fallback: false })}\n`
+          );
+
+          const upgradeExitCode = await promptAndUpgrade(client, latest);
+          if (upgradeExitCode !== undefined) {
+            process.exitCode = upgradeExitCode;
+            return;
+          }
+        } else {
+          const errorMsg =
+            exitCode && exitCode !== 2
+              ? chalk.magenta(
+                  `\n\nThe latest update ${chalk.italic(
+                    'may'
+                  )} fix any errors that occurred.`
+                )
+              : '';
+          output.print(
+            box(
+              `Update available! ${chalk.gray(`v${pkg.version}`)} ≫ ${chalk.green(
+                `v${latest}`
+              )}
+Changelog: ${output.link(changelog, changelog, { fallback: false })}
+Run ${chalk.cyan(cmd(await getUpdateCommand()))} to update.${errorMsg}`
+            )
+          );
+          output.print('\n');
+        }
+        // If the fresh lookup failed we don't show the exact version.
+      } else if (!fresh) {
+        // Fresh lookup failed — show a generic update message without
+        // naming a specific version, since the cached version may be stale.
+        if (isTTY) {
+          output.print('\nA newer version of Vercel CLI may be available.\n');
+
+          const upgradeExitCode = await promptAndUpgrade(client);
+          if (upgradeExitCode !== undefined) {
+            process.exitCode = upgradeExitCode;
+            return;
+          }
+        } else {
+          output.print(
+            box(
+              `A newer version of Vercel CLI may be available.
+Run ${chalk.cyan(cmd(await getUpdateCommand()))} to update.`
+            )
+          );
+          output.print('\n');
+        }
+      }
+      // else: userUpToDate — skip notification silently
+    }
+
     process.exitCode = exitCode;
-    // @ts-ignore - "nowExit" is a non-standard event name
-    process.emit('nowExit');
   })
   .catch(handleUnexpected);

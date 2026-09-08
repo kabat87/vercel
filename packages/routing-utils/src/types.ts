@@ -9,43 +9,148 @@ export type RouteApiError = {
   errors?: string[]; // array of all error messages
 };
 
+type MatchableValue =
+  | string
+  | {
+      eq?: string | number;
+      neq?: string;
+      inc?: string[];
+      ninc?: string[];
+      pre?: string;
+      suf?: string;
+      re?: string;
+      gt?: number;
+      gte?: number;
+      lt?: number;
+      lte?: number;
+    };
+
+type MitigateAction = 'challenge' | 'deny';
+
 export type HasField = Array<
   | {
       type: 'host';
-      value: string;
+      value: MatchableValue;
     }
   | {
       type: 'header' | 'cookie' | 'query';
       key: string;
-      value?: string;
+      value?: MatchableValue;
     }
 >;
 
-export type Source = {
+export type HeaderQueryTransform = {
+  type: 'request.headers' | 'request.query' | 'response.headers';
+  op: 'append' | 'set' | 'delete';
+  target: {
+    // re is not supported for transforms. Once supported, replace key with MatchableValue.
+    key:
+      | string
+      | {
+          eq?: string | number;
+          neq?: string;
+          inc?: string[];
+          ninc?: string[];
+          pre?: string;
+          suf?: string;
+          gt?: number;
+          gte?: number;
+          lt?: number;
+          lte?: number;
+        };
+  };
+  args?: string | string[];
+  env?: string[];
+};
+
+export type PathTransform = {
+  type: 'request.path';
+  op: 'set';
+  args: string;
+  env?: string[];
+};
+
+export type Transform = HeaderQueryTransform | PathTransform;
+
+export type ServiceDestination = {
+  /**
+   * Optional explicit format marker. The destination is identified by the
+   * presence of `service`, so `type` is no longer required.
+   */
+  type?: 'service';
+  service: string;
+  /** Routing-only path used to select a route inside the target service. */
+  path?: string;
+};
+
+export type RouteWithSrc = {
   src: string;
   dest?: string;
   headers?: { [name: string]: string };
   methods?: string[];
   continue?: boolean;
+  /** @deprecated */
   override?: boolean;
+  caseSensitive?: boolean;
   check?: boolean;
+  /** @deprecated */
   important?: boolean;
   status?: number;
   has?: HasField;
+  missing?: HasField;
+  mitigate?: {
+    action: MitigateAction;
+  };
+  transforms?: Transform[];
+  env?: string[];
   locale?: {
     redirect?: Record<string, string>;
     cookie?: string;
   };
+  /**
+   * Aliases for `src`, `dest`, and `status`. These provide consistency with the
+   * `rewrites`, `redirects`, and `headers` fields which use `source`, `destination`,
+   * and `statusCode`. During normalization, the string forms are converted to
+   * their canonical forms (`src`, `dest`, `status`) and stripped from the route
+   * object.
+   *
+   * `destination` may also be a service-targeted object, in which case routing
+   * is delegated into the named service's internal route table and the object
+   * is preserved as-is (not folded into `dest`).
+   */
+  source?: string;
+  destination?: string | ServiceDestination;
+  statusCode?: number;
+  /**
+   * A middleware key within the `output` key under the build result.
+   * Overrides a `middleware` definition.
+   */
+  middlewarePath?: string;
+  /**
+   * The original middleware matchers.
+   */
+  middlewareRawSrc?: string[];
+  /**
+   * A middleware index in the `middleware` key under the build result
+   */
+  middleware?: number;
+  respectOriginCacheControl?: boolean;
 };
 
-export type Handler = {
+export type RouteWithHandle = {
+  /** @deprecated Internal use only. Do not use in vercel.json. */
   handle: HandleValue;
   src?: string;
   dest?: string;
   status?: number;
 };
 
-export type Route = Source | Handler;
+export type Route = RouteWithSrc | RouteWithHandle;
+
+export type RouteInput =
+  | RouteWithSrc
+  | (Omit<RouteWithSrc, 'src'> & { src?: string; source: string })
+  | RouteWithHandle;
 
 export type NormalizedRoutes = {
   routes: Route[] | null;
@@ -53,7 +158,12 @@ export type NormalizedRoutes = {
 };
 
 export interface GetRoutesProps {
-  nowConfig: VercelConfig;
+  routes?: RouteInput[];
+  cleanUrls?: boolean;
+  rewrites?: Rewrite[];
+  redirects?: Redirect[];
+  headers?: Header[];
+  trailingSlash?: boolean;
 }
 
 export interface MergeRoutesProps {
@@ -67,21 +177,15 @@ export interface Build {
   routes?: Route[];
 }
 
-export interface VercelConfig {
-  name?: string;
-  version?: number;
-  routes?: Route[];
-  cleanUrls?: boolean;
-  rewrites?: Rewrite[];
-  redirects?: Redirect[];
-  headers?: Header[];
-  trailingSlash?: boolean;
-}
-
 export interface Rewrite {
   source: string;
-  destination: string;
+  destination: string | ServiceDestination;
+  transforms?: PathTransform[];
   has?: HasField;
+  missing?: HasField;
+  statusCode?: number;
+  env?: string[];
+  respectOriginCacheControl?: boolean;
 }
 
 export interface Redirect {
@@ -90,12 +194,15 @@ export interface Redirect {
   permanent?: boolean;
   statusCode?: number;
   has?: HasField;
+  missing?: HasField;
+  env?: string[];
 }
 
 export interface Header {
   source: string;
   headers: HeaderKeyValue[];
   has?: HasField;
+  missing?: HasField;
 }
 
 export interface HeaderKeyValue {
@@ -114,21 +221,7 @@ export interface AppendRoutesToPhaseProps {
   newRoutes: Route[] | null;
   /**
    * The phase to append the routes such as `filesystem`.
+   * If the phase is `null`, the routes will be appended prior to the first handle being found.
    */
-  phase: HandleValue;
+  phase: HandleValue | null;
 }
-
-/** @deprecated Use VercelConfig instead. */
-export type NowConfig = VercelConfig;
-
-/** @deprecated Use Rewrite instead. */
-export type NowRewrite = Rewrite;
-
-/** @deprecated Use Redirect instead. */
-export type NowRedirect = Redirect;
-
-/** @deprecated Use Header instead. */
-export type NowHeader = Header;
-
-/** @deprecated Use HeaderKeyValue instead. */
-export type NowHeaderKeyValue = HeaderKeyValue;

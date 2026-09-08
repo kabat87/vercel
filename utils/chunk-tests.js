@@ -1,0 +1,781 @@
+// @ts-check
+const fs = require('node:fs');
+const path = require('node:path');
+const testGlob = require('./test-glob');
+
+const runnersMap = new Map([
+  [
+    'test-unit',
+    {
+      min: 1,
+      max: 1,
+      testScript: 'test-unit',
+      runners: ['ubuntu-latest', 'macos-14', 'windows-latest'],
+      nodeVersions: ['20', '22', '24'],
+      excludeRunnerNodeVersions: { 'windows-latest': ['20'] },
+    },
+  ],
+  [
+    'test',
+    {
+      min: 1,
+      max: 1,
+      testScript: 'test',
+      runners: ['ubuntu-latest', 'macos-14', 'windows-latest'],
+      nodeVersions: ['20', '22', '24'],
+      // Skip Node 20 on Windows: it's the slowest runner with the highest
+      // per-job overhead and the oldest supported Node, so the Windows/Node 20
+      // unit cells are the lowest-value coverage. Node 20 still runs on Linux
+      // and macOS; Node 22 (current primary) still runs on all three. This
+      // keeps the full (run-all) unit matrix under GitHub Actions' 256-config
+      // limit.
+      excludeRunnerNodeVersions: { 'windows-latest': ['20'] },
+    },
+  ],
+  [
+    'test-e2e',
+    {
+      min: 1,
+      max: 7,
+      testScript: 'test',
+      runners: ['ubuntu-latest'],
+    },
+  ],
+  [
+    'test-e2e-artifacts',
+    {
+      min: 1,
+      max: 7,
+      testScript: 'test',
+      runners: ['ubuntu-latest'],
+    },
+  ],
+  [
+    'test-e2e-builder',
+    {
+      min: 1,
+      max: 7,
+      testScript: 'test-e2e-builder',
+      runners: ['ubuntu-latest'],
+      useVitestShards: true,
+    },
+  ],
+  [
+    'test-e2e-independent',
+    {
+      min: 1,
+      max: 7,
+      testScript: 'test',
+      runners: ['ubuntu-latest'],
+    },
+  ],
+  [
+    'test-e2e-node-all-versions',
+    {
+      min: 1,
+      max: 7,
+      testScript: 'test',
+      runners: ['ubuntu-latest'],
+      nodeVersions: ['20', '22', '24'],
+    },
+  ],
+  [
+    'test-next-local',
+    {
+      min: 1,
+      max: 5,
+      runners: ['ubuntu-latest-32-core'],
+      testScript: 'test',
+      nodeVersions: ['22'],
+    },
+  ],
+  [
+    // Path-separator-sensitive Next builder integration tests. Keep this
+    // smaller than the full test-next-local suite (32-core Linux) — add
+    // files to the package script as Windows coverage grows.
+    'test-next-local-windows',
+    {
+      min: 1,
+      max: 1,
+      runners: ['windows-latest-8-core'],
+      testScript: 'test',
+      nodeVersions: ['22'],
+    },
+  ],
+  [
+    'test-dev',
+    {
+      min: 1,
+      max: 7,
+      testScript: 'test',
+      runners: ['ubuntu-latest', 'macos-14'],
+    },
+  ],
+  [
+    'test-dev-artifacts',
+    {
+      min: 1,
+      max: 7,
+      testScript: 'test',
+      runners: ['ubuntu-latest', 'macos-14'],
+    },
+  ],
+]);
+
+const packageOptionsOverrides = {
+  // Coarse tiers from cold nightly runs. These intentionally avoid pretending
+  // that individual timings are stable while still starting known stragglers
+  // before the bulk of the matrix.
+  // The package's artifact task is an aggregate node whose dependencies fan
+  // out to the deployment-heavy groups. Invoke that entrypoint directly
+  // instead of forwarding individual test paths to the generic test task.
+  '@vercel/build-utils': {
+    taskOptions: {
+      'test-e2e-artifacts': {
+        testScript: 'test-e2e-artifacts',
+        includeTestPaths: false,
+      },
+    },
+    schedulePriority: { 'test-e2e-artifacts': 3 },
+  },
+
+  // The vercel CLI has many test files. Passing them as CLI args hits the Windows
+  // cmd.exe ~8191 char arg limit, so we route them through the VITEST_TEST_FILES
+  // env var instead. useEnvPaths signals the workflow to set that var and omit
+  // the -- args from the turbo command.
+  //
+  // Why max: 7?
+  // Per-job overhead on the slowest runner (Windows) is ~450s (checkout, node
+  // setup, Rust toolchain, pnpm install, build). At max=7, each chunk has ~48
+  // test files taking ~130s to run. Going beyond 7 adds more jobs and runner cost
+  // but saves <30s of wall clock, since overhead already dominates test time.
+  // Benchmark (wall clock of the unit-test phase):
+  //   max=2 (old): ~22 min    max=4: ~10 min    max=7: ~9 min    max=14: ~8.5 min
+  // The nightly matrix is capped below its total job count. Prioritize the CLI
+  // cells so these consistently long jobs are not queued behind shorter work.
+  vercel: {
+    max: 7,
+    useEnvPaths: true,
+    schedulePriority: { 'test-unit': 3, 'test-dev-artifacts': 3 },
+  },
+
+  examples: { schedulePriority: { 'test-e2e-artifacts': 2 } },
+  '@vercel/python': { schedulePriority: { 'test-e2e-builder': 1 } },
+  '@vercel/remix-builder': {
+    schedulePriority: { 'test-e2e-builder': 1 },
+  },
+  '@vercel/static-build': {
+    schedulePriority: { 'test-e2e-builder': 1 },
+  },
+
+  // Next.js fixture tests create and probe real deployments, so they need
+  // smaller chunks to stay within the per-job timeout.
+  '@vercel/next': {
+    max: 20,
+    schedulePriority: {
+      'test-unit': 2,
+      'test-next-local': 1,
+      'test-next-local-windows': 1,
+    },
+    taskOptions: {
+      'test-e2e-builder': {
+        excludeTestPaths: ['test/fixtures/00-bun-runtime/index.test.ts'],
+      },
+    },
+  },
+
+  // These parser tests are platform-independent and do not need an OS matrix.
+  '@vercel/python-analysis': {
+    max: 1,
+    runners: ['ubuntu-latest'],
+    nodeVersions: ['22'],
+  },
+
+  '//': {
+    runners: ['ubuntu-latest'],
+    nodeVersions: ['22'],
+  },
+
+  // Native task commands do not vary with Node.js. Run them once to preserve
+  // room below GitHub Actions' 256-cell matrix limit.
+  vercel_runtime: {
+    runners: ['ubuntu-latest'],
+    nodeVersions: ['22'],
+  },
+  'vercel-runtime': {
+    runners: ['ubuntu-latest'],
+    nodeVersions: ['22'],
+  },
+  'vercel-workers': {
+    runners: ['ubuntu-latest'],
+    nodeVersions: ['22'],
+  },
+
+  // `@vercel/container`'s unit tests are pure logic with `spawn`/`fs`/`fetch`
+  // fully mocked, so they're OS-independent. Run them on Linux only instead of
+  // all three runners: the macOS/Windows copies add no coverage and pushed the
+  // all-packages unit matrix past GitHub Actions' 256-configuration limit.
+  '@vercel/container': {
+    runners: ['ubuntu-latest'],
+    nodeVersions: ['22'],
+  },
+};
+
+const runnerSchedulePriority = {
+  // Windows cells consistently have the highest setup and execution overhead.
+  'windows-latest': 1,
+  'windows-latest-8-core': 1,
+};
+
+const DEFAULT_TEST_FILE_EXTENSIONS = ['js', 'ts', 'mjs', 'mts'];
+const DEFAULT_TEST_NAME_PATTERNS = ['test', 'spec'];
+
+// Packages whose build requires the Go toolchain.
+// `@vercel-internals/ipc-proxy` compiles cross-arch proxy binaries during its
+// build step; `@vercel/go` depends on it and copies those binaries. The `vercel`
+// CLI depends on `@vercel/go`, so its build transitively needs Go as well.
+// We walk the dep graph transitively — matching the way turbo builds
+// dependencies — so indirect consumers like `vercel` get needsGo even when
+// @vercel/go is a workspace dep but @vercel-internals/ipc-proxy is not direct.
+const GO_BUILD_ROOTS = new Set(['@vercel-internals/ipc-proxy', '@vercel/go']);
+
+function directNeeds(manifest, roots) {
+  if (roots.has(manifest.name)) return true;
+  const allDeps = { ...manifest.dependencies, ...manifest.devDependencies };
+  return Object.keys(allDeps).some(dep => roots.has(dep));
+}
+
+function computeTransitiveNeeds(manifests, roots) {
+  // Build dep graph for workspace packages only.
+  const knownNames = new Set(manifests.map(m => m.packageName));
+  const nameToDeps = new Map();
+  for (const { packageName, packageJson } of manifests) {
+    const allDeps = {
+      ...packageJson.dependencies,
+      ...packageJson.devDependencies,
+    };
+    const deps = new Set(Object.keys(allDeps).filter(d => knownNames.has(d)));
+    nameToDeps.set(packageName, deps);
+  }
+
+  // Invert: dep -> parents, so we can walk "who depends on me?"
+  const reverseEdges = new Map();
+  for (const [parent, deps] of nameToDeps) {
+    for (const dep of deps) {
+      if (!reverseEdges.has(dep)) reverseEdges.set(dep, new Set());
+      reverseEdges.get(dep).add(parent);
+    }
+  }
+
+  // Seed with direct matches (roots themselves or direct dep on a root).
+  // This handles cases where a root isn't in knownNames (e.g. internals may
+  // not appear in turbo packages list) — directNeeds still catches the
+  // first level via package.json inspection.
+  const initial = new Set();
+  for (const m of manifests) {
+    if (directNeeds(m.packageJson, roots)) initial.add(m.packageName);
+  }
+  // Also include roots that happen to be workspace packages themselves.
+  for (const r of roots) {
+    if (knownNames.has(r)) initial.add(r);
+  }
+
+  const needed = new Set(initial);
+  const queue = [...initial];
+  // Include roots in visited so we don't re-visit them if they later appear
+  // as a parent, but traversal is driven by initial (known) nodes. We also
+  // push roots into the BFS if they are known, so their parents are found.
+  const visited = new Set([...queue, ...roots]);
+
+  while (queue.length > 0) {
+    const cur = queue.shift();
+    const parents = reverseEdges.get(cur);
+    if (!parents) continue;
+    for (const parent of parents) {
+      if (!visited.has(parent)) {
+        visited.add(parent);
+        needed.add(parent);
+        queue.push(parent);
+      }
+    }
+  }
+
+  return needed;
+}
+
+function readPackageManifest(rootPath, packageJsonPath) {
+  const manifest = JSON.parse(fs.readFileSync(packageJsonPath, 'utf8'));
+  // First pass: direct flag only; transitive enrichment happens after we have
+  // the full manifest list (see getPackageManifests / finalizeTransitiveNeeds).
+  const needsGo = directNeeds(manifest, GO_BUILD_ROOTS);
+  return {
+    packagePath: path.relative(rootPath, path.dirname(packageJsonPath)),
+    packageJson: manifest,
+    packageName: manifest.name,
+    needsGo,
+  };
+}
+
+function finalizeTransitiveNeeds(manifests) {
+  const goNeeded = computeTransitiveNeeds(manifests, GO_BUILD_ROOTS);
+  for (const m of manifests) {
+    if (goNeeded.has(m.packageName)) m.needsGo = true;
+  }
+  return manifests;
+}
+
+function getScriptTestPatterns(packageJson, scriptName, taskCommand) {
+  const configuredPatterns = packageJson.testing?.[scriptName];
+  if (configuredPatterns) {
+    return Array.isArray(configuredPatterns)
+      ? configuredPatterns
+      : [configuredPatterns];
+  }
+
+  const pnpmRunScript = taskCommand?.match(/^pnpm run ([^\s]+)$/)?.[1];
+  const fallbackScriptName = scriptName.replace(
+    /-(?:artifacts|independent)$/,
+    ''
+  );
+  const isNoopCommand = /^node -e process\.exit\(0\)$/.test(taskCommand || '');
+  const script = pnpmRunScript
+    ? packageJson.scripts?.[pnpmRunScript]
+    : !taskCommand || isNoopCommand
+      ? packageJson.scripts?.[scriptName] ||
+        packageJson.scripts?.[fallbackScriptName]
+      : taskCommand;
+  if (!script) {
+    return [];
+  }
+
+  const globPatterns = getQuotedPatterns(script);
+  if (script.startsWith('glob ') && globPatterns.length > 0) {
+    return globPatterns;
+  }
+
+  const pnpmTestPatterns = /(?:^|[;&]\s*)pnpm test(?:\s|$)/.test(script)
+    ? getPatternsAfterCommand(script, 'pnpm test')
+    : [];
+  if (pnpmTestPatterns.length > 0) {
+    return pnpmTestPatterns;
+  }
+
+  const pnpmVitestPatterns = /(?:^|[;&]\s*)pnpm vitest-run(?:\s|$)/.test(script)
+    ? getPatternsAfterCommand(script, 'pnpm vitest-run')
+    : [];
+  if (pnpmVitestPatterns.length > 0) {
+    return pnpmVitestPatterns;
+  }
+
+  if (script === 'pnpm test') {
+    return getDefaultTestPatterns();
+  }
+
+  const vitestPatterns = getPatternsAfterCommand(script, 'vitest run');
+  if (vitestPatterns.length > 0) {
+    return normalizeTestPatterns(scriptName, vitestPatterns);
+  }
+
+  const nodeRunner = script.match(/^node scripts\/(?:vitest-run|test)\.mjs/);
+  if (nodeRunner) {
+    return normalizeTestPatterns(
+      scriptName,
+      getPatternsAfterCommand(script, nodeRunner[0])
+    );
+  }
+
+  return [];
+}
+
+function normalizeTestPatterns(scriptName, patterns) {
+  if (!scriptName.startsWith('test-e2e')) {
+    return patterns;
+  }
+
+  return patterns.map(pattern => {
+    const isTestFilePattern = DEFAULT_TEST_NAME_PATTERNS.some(name =>
+      pattern.includes(`.${name}.`)
+    );
+    const isTestFile = DEFAULT_TEST_FILE_EXTENSIONS.some(extension =>
+      pattern.endsWith(`.${extension}`)
+    );
+    if (pattern.endsWith('/') || isTestFilePattern || isTestFile) {
+      return pattern;
+    }
+    return `${pattern}*`;
+  });
+}
+
+function getQuotedPatterns(script) {
+  const patterns = [];
+  const quotedPattern = /'([^']+)'|"([^"]+)"/g;
+  let match;
+  while ((match = quotedPattern.exec(script))) {
+    patterns.push(match[1] || match[2]);
+  }
+  return patterns.filter(pattern => isLikelyTestPattern(pattern));
+}
+
+function getPatternsAfterCommand(script, command) {
+  const commandIndex = script.lastIndexOf(command);
+  if (commandIndex === -1) {
+    return [];
+  }
+
+  const args = tokenizeShellArgs(script.slice(commandIndex + command.length));
+  const patterns = [];
+
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index];
+    if (arg === '&&' || arg === ';') {
+      break;
+    }
+
+    if (arg === '--config' || arg === '-c' || arg === '--exclude') {
+      index += 1;
+      continue;
+    }
+
+    if (arg.startsWith('-')) {
+      continue;
+    }
+
+    if (isLikelyTestPattern(arg)) {
+      patterns.push(arg);
+    }
+  }
+
+  return patterns.length > 0 ? patterns : getDefaultTestPatterns();
+}
+
+function tokenizeShellArgs(input) {
+  const tokens = [];
+  const tokenPattern = /'([^']*)'|"([^"]*)"|(\S+)/g;
+  let match;
+  while ((match = tokenPattern.exec(input))) {
+    tokens.push(match[1] || match[2] || match[3]);
+  }
+  return tokens;
+}
+
+function isLikelyTestPattern(pattern) {
+  return (
+    pattern.includes('/') ||
+    pattern.includes('*') ||
+    DEFAULT_TEST_NAME_PATTERNS.some(name => pattern.includes(`.${name}.`))
+  );
+}
+
+function getDefaultTestPatterns() {
+  return DEFAULT_TEST_NAME_PATTERNS.flatMap(testName =>
+    DEFAULT_TEST_FILE_EXTENSIONS.map(
+      extension => `test/**/*.${testName}.${extension}`
+    )
+  );
+}
+
+function getTestPathsForPackage(rootPath, packagePath, patterns) {
+  const packageRoot = path.join(rootPath, packagePath);
+  const testPaths = new Set();
+
+  for (const pattern of patterns) {
+    for (const testPath of testGlob.expandTestPattern(
+      packageRoot,
+      pattern,
+      getDefaultTestPatterns()
+    )) {
+      testPaths.add(testPath);
+    }
+  }
+
+  return [...testPaths].sort((a, b) => a.localeCompare(b));
+}
+
+function getRunnerOptions(scriptName, packageName) {
+  let runnerOptions = runnersMap.get(scriptName);
+  if (packageOptionsOverrides[packageName]) {
+    const { taskOptions = {}, ...packageOptions } =
+      packageOptionsOverrides[packageName];
+    runnerOptions = Object.assign(
+      {},
+      runnerOptions,
+      packageOptions,
+      taskOptions[scriptName]
+    );
+  }
+  if (!runnerOptions) {
+    throw new Error(
+      `Unable to find runner options for package "${packageName}" and script ${scriptName}`
+    );
+  }
+  return runnerOptions;
+}
+
+function getRunnerShort(runner) {
+  switch (runner) {
+    case 'ubuntu-latest':
+      return 'linux';
+    case 'macos-14':
+      return 'mac';
+    case 'windows-latest':
+    case 'windows-latest-8-core':
+      return 'win';
+    default:
+      return runner;
+  }
+}
+
+function getPackageDisplayName(packageName) {
+  switch (packageName) {
+    case '//':
+      return 'Root';
+    case 'vercel':
+      return 'CLI';
+    default:
+      return packageName;
+  }
+}
+
+async function getChunkedTests() {
+  const rootPath = path.resolve(__dirname, '..');
+  const taskEntries = JSON.parse(process.env.TURBO_TASKS || '[]');
+  if (!Array.isArray(taskEntries)) {
+    throw new Error('TURBO_TASKS must be a JSON array');
+  }
+  if (taskEntries.length === 0) {
+    console.error('No executable affected tasks reported by Turborepo');
+    return [];
+  }
+
+  const tasksByPackage = new Map();
+  const packageDirectories = new Map();
+  for (const entry of taskEntries) {
+    if (!entry.package || typeof entry.directory !== 'string' || !entry.task) {
+      throw new Error(
+        'Each TURBO_TASKS entry must include package, directory, and task'
+      );
+    }
+    packageDirectories.set(entry.package, entry.directory);
+    const packageTasks = tasksByPackage.get(entry.package) || new Map();
+    packageTasks.set(entry.task, entry.command);
+    tasksByPackage.set(entry.package, packageTasks);
+  }
+
+  /**
+   * @typedef {string} TestPath
+   * @type {{ [package: string]: { [script: string]: TestPath[] } }}
+   */
+  const testsToRun = {};
+  const wholeTasks = new Set();
+
+  let packageManifests = [...packageDirectories].map(
+    ([turboPackageName, directory]) => {
+      const packageJsonPath = path.join(rootPath, directory, 'package.json');
+      const manifest = fs.existsSync(packageJsonPath)
+        ? readPackageManifest(rootPath, packageJsonPath)
+        : {
+            packagePath: directory,
+            packageJson: {},
+            packageName: turboPackageName,
+            needsGo: false,
+          };
+      return {
+        ...manifest,
+        isNative:
+          !fs.existsSync(packageJsonPath) ||
+          (turboPackageName !== '//' &&
+            turboPackageName !== manifest.packageName),
+        packageName: turboPackageName,
+      };
+    }
+  );
+  // Enrich with transitive toolchain needs via dep-graph walk so consumers
+  // like `vercel` CLI (which depends on @vercel/go transitively) get marked.
+  packageManifests = finalizeTransitiveNeeds(packageManifests);
+  packageManifests.forEach(
+    ({ isNative, packageJson, packageName, packagePath, needsGo }) => {
+      for (const [scriptName, taskCommand] of tasksByPackage.get(packageName) ||
+        []) {
+        const patterns = getScriptTestPatterns(
+          packageJson,
+          scriptName,
+          taskCommand
+        );
+        const testPaths = isNative
+          ? []
+          : getTestPathsForPackage(rootPath, packagePath, patterns);
+        if (testPaths.length === 0) {
+          wholeTasks.add(`${packageName}#${scriptName}`);
+        }
+
+        const packagePathAndName = `${packagePath},${packageName}`;
+        testsToRun[packagePathAndName] = testsToRun[packagePathAndName] || {
+          needsGo,
+        };
+        testsToRun[packagePathAndName][scriptName] = testPaths;
+      }
+    }
+  );
+
+  const chunkedTests = Object.entries(testsToRun).flatMap(
+    ([packagePathAndName, scriptNames]) => {
+      const [packagePath, packageName] = packagePathAndName.split(',');
+      const { needsGo } = scriptNames;
+      return Object.entries(scriptNames).flatMap(([scriptName, testPaths]) => {
+        if (scriptName === 'needsGo') return [];
+        const wholeTask = wholeTasks.has(`${packageName}#${scriptName}`);
+        const runnerOptions = wholeTask
+          ? {
+              ...getRunnerOptions(scriptName, packageName),
+              includeTestPaths: false,
+              max: 1,
+              nodeVersions: ['22'],
+              runners: ['ubuntu-latest'],
+            }
+          : getRunnerOptions(scriptName, packageName);
+        const {
+          runners,
+          min,
+          max,
+          testScript,
+          nodeVersions = ['22'],
+          useEnvPaths = false,
+          excludeRunnerNodeVersions = {},
+          excludeTestPaths = [],
+          includeTestPaths = true,
+          useVitestShards = false,
+        } = runnerOptions;
+
+        const sortedTestPaths = testPaths
+          .filter(
+            testPath =>
+              !excludeTestPaths.includes(
+                path
+                  .relative(path.join(rootPath, packagePath), testPath)
+                  .replace(/\\/g, '/')
+              )
+          )
+          .sort((a, b) => a.localeCompare(b));
+        const testPathChunks =
+          sortedTestPaths.length === 0
+            ? [[]]
+            : intoChunks(min, max, sortedTestPaths);
+        return testPathChunks.flatMap((chunk, chunkNumber, allChunks) => {
+          return nodeVersions.flatMap(nodeVersion => {
+            return runners.flatMap(runner => {
+              // Skip (runner, nodeVersion) combinations explicitly excluded
+              // for this lane (e.g. Node 20 on Windows).
+              if (
+                (excludeRunnerNodeVersions[runner] || []).includes(nodeVersion)
+              ) {
+                return [];
+              }
+              const runnerShort = getRunnerShort(runner);
+              const packageDisplayName = getPackageDisplayName(packageName);
+              const chunkSuffix =
+                allChunks.length > 1
+                  ? ` [${chunkNumber + 1}/${allChunks.length}]`
+                  : '';
+              const label = `${packageDisplayName} (${runnerShort}/node${nodeVersion})${chunkSuffix}`;
+              const relativeTestPaths = useVitestShards
+                ? allChunks.length > 1
+                  ? [`--shard=${chunkNumber + 1}/${allChunks.length}`]
+                  : []
+                : includeTestPaths
+                  ? chunk.map(testFile =>
+                      path.relative(
+                        path.join(__dirname, '../', packagePath),
+                        testFile
+                      )
+                    )
+                  : [];
+              return {
+                runner,
+                packagePath,
+                packageName,
+                scriptName,
+                testScript,
+                nodeVersion,
+                testPaths: relativeTestPaths,
+                chunkNumber: chunkNumber + 1,
+                allChunksLength: allChunks.length,
+                useEnvPaths,
+                needsGo,
+                label,
+              };
+            });
+          });
+        });
+      });
+    }
+  );
+
+  const scheduledTasks = new Set(
+    chunkedTests.map(cell => `${cell.packageName}#${cell.scriptName}`)
+  );
+  const missingTasks = [...tasksByPackage].flatMap(([packageName, tasks]) =>
+    [...tasks]
+      .map(([task]) => `${packageName}#${task}`)
+      .filter(task => !scheduledTasks.has(task))
+  );
+  if (missingTasks.length > 0) {
+    throw new Error(
+      `Test tasks were not scheduled: ${missingTasks.join(', ')}`
+    );
+  }
+
+  return sortBySchedulePriority(chunkedTests);
+}
+
+function sortBySchedulePriority(testCells) {
+  return testCells
+    .map((cell, index) => ({
+      cell,
+      index,
+      priority:
+        (packageOptionsOverrides[cell.packageName]?.schedulePriority?.[
+          cell.scriptName
+        ] ?? 0) + (runnerSchedulePriority[cell.runner] ?? 0),
+    }))
+    .sort((a, b) => b.priority - a.priority || a.index - b.index)
+    .map(({ cell }) => cell);
+}
+
+/**
+ * @template T
+ * @param {number} minChunks minimum number of chunks
+ * @param {number} maxChunks maximum number of chunks
+ * @param {T[]} arr
+ * @returns {T[][]}
+ */
+function intoChunks(minChunks, maxChunks, arr) {
+  const chunkSize = Math.max(minChunks, Math.ceil(arr.length / maxChunks));
+  const chunks = [];
+  for (let i = 0; i < maxChunks; i++) {
+    chunks.push(arr.slice(i * chunkSize, (i + 1) * chunkSize));
+  }
+  return chunks.filter(x => x.length > 0);
+}
+
+async function main() {
+  try {
+    const chunks = await getChunkedTests();
+    // TODO: pack and build the runtimes for each package and cache it so we only deploy it once
+    console.log(JSON.stringify(chunks));
+  } catch (e) {
+    console.error(e);
+    process.exitCode = 1;
+  }
+}
+
+// @ts-ignore
+if (module === require.main || !module.parent) {
+  main();
+}
+
+module.exports = {
+  getChunkedTests,
+  intoChunks,
+  getScriptTestPatterns,
+  sortBySchedulePriority,
+};

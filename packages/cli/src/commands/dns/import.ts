@@ -1,33 +1,76 @@
 import chalk from 'chalk';
-import Client from '../../util/client';
+import type Client from '../../util/client';
 import getScope from '../../util/get-scope';
 import { DomainNotFound, InvalidDomain } from '../../util/errors-ts';
 import stamp from '../../util/output/stamp';
 import importZonefile from '../../util/dns/import-zonefile';
 import { getCommandName } from '../../util/pkg-name';
+import output from '../../output-manager';
+import { DnsImportTelemetryClient } from '../../util/telemetry/commands/dns/import';
+import { importSubcommand } from './command';
+import { parseArguments } from '../../util/get-args';
+import { getFlagsSpecification } from '../../util/get-flags-specification';
+import { printError } from '../../util/error';
+import {
+  outputActionRequired,
+  outputAgentError,
+  withGlobalFlags,
+} from '../../util/agent-output';
+import {
+  AGENT_ACTION,
+  AGENT_REASON,
+  AGENT_STATUS,
+} from '../../util/agent-output-constants';
 
-type Options = {};
-
-export default async function add(
-  client: Client,
-  opts: Options,
-  args: string[]
-) {
-  const { output } = client;
-  let contextName = null;
-
+export default async function importZone(client: Client, argv: string[]) {
+  let parsedArgs;
+  const flagsSpecification = getFlagsSpecification(importSubcommand.options);
   try {
-    ({ contextName } = await getScope(client));
+    parsedArgs = parseArguments(argv, flagsSpecification);
   } catch (err) {
-    if (err.code === 'NOT_AUTHORIZED' || err.code === 'TEAM_DELETED') {
-      output.error(err.message);
-      return 1;
+    if (client.nonInteractive) {
+      outputAgentError(
+        client,
+        {
+          status: AGENT_STATUS.ERROR,
+          reason: AGENT_REASON.INVALID_ARGUMENTS,
+          message: err instanceof Error ? err.message : String(err),
+        },
+        1
+      );
     }
-
-    throw err;
+    printError(err);
+    return 1;
   }
+  const { args } = parsedArgs;
+  const { telemetryEventStore } = client;
+  const { contextName } = await getScope(client);
+  const telemetry = new DnsImportTelemetryClient({
+    opts: {
+      store: telemetryEventStore,
+    },
+  });
 
   if (args.length !== 2) {
+    if (client.nonInteractive) {
+      const cmd = withGlobalFlags(client, 'dns import <domain> <zonefile>');
+      outputActionRequired(
+        client,
+        {
+          status: AGENT_STATUS.ACTION_REQUIRED,
+          reason: AGENT_REASON.MISSING_ARGUMENTS,
+          action: AGENT_ACTION.MISSING_ARGUMENTS,
+          message: `Invalid number of arguments. Run: ${cmd}`,
+          next: [
+            {
+              command: cmd,
+              when: 'to import a zone file',
+            },
+          ],
+        },
+        1
+      );
+    }
     output.error(
       `Invalid number of arguments. Usage: ${chalk.cyan(
         `${getCommandName('dns import <domain> <zonefile>')}`
@@ -38,6 +81,8 @@ export default async function add(
 
   const addStamp = stamp();
   const [domain, zonefilePath] = args;
+  telemetry.trackCliArgumentDomain(domain);
+  telemetry.trackCliArgumentZonefile(zonefilePath);
 
   const recordIds = await importZonefile(
     client,
@@ -46,6 +91,23 @@ export default async function add(
     zonefilePath
   );
   if (recordIds instanceof DomainNotFound) {
+    if (client.nonInteractive) {
+      outputAgentError(
+        client,
+        {
+          status: AGENT_STATUS.ERROR,
+          reason: AGENT_REASON.DOMAIN_NOT_FOUND,
+          message: `The domain ${domain} can't be found under ${contextName}.`,
+          next: [
+            {
+              command: withGlobalFlags(client, 'dns ls'),
+              when: 'to list DNS records for your scope',
+            },
+          ],
+        },
+        1
+      );
+    }
     output.error(
       `The domain ${domain} can't be found under ${chalk.bold(
         contextName
@@ -55,6 +117,17 @@ export default async function add(
   }
 
   if (recordIds instanceof InvalidDomain) {
+    if (client.nonInteractive) {
+      outputAgentError(
+        client,
+        {
+          status: AGENT_STATUS.ERROR,
+          reason: AGENT_REASON.INVALID_DOMAIN,
+          message: `The domain ${domain} doesn't match the one found in the zone file.`,
+        },
+        1
+      );
+    }
     output.error(
       `The domain ${domain} doesn't match with the one found in the Zone file ${chalk.gray(
         addStamp()
@@ -63,12 +136,10 @@ export default async function add(
     return 1;
   }
 
-  console.log(
-    `${chalk.cyan('> Success!')} ${
-      recordIds.length
-    } DNS records for domain ${chalk.bold(domain)} created under ${chalk.bold(
-      contextName
-    )} ${chalk.gray(addStamp())}`
+  output.success(
+    `${recordIds.length} DNS records for domain ${chalk.bold(
+      domain
+    )} created under ${chalk.bold(contextName)} ${chalk.gray(addStamp())}`
   );
   return 0;
 }

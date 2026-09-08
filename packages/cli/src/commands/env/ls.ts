@@ -1,111 +1,228 @@
 import chalk from 'chalk';
 import ms from 'ms';
-import { Output } from '../../util/output';
-import { Project, ProjectEnvVariable, ProjectEnvType } from '../../types';
-import Client from '../../util/client';
+import type {
+  CustomEnvironment,
+  ProjectEnvVariable,
+  ProjectLinked,
+} from '@vercel-internals/types';
+import type Client from '../../util/client';
 import formatTable from '../../util/format-table';
 import getEnvRecords from '../../util/env/get-env-records';
-import formatEnvTarget from '../../util/env/format-env-target';
-import {
-  isValidEnvTarget,
-  getEnvTargetPlaceholder,
-} from '../../util/env/env-target';
+import { getEnvTargetPlaceholder } from '../../util/env/env-target';
 import stamp from '../../util/output/stamp';
-import param from '../../util/output/param';
 import { getCommandName } from '../../util/pkg-name';
 import ellipsis from '../../util/output/ellipsis';
+import { getCustomEnvironments } from '../../util/target/get-custom-environments';
+import formatEnvironments from '../../util/env/format-environments';
+import { formatProject } from '../../util/projects/format-project';
+import output from '../../output-manager';
+import { validateJsonOutput } from '../../util/output-format';
+import { EnvLsTelemetryClient } from '../../util/telemetry/commands/env/ls';
+import { listSubcommand } from './command';
+import { parseArguments } from '../../util/get-args';
+import { getFlagsSpecification } from '../../util/get-flags-specification';
+import { printError } from '../../util/error';
+import { resolveProjectContext } from '../../util/projects/resolve-project-context';
+import { determineAgent } from '@vercel/detect-agent';
+import { suggestNextCommands } from '../../util/suggest-next-commands';
+import { isGuidanceEnabled } from '../../util/guidance/is-enabled';
+import { validateLsArgs } from '../../util/validate-ls-args';
+import { withGlobalFlags } from '../../util/agent-output';
+import { isSecretEnvVar } from '../../util/env/env-var-config-secret-ui';
 
-type Options = {
-  '--debug': boolean;
-};
+export default async function ls(client: Client, argv: string[]) {
+  const telemetryClient = new EnvLsTelemetryClient({
+    opts: {
+      store: client.telemetryEventStore,
+    },
+  });
 
-export default async function ls(
-  client: Client,
-  project: Project,
-  opts: Partial<Options>,
-  args: string[],
-  output: Output
-) {
-  if (args.length > 2) {
-    output.error(
-      `Invalid number of arguments. Usage: ${getCommandName(
-        `env ls ${getEnvTargetPlaceholder()} <gitbranch>`
-      )}`
-    );
+  let parsedArgs;
+  const flagsSpecification = getFlagsSpecification(listSubcommand.options);
+  try {
+    parsedArgs = parseArguments(argv, flagsSpecification);
+  } catch (err) {
+    printError(err);
     return 1;
+  }
+  const { args, flags } = parsedArgs;
+
+  const validationResult = validateLsArgs({
+    commandName: 'env ls',
+    args: args,
+    maxArgs: 2,
+    exitCode: 1,
+    usageString: getCommandName(
+      `env ls ${getEnvTargetPlaceholder()} <gitbranch>`
+    ),
+  });
+  if (validationResult !== 0) {
+    return validationResult;
   }
 
   const [envTarget, envGitBranch] = args;
+  const formatResult = validateJsonOutput(flags);
+  if (!formatResult.valid) {
+    output.error(formatResult.error);
+    return 1;
+  }
+  const asJson = formatResult.jsonOutput;
 
-  if (!isValidEnvTarget(envTarget)) {
+  telemetryClient.trackCliArgumentEnvironment(envTarget);
+  telemetryClient.trackCliArgumentGitBranch(envGitBranch);
+  telemetryClient.trackCliFlagGuidance(flags['--guidance']);
+  telemetryClient.trackCliOptionFormat(flags['--format']);
+  const projectName = flags['--project'];
+  telemetryClient.trackCliOptionProject(projectName);
+
+  const link = await resolveProjectContext({
+    client,
+    projectNameOrId: projectName,
+    commandName: 'env ls',
+  });
+  if (link.status === 'error') {
+    return link.exitCode;
+  } else if (link.status === 'not_linked') {
     output.error(
-      `The Environment ${param(
-        envTarget
-      )} is invalid. It must be one of: ${getEnvTargetPlaceholder()}.`
+      `Your codebase isn’t linked to a project on Vercel. Pass --project <name>, or ${client.nonInteractive ? `run ${getCommandName('link --yes --team <team-id> --project <project-id>')} to link non-interactively.` : `run ${getCommandName('link')} to begin.`}`
     );
     return 1;
   }
+  client.config.currentTeam =
+    link.org.type === 'team' ? link.org.id : undefined;
+
+  const { project, org } = link;
 
   const lsStamp = stamp();
 
-  const { envs } = await getEnvRecords(output, client, project.id, {
-    target: envTarget,
-    gitBranch: envGitBranch,
-  });
+  const [envsResult, customEnvs] = await Promise.all([
+    getEnvRecords(client, project.id, 'vercel-cli:env:ls', {
+      target: envTarget,
+      gitBranch: envGitBranch,
+    }),
+    getCustomEnvironments(client, project.id),
+  ]);
+  const { envs } = envsResult;
 
-  if (envs.length === 0) {
+  const projectSlugLink = formatProject(org.slug, project.name);
+
+  if (asJson) {
+    output.stopSpinner();
+    const jsonOutput = {
+      envs: envs.map(env => ({
+        key: env.key,
+        value: isSecretEnvVar(env) ? undefined : env.value,
+        type: env.type,
+        visibility: env.visibility,
+        target: env.target,
+        gitBranch: env.gitBranch,
+        configurationId: env.configurationId,
+        createdAt: env.createdAt,
+        updatedAt: env.updatedAt,
+      })),
+    };
+    client.stdout.write(`${JSON.stringify(jsonOutput, null, 2)}\n`);
+  } else if (envs.length === 0) {
     output.log(
-      `No Environment Variables found in Project ${chalk.bold(
-        project.name
-      )} ${chalk.gray(lsStamp())}`
+      `No Environment Variables found for ${projectSlugLink} ${chalk.gray(lsStamp())}`
     );
   } else {
     output.log(
-      `Environment Variables found in Project ${chalk.bold(
-        project.name
-      )} ${chalk.gray(lsStamp())}`
+      `Environment Variables found for ${projectSlugLink} ${chalk.gray(lsStamp())}`
     );
-    console.log(getTable(envs));
+    client.stdout.write(`${getTable(link, envs, customEnvs)}\n`);
+  }
+
+  if (!asJson) {
+    const { isAgent } = await determineAgent();
+    const guidanceMode = isGuidanceEnabled(
+      client,
+      parsedArgs.flags['--guidance'],
+      isAgent
+    );
+    if (guidanceMode) {
+      suggestNextCommands([
+        {
+          description: 'Add an Environment Variable',
+          command: withGlobalFlags(client, 'env add', {
+            preserveProject: true,
+          }),
+        },
+        {
+          description: 'Remove an Environment Variable',
+          command: withGlobalFlags(client, 'env rm', {
+            preserveProject: true,
+          }),
+        },
+        {
+          description: 'Pull Development Environment Variables into .env.local',
+          command: withGlobalFlags(client, 'env pull', {
+            preserveProject: true,
+          }),
+        },
+      ]);
+    }
   }
 
   return 0;
 }
 
-function getTable(records: ProjectEnvVariable[]) {
+function getTable(
+  link: ProjectLinked,
+  records: ProjectEnvVariable[],
+  customEnvironments: CustomEnvironment[]
+) {
   const label = records.some(env => env.gitBranch)
     ? 'environments (git branch)'
     : 'environments';
   return formatTable(
-    ['name', 'value', label, 'created'],
+    ['name', 'value', 'type', label, 'created'],
     ['l', 'l', 'l', 'l', 'l'],
     [
       {
         name: '',
-        rows: records.map(getRow),
+        rows: records.map(row => getRow(link, row, customEnvironments)),
       },
     ]
   );
 }
 
-function getRow(env: ProjectEnvVariable) {
+function getRow(
+  link: ProjectLinked,
+  env: ProjectEnvVariable,
+  customEnvironments: CustomEnvironment[]
+) {
   let value: string;
-  if (env.type === ProjectEnvType.Plaintext) {
+  if (isSecretEnvVar(env)) {
+    value = chalk.gray.italic('Hidden');
+  } else if (env.type === 'system') {
+    value = chalk.gray.italic(env.value);
+  } else {
     // replace space characters (line-break, etc.) with simple spaces
     // to make sure the displayed value is a single line
     const singleLineValue = env.value.replace(/\s/g, ' ');
 
     value = chalk.gray(ellipsis(singleLineValue, 19));
-  } else if (env.type === ProjectEnvType.System) {
-    value = chalk.gray.italic(env.value);
-  } else {
-    value = chalk.gray.italic('Encrypted');
   }
 
   const now = Date.now();
   return [
     chalk.bold(env.key),
     value,
-    formatEnvTarget(env),
+    getEnvironmentVariableTypeLabel(env),
+    formatEnvironments(link, env, customEnvironments),
     env.createdAt ? `${ms(now - env.createdAt)} ago` : '',
   ];
+}
+
+function getEnvironmentVariableTypeLabel(
+  env: ProjectEnvVariable
+): 'Config' | 'Secret' | 'System' {
+  if (isSecretEnvVar(env)) {
+    return 'Secret';
+  }
+  if (env.type === 'system') {
+    return 'System';
+  }
+  return 'Config';
 }

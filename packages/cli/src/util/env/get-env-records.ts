@@ -1,18 +1,34 @@
-import { Output } from '../output';
-import Client from '../client';
-import { ProjectEnvVariable, ProjectEnvTarget } from '../../types';
 import { URLSearchParams } from 'url';
+import type Client from '../client';
+import type { ProjectEnvVariable } from '@vercel-internals/types';
+import output from '../../output-manager';
+import { withEnvChallengeRecovery } from './challenge-recovery';
+
+/** The CLI command that was used that needs the environment variables. */
+export type EnvRecordsSource =
+  | 'vercel-cli:env:ls'
+  | 'vercel-cli:env:add'
+  | 'vercel-cli:env:rm'
+  | 'vercel-cli:env:update'
+  | 'vercel-cli:env:pull'
+  | 'vercel-cli:env:run'
+  | 'vercel-cli:dev'
+  | 'vercel-cli:pull'
+  | 'vercel-cli:link'
+  | 'vercel-cli:integration:add'
+  | 'vercel-cli:blob:store-add'
+  | 'vercel-cli:blob:store-remove';
 
 export default async function getEnvRecords(
-  output: Output,
   client: Client,
   projectId: string,
+  source: EnvRecordsSource,
   {
     target,
     gitBranch,
     decrypt,
   }: {
-    target?: ProjectEnvTarget | string;
+    target?: string;
     gitBranch?: string;
     decrypt?: boolean;
   } = {}
@@ -23,7 +39,15 @@ export default async function getEnvRecords(
   const query = new URLSearchParams();
 
   if (target) {
-    query.set('target', target);
+    let targetParam = 'target';
+    if (
+      target !== 'production' &&
+      target !== 'preview' &&
+      target !== 'development'
+    ) {
+      targetParam = 'customEnvironmentId';
+    }
+    query.set(targetParam, target);
   }
   if (gitBranch) {
     query.set('gitBranch', gitBranch);
@@ -31,8 +55,58 @@ export default async function getEnvRecords(
   if (decrypt) {
     query.set('decrypt', decrypt.toString());
   }
+  if (source) {
+    query.set('source', source);
+  }
 
-  const url = `/v7/projects/${projectId}/env?${query}`;
+  const url = `/v10/projects/${projectId}/env?${query}`;
 
-  return client.fetch<{ envs: ProjectEnvVariable[] }>(url);
+  return withEnvChallengeRecovery(client, () =>
+    client.fetch<{ envs: ProjectEnvVariable[] }>(url)
+  );
+}
+
+interface PullEnvOptions {
+  target?: string;
+  gitBranch?: string;
+}
+
+export async function pullEnvRecords(
+  client: Client,
+  projectIdOrDeploymentId: string,
+  source: EnvRecordsSource,
+  { target, gitBranch }: PullEnvOptions = {}
+) {
+  output.debug(
+    `Fetching Environment Variables of ${projectIdOrDeploymentId} and target ${target}`
+  );
+  const query = new URLSearchParams();
+
+  let url = `/v3/env/pull/${projectIdOrDeploymentId}`;
+
+  // When pulling by deployment ID, target and gitBranch are irrelevant
+  // since the deployment already has its env fully resolved.
+  if (!projectIdOrDeploymentId.startsWith('dpl_')) {
+    if (target) {
+      url += `/${encodeURIComponent(target)}`;
+      if (gitBranch) {
+        url += `/${encodeURIComponent(gitBranch)}`;
+      }
+    }
+  }
+
+  if (source) {
+    query.set('source', source);
+  }
+
+  if (Array.from(query).length > 0) {
+    url += `?${query}`;
+  }
+
+  return withEnvChallengeRecovery(client, () =>
+    client.fetch<{
+      env: Record<string, string>;
+      buildEnv: Record<string, string>;
+    }>(url)
+  );
 }

@@ -1,0 +1,803 @@
+import fs from 'fs-extra';
+import net from 'net';
+import { createHash, randomBytes } from 'crypto';
+import { join, resolve } from 'path';
+import type { ExecaChildProcess } from 'execa';
+import _execa, { type Options } from 'execa';
+import nodeFetch, {
+  type RequestInit,
+  type Response,
+} from '../../src/util/fetch';
+import retry from 'async-retry';
+import { satisfies } from 'semver';
+import stripAnsi from 'strip-ansi';
+import { fetchCachedToken } from '../../../../test/lib/deployment/now-deploy';
+import { spawnSync, execFileSync } from 'child_process';
+
+vi.setConfig({ testTimeout: 10 * 60 * 1000, hookTimeout: 10 * 60 * 1000 });
+
+const isCI = !!process.env.CI;
+
+export function sleep(ms: number) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+const BASE_PORT = 3000;
+const PORTS_PER_WORKER = 1000;
+const rawWorkerId = Number.parseInt(process.env.VITEST_WORKER_ID || '1', 10);
+const workerId =
+  Number.isFinite(rawWorkerId) && rawWorkerId > 0 ? rawWorkerId : 1;
+
+// Vitest may run dev integration files in parallel workers. Keep each worker
+// in its own port range to avoid cross-worker collisions.
+let port = BASE_PORT + (workerId - 1) * PORTS_PER_WORKER;
+
+const binaryPath = resolve(__dirname, `../../scripts/start.js`);
+
+export function fixture(name: string) {
+  return join('test', 'dev', 'fixtures', name);
+}
+
+const fixtureAbsolute = (name: string) => join(__dirname, 'fixtures', name);
+
+let processCounter = 0;
+const processList = new Map();
+
+function execa(initial: string, args: string[], options: Options<null> = {}) {
+  const procId = ++processCounter;
+  const child = _execa(initial, args, options);
+
+  processList.set(procId, child);
+  child.on('close', () => processList.delete(procId));
+
+  return child;
+}
+
+type FetchOptions = RequestInit & {
+  status?: number;
+  retries?: number;
+};
+
+export function fetchWithRetry(url: string, opts: FetchOptions = {}) {
+  return retry(
+    async () => {
+      const res = await nodeFetch(url, opts);
+
+      if (res.status !== opts.status) {
+        const text = await res.text();
+        throw new Error(
+          `Failed to fetch "${url}", received ${res.status}, expected ${
+            opts.status
+          }, id: ${res.headers.get('x-vercel-id')}:\n\n${text}\n\n`
+        );
+      }
+
+      return res;
+    },
+    {
+      retries: opts.retries ?? 3,
+      factor: 1,
+    }
+  );
+}
+
+type ResolverPromise<T> = Promise<T> & {
+  resolve: (value: PromiseLike<null> | null) => void;
+  reject: (reason?: any) => void;
+};
+
+function createResolver(): ResolverPromise<null> {
+  let resolver: ResolverPromise<null>['resolve'];
+  let rejector: ResolverPromise<null>['reject'];
+
+  const p = new Promise((resolve, reject) => {
+    resolver = resolve;
+    rejector = reject;
+  }) as ResolverPromise<null>;
+
+  //@ts-expect-error
+  p.resolve = resolver;
+  //@ts-expect-error
+  p.reject = rejector;
+
+  return p;
+}
+
+export function formatOutput({
+  stderr,
+  stdout,
+}: {
+  stderr: string;
+  stdout: string;
+}) {
+  return `Received:\n"${stderr}"\n"${stdout}"`;
+}
+
+function printOutput(fixture: string, stdout: string, stderr: string) {
+  const lines = (
+    `\nOutput for "${fixture}"\n` +
+    `\n----- stdout -----\n` +
+    stdout +
+    `\n----- stderr -----\n` +
+    stderr
+  ).split('\n');
+
+  const getPrefix = (nr: number) => {
+    return nr === 0 ? '╭' : nr === lines.length - 1 ? '╰' : '│';
+  };
+
+  console.log(
+    lines.map((line, index) => ` ${getPrefix(index)} ${line}`).join('\n')
+  );
+}
+
+export function shouldSkip(name: string, versions: string) {
+  if (!satisfies(process.version, versions)) {
+    console.log(`Skipping "${name}" because it requires "${versions}".`);
+    return true;
+  }
+
+  return false;
+}
+
+export function validateResponseHeaders(res: Response, podId?: string) {
+  if (res.status < 500) {
+    const cacheControlCount = res.headers.get('cache-control')?.length || 0;
+    expect(cacheControlCount > 0).toBeTruthy();
+
+    expect(res.headers.get('server')).toEqual('Vercel');
+    expect(res.headers.get('x-vercel-id')).toBeTruthy();
+
+    if (podId) {
+      const vercelID = res.headers.get('x-vercel-id') || '';
+      expect(vercelID.includes(`::${podId}-`)).toBeTruthy();
+    }
+  }
+}
+
+export function webSocketEcho(
+  port: number,
+  path: string,
+  message: string
+): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const socket = net.connect(port, '127.0.0.1');
+    const key = randomBytes(16).toString('base64');
+    let buffer: Uint8Array<ArrayBufferLike> = new Uint8Array(0);
+    let handshakeComplete = false;
+    let settled = false;
+
+    const timeout = setTimeout(() => {
+      fail(new Error('Timed out waiting for WebSocket response'));
+    }, 10_000);
+
+    const settle = (fn: () => void) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      fn();
+    };
+
+    const fail = (error: Error) => {
+      settle(() => {
+        socket.destroy();
+        reject(error);
+      });
+    };
+
+    socket.once('error', fail);
+    socket.on('data', chunk => {
+      buffer = appendBytes(buffer, toBytes(chunk));
+
+      if (!handshakeComplete) {
+        const headerEnd = indexOfBytes(buffer, headerSeparator);
+        if (headerEnd === -1) return;
+
+        const headers = Buffer.from(buffer.subarray(0, headerEnd)).toString(
+          'utf8'
+        );
+        if (!headers.startsWith('HTTP/1.1 101 Switching Protocols')) {
+          fail(new Error(`Unexpected WebSocket handshake:\n${headers}`));
+          return;
+        }
+
+        const accept = createHash('sha1')
+          .update(`${key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`)
+          .digest('base64');
+        if (
+          !headers
+            .toLowerCase()
+            .includes(`sec-websocket-accept: ${accept.toLowerCase()}`)
+        ) {
+          fail(new Error(`Unexpected Sec-WebSocket-Accept:\n${headers}`));
+          return;
+        }
+
+        handshakeComplete = true;
+        buffer = buffer.subarray(headerEnd + 4);
+        socket.write(maskedTextFrame(message));
+      }
+
+      const text = readTextFrame(buffer);
+      if (text !== undefined) {
+        settle(() => {
+          socket.end();
+          resolve(text);
+        });
+      }
+    });
+
+    socket.write(
+      [
+        `GET ${path} HTTP/1.1`,
+        `Host: 127.0.0.1:${port}`,
+        'Upgrade: websocket',
+        'Connection: Upgrade',
+        `Sec-WebSocket-Key: ${key}`,
+        'Sec-WebSocket-Version: 13',
+        '',
+        '',
+      ].join('\r\n')
+    );
+  });
+}
+
+const headerSeparator: Uint8Array<ArrayBufferLike> = new Uint8Array([
+  13, 10, 13, 10,
+]);
+
+function appendBytes(
+  a: Uint8Array<ArrayBufferLike>,
+  b: Uint8Array<ArrayBufferLike>
+): Uint8Array<ArrayBufferLike> {
+  const next = new Uint8Array(a.length + b.length);
+  next.set(a, 0);
+  next.set(b, a.length);
+  return next;
+}
+
+function toBytes(buffer: ArrayLike<number>): Uint8Array<ArrayBufferLike> {
+  const bytes = new Uint8Array(buffer.length);
+  for (let i = 0; i < buffer.length; i++) {
+    bytes[i] = buffer[i];
+  }
+  return bytes;
+}
+
+function indexOfBytes(
+  buffer: Uint8Array<ArrayBufferLike>,
+  needle: Uint8Array<ArrayBufferLike>
+): number {
+  for (let i = 0; i <= buffer.length - needle.length; i++) {
+    let matches = true;
+    for (let j = 0; j < needle.length; j++) {
+      if (buffer[i + j] !== needle[j]) {
+        matches = false;
+        break;
+      }
+    }
+    if (matches) return i;
+  }
+  return -1;
+}
+
+function maskedTextFrame(message: string): Uint8Array<ArrayBufferLike> {
+  const payload = Buffer.from(message);
+  const mask = randomBytes(4);
+  const frame = new Uint8Array(6 + payload.length);
+  frame[0] = 0x81;
+  frame[1] = 0x80 | payload.length;
+  frame.set(mask, 2);
+
+  for (let i = 0; i < payload.length; i++) {
+    frame[6 + i] = payload[i] ^ mask[i % 4];
+  }
+
+  return frame;
+}
+
+function readTextFrame(
+  buffer: Uint8Array<ArrayBufferLike>
+): string | undefined {
+  if (buffer.length < 2) return undefined;
+
+  const length = buffer[1] & 0x7f;
+  if (length > 125) {
+    throw new Error('Test WebSocket client only supports small frames');
+  }
+  if (buffer.length < 2 + length) return undefined;
+
+  return Buffer.from(buffer.subarray(2, 2 + length)).toString('utf8');
+}
+
+export async function exec(directory: string, args: string[] = []) {
+  const token = await fetchCachedToken();
+
+  console.log(
+    `exec() ${binaryPath} dev ${directory} -t ***${
+      process.env.VERCEL_TEAM_ID ? ' --scope ***' : ''
+    } ${args.join(' ')}`
+  );
+
+  const scope: string[] = process.env.VERCEL_TEAM_ID
+    ? ['--scope', process.env.VERCEL_TEAM_ID]
+    : [];
+
+  return execa(binaryPath, ['dev', directory, '-t', token, ...scope, ...args], {
+    reject: false,
+    shell: true,
+    env: { __VERCEL_SKIP_DEV_CMD: '1' },
+  });
+}
+
+async function runNpmInstall(fixturePath: string) {
+  if (await fs.pathExists(join(fixturePath, 'package.json'))) {
+    let command;
+    if (await fs.pathExists(join(fixturePath, 'package-lock.json'))) {
+      command = 'npm';
+    } else {
+      command = 'yarn';
+    }
+    await execa(command, ['install'], {
+      cwd: fixturePath,
+      shell: true,
+      stdio: 'inherit',
+    });
+  }
+}
+
+export async function testPath(
+  isDev: boolean,
+  origin: string,
+  status: number,
+  path: string,
+  expectedText: string | Function | RegExp,
+  expectedHeaders = {},
+  fetchOpts: FetchOptions = {}
+) {
+  const opts: FetchOptions = {
+    retries: isCI ? 5 : 0,
+    ...fetchOpts,
+    redirect: 'manual',
+    status,
+  };
+  const url = `${origin}${path}`;
+  const res = await fetchWithRetry(url, opts);
+  const msg = `Testing response from ${fetchOpts.method || 'GET'} ${url}`;
+
+  console.log(msg);
+  expect(res.status, getEnvironmentMessage(isDev)).toBe(status);
+  validateResponseHeaders(res);
+
+  if (typeof expectedText === 'string') {
+    const actualText = await res.text();
+    expect(actualText.trim(), getEnvironmentMessage(isDev)).toBe(
+      expectedText.trim()
+    );
+  } else if (typeof expectedText === 'function') {
+    const actualText = await res.text();
+    await expectedText(actualText, res, isDev);
+  } else if (expectedText instanceof RegExp) {
+    const actualText = await res.text();
+    expectedText.lastIndex = 0; // reset since we test twice
+    expect(actualText, getEnvironmentMessage(isDev)).toMatch(expectedText);
+  }
+
+  if (expectedHeaders) {
+    Object.entries(expectedHeaders).forEach(([key, expectedValue]) => {
+      const actualValue = res.headers.get(key);
+      expect(actualValue, getEnvironmentMessage(isDev)).toBe(expectedValue);
+    });
+  }
+}
+
+function getEnvironmentMessage(isDev: boolean): string {
+  if (isDev) {
+    return 'FROM DEV SERVER';
+  }
+  return `FROM DEPLOYMENT`;
+}
+
+export async function testFixture(
+  directory: string,
+  opts: Options<null> & { skipNpmInstall?: boolean } = {},
+  args: string[] = []
+) {
+  const { skipNpmInstall, ...execaOpts } = opts;
+  if (!skipNpmInstall) {
+    await runNpmInstall(directory);
+  }
+
+  const token = await fetchCachedToken();
+
+  console.log(
+    `testFixture() ${binaryPath} dev ${directory} -t ***${
+      process.env.VERCEL_TEAM_ID ? ' --scope ***' : ''
+    } -l ${port} ${args.join(' ')}`
+  );
+  const dev = execa(
+    binaryPath,
+    [
+      'dev',
+      directory,
+      '-t',
+      token,
+      ...(process.env.VERCEL_TEAM_ID
+        ? ['--scope', process.env.VERCEL_TEAM_ID]
+        : []),
+      '-l',
+      String(port),
+      ...args,
+    ],
+    {
+      reject: false,
+      shell: true,
+      stdio: 'pipe',
+      ...execaOpts,
+      env: { ...execaOpts.env, __VERCEL_SKIP_DEV_CMD: '1' },
+    }
+  );
+
+  let stdout = '';
+  let stderr = '';
+  const readyResolver = createResolver();
+  const exitResolver = createResolver();
+
+  if (!dev.stdout) {
+    throw new Error('`vc dev` process missing "stdout".');
+  }
+  if (!dev.stderr) {
+    throw new Error('`vc dev` process missing "stderr".');
+  }
+
+  dev.stdout.setEncoding('utf8');
+  dev.stderr.setEncoding('utf8');
+
+  dev.stdout.on('data', data => {
+    stdout += data;
+  });
+  dev.stderr.on('data', data => {
+    stderr += data;
+
+    if (stripAnsi(stderr).includes('Ready! Available at')) {
+      readyResolver.resolve(null);
+    } else if (stripAnsi(stderr).includes('Available at:')) {
+      readyResolver.resolve(null);
+    }
+  });
+
+  let printedOutput = false;
+  let devTimer: NodeJS.Timeout;
+
+  dev.on('exit', code => {
+    devTimer = setTimeout(async () => {
+      const pids = Object.keys(await ps(dev.pid!)).join(', ');
+
+      console.error(
+        `Test ${directory} exited with code ${code}, but has timed out closing stdio\n` +
+          (pids
+            ? `Hanging child processes: ${pids}`
+            : `${dev.pid} already exited`)
+      );
+    }, 5000);
+  });
+
+  dev.on('close', () => {
+    clearTimeout(devTimer);
+    if (!printedOutput) {
+      printOutput(directory, stdout, stderr);
+      printedOutput = true;
+    }
+    exitResolver.resolve(null);
+    readyResolver.resolve(null);
+  });
+
+  dev.on('error', () => {
+    if (!printedOutput) {
+      printOutput(directory, stdout, stderr);
+      printedOutput = true;
+    }
+    exitResolver.resolve(null);
+    readyResolver.resolve(null);
+  });
+
+  // @ts-expect-error
+  dev.kill = async () => {
+    // kill the entire process tree for the child as some tests will spawn
+    // child processes that either become defunct or assigned a new parent
+    // process
+    await nukeProcessTree(dev.pid!);
+
+    await exitResolver;
+    return {
+      stdout,
+      stderr,
+    };
+  };
+
+  return {
+    dev: dev as any as Omit<typeof dev, 'kill'> & {
+      kill: () => Promise<{ stdout: string; stderr: string }>;
+    },
+    port,
+    readyResolver,
+  };
+}
+
+export function testFixtureStdio(
+  directory: string,
+  fn: Function,
+  { skipDeploy = false } = {}
+) {
+  return async () => {
+    const cwd = fixtureAbsolute(directory);
+    const token = await fetchCachedToken();
+    let deploymentUrl: string;
+
+    // Deploy fixture and link project
+    if (!skipDeploy) {
+      const projectJsonPath = join(cwd, '.vercel', 'project.json');
+      await fs.remove(projectJsonPath);
+      const gitignore = join(cwd, '.gitignore');
+      const hasGitignore = await fs.pathExists(gitignore);
+
+      try {
+        const args = [];
+
+        args.push('--token', token);
+
+        if (process.env.VERCEL_TEAM_ID) {
+          args.push('--scope', process.env.VERCEL_TEAM_ID);
+        }
+
+        args.push('deploy');
+
+        const buildEnvNames = [
+          'VERCEL_CLI_VERSION',
+          'VERCEL_RUNTIME_PYTHON',
+          'VERCEL_WORKERS_PYTHON',
+        ] as const;
+        for (const buildEnvName of buildEnvNames) {
+          const buildEnvValue = process.env[buildEnvName];
+          if (buildEnvValue) {
+            args.push('--build-env', `${buildEnvName}=${buildEnvValue}`);
+          }
+        }
+
+        args.push('--debug');
+        args.push('--yes');
+
+        // Run `vc deploy`
+        const deployResult = await execa(binaryPath, args, {
+          cwd,
+          stdio: 'pipe',
+          reject: false,
+        });
+
+        const errorDetails = JSON.stringify({
+          exitCode: deployResult.exitCode,
+          stdout: deployResult.stdout,
+          stderr: deployResult.stderr,
+        });
+
+        // Expect the deploy succeeded with exit of 0;
+        expect(deployResult.exitCode, errorDetails).toBe(0);
+        deploymentUrl = new URL(deployResult.stdout.toString()).host;
+      } finally {
+        if (!hasGitignore) {
+          await fs.remove(gitignore);
+        }
+      }
+    }
+
+    // Start dev
+    let dev: ExecaChildProcess<Buffer>;
+
+    await runNpmInstall(cwd);
+
+    let stdout = '';
+    let stderr = '';
+    const readyResolver = createResolver();
+    const exitResolver = createResolver();
+
+    try {
+      let printedOutput = false;
+
+      console.log(
+        `testFixtureStdio() ${binaryPath} dev -l ${port} -t ***${
+          process.env.VERCEL_TEAM_ID ? ' --scope ***' : ''
+        } --debug`
+      );
+      const env = skipDeploy
+        ? { ...process.env, __VERCEL_SKIP_DEV_CMD: '1' }
+        : process.env;
+      dev = execa(
+        binaryPath,
+        [
+          'dev',
+          '-l',
+          port.toString(),
+          '-t',
+          token,
+          ...(process.env.VERCEL_TEAM_ID
+            ? ['--scope', process.env.VERCEL_TEAM_ID]
+            : []),
+          '--debug',
+        ],
+        {
+          cwd,
+          env,
+        }
+      );
+
+      if (!dev.stdout) {
+        throw new Error('`vc dev` missing "stdout"');
+      }
+      if (!dev.stderr) {
+        throw new Error('`vc dev` missing "stderr"');
+      }
+
+      dev.stdout.setEncoding('utf8');
+      dev.stderr.setEncoding('utf8');
+
+      dev.stdout.pipe(process.stdout);
+      dev.stderr.pipe(process.stderr);
+
+      dev.stdout.on('data', data => {
+        stdout += data;
+      });
+
+      dev.stderr.on('data', async data => {
+        stderr += data;
+
+        if (stripAnsi(data).includes('Ready! Available at')) {
+          readyResolver.resolve(null);
+        }
+
+        if (stderr.includes(`Requested port ${port} is already in use`)) {
+          await nukeProcessTree(dev.pid!);
+          throw new Error(
+            `Failed for "${directory}" with port ${port} with stderr "${stderr}".`
+          );
+        }
+
+        if (stderr.includes('Command failed')) {
+          await nukeProcessTree(dev.pid!);
+          throw new Error(`Failed for "${directory}" with stderr "${stderr}".`);
+        }
+      });
+
+      dev.on('close', () => {
+        if (!printedOutput) {
+          printOutput(directory, stdout, stderr);
+          printedOutput = true;
+        }
+        exitResolver.resolve(null);
+      });
+
+      dev.on('error', () => {
+        if (!printedOutput) {
+          printOutput(directory, stdout, stderr);
+          printedOutput = true;
+        }
+        exitResolver.resolve(null);
+      });
+
+      await readyResolver;
+
+      const helperTestPath = async (...args: any[]) => {
+        if (!skipDeploy) {
+          // @ts-ignore
+          await testPath(false, `https://${deploymentUrl}`, ...args);
+        }
+        // @ts-ignore
+        await testPath(true, `http://localhost:${port}`, ...args);
+      };
+      await fn(helperTestPath, port);
+    } finally {
+      // @ts-ignore
+      await nukeProcessTree(dev.pid);
+      await exitResolver;
+    }
+  };
+}
+
+async function ps(parentPid: number, pids: Record<string, Array<number>> = {}) {
+  const cmd: string[] =
+    process.platform === 'darwin'
+      ? ['pgrep', '-P', parentPid.toString()]
+      : ['ps', '-o', 'pid', '--no-headers', '--ppid', parentPid.toString()];
+
+  try {
+    const buf = execFileSync(cmd[0], cmd.slice(1), {
+      encoding: 'utf-8',
+    });
+    const possiblePids = buf.match(/\d+/g) || [];
+    for (const rawPid of possiblePids) {
+      const pid = parseInt(rawPid);
+      const recurse = Object.prototype.hasOwnProperty.call(pids, pid);
+      pids[parentPid].push(pid);
+      pids[pid] = [];
+      if (recurse) {
+        await ps(pid, pids);
+      }
+    }
+  } catch (err) {
+    const error = err as Error;
+    console.log(`Failed to get processes: ${error.toString()}`);
+  }
+  return pids;
+}
+
+async function nukePID(
+  pid: number,
+  signal: string = 'SIGTERM',
+  retries: number = 10
+) {
+  if (retries === 0) {
+    console.log(`pid ${pid} won't die, giving up`);
+    return;
+  }
+
+  // kill the process
+  try {
+    process.kill(pid, signal);
+  } catch (_e) {
+    // process does not exist
+
+    console.log(`pid ${pid} is not running`);
+    return;
+  }
+
+  await sleep(250);
+
+  try {
+    // check if killed
+    process.kill(pid, 0);
+  } catch (_e) {
+    console.log(`pid ${pid} is not running`);
+    return;
+  }
+
+  console.log(`pid ${pid} didn't exit, sending SIGKILL (retries ${retries})`);
+  await nukePID(pid, 'SIGKILL', retries - 1);
+}
+
+export async function nukeProcessTree(pid: number, signal?: string) {
+  if (process.platform === 'win32') {
+    spawnSync('taskkill', ['/pid', pid.toString(), '/T', '/F'], {
+      stdio: 'inherit',
+    });
+    return;
+  }
+
+  const pids = await ps(pid, {
+    [pid]: [],
+  });
+
+  console.log(`Nuking pids: ${Object.keys(pids).join(', ')}`);
+  await Promise.all(Object.keys(pids).map(pid => nukePID(Number(pid), signal)));
+}
+
+beforeEach(() => {
+  port = ++port;
+});
+
+afterEach(async () => {
+  await Promise.all(
+    Array.from(processList).map(async ([_procId, proc]) => {
+      console.log(`killing process ${proc.pid} "${proc.spawnargs.join(' ')}"`);
+
+      try {
+        await nukeProcessTree(proc.pid);
+      } catch (err) {
+        const error = err as Error & { code?: string };
+
+        // Was already killed
+        if (error.code !== 'ESRCH') {
+          console.error('Failed to kill process', proc.pid, error);
+        }
+      }
+    })
+  );
+});

@@ -1,0 +1,8 @@
+{
+  "probes": [
+    {
+      "path": "/",
+      "mustContain": "version:go1.18.10:first:RANDOMNESS_PLACEHOLDER"
+    }
+  ]
+}

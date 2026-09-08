@@ -1,0 +1,205 @@
+import { packageName } from '../../util/pkg-name';
+import { projectOption } from '../../util/arg-common';
+
+// has to be ms compliant
+// https://github.com/vercel/ms/blob/fe5338229cfdac6822891dcb9c24660b4d2e612b/src/index.ts#L95
+export const CommandTimeout = '5 minutes';
+
+export const logsCommand = {
+  name: 'logs',
+  aliases: ['log'],
+  description:
+    'Display request logs for a project.\n\n' +
+    'Use --follow to stream live runtime logs from a deployment. By default, --follow prefers the active production deployment and falls back to your latest READY deployment.\n\n' +
+    'Source types: λ = serverless, ε = edge/middleware, ◇ = static/external',
+  arguments: [
+    {
+      name: 'url|deploymentId',
+      required: false,
+    },
+  ],
+  options: [
+    { ...projectOption, shorthand: 'p' },
+    {
+      name: 'deployment',
+      shorthand: 'd',
+      type: String,
+      deprecated: false,
+      description:
+        'Filter logs to a specific deployment ID or URL (alternative to positional argument)',
+    },
+    {
+      name: 'environment',
+      shorthand: null,
+      type: String,
+      deprecated: false,
+      description:
+        'Filter by environment: production or preview; with --follow, select the active production deployment or your latest preview deployment',
+    },
+    {
+      name: 'level',
+      shorthand: null,
+      type: [String],
+      deprecated: false,
+      description: 'Filter by log level: error, warning, info, fatal',
+    },
+    {
+      name: 'status-code',
+      shorthand: null,
+      type: String,
+      deprecated: false,
+      description: 'Filter by HTTP status code (e.g., 500, 4xx)',
+    },
+    {
+      name: 'source',
+      shorthand: null,
+      type: [String],
+      deprecated: false,
+      description:
+        'Filter by source: serverless, edge-function, edge-middleware, static',
+    },
+    {
+      name: 'since',
+      shorthand: null,
+      type: String,
+      deprecated: false,
+      description: 'Start time (ISO format or relative: 1h, 30m)',
+    },
+    {
+      name: 'until',
+      shorthand: null,
+      type: String,
+      deprecated: false,
+      description: 'End time (ISO format or relative, default: now)',
+    },
+    {
+      name: 'limit',
+      shorthand: 'n',
+      type: Number,
+      deprecated: false,
+      description: 'Maximum number of results (default: 100)',
+    },
+    {
+      name: 'json',
+      shorthand: 'j',
+      type: Boolean,
+      deprecated: false,
+      description: 'Output logs as JSON Lines for piping to other tools',
+    },
+    {
+      name: 'follow',
+      shorthand: 'f',
+      type: Boolean,
+      deprecated: false,
+      description: 'Stream live runtime logs from a deployment',
+    },
+    {
+      name: 'no-follow',
+      shorthand: null,
+      type: Boolean,
+      deprecated: false,
+      description:
+        'No-op; deployment arguments only stream logs when --follow is set',
+    },
+    {
+      name: 'query',
+      shorthand: 'q',
+      type: String,
+      deprecated: false,
+      description:
+        'Advanced search query (supports filter syntax, e.g. "status:500 error")',
+    },
+    {
+      name: 'search',
+      shorthand: null,
+      type: String,
+      deprecated: true,
+      description:
+        'Advanced search query (supports filter syntax, e.g. "status:500 error")',
+    },
+    {
+      name: 'request-id',
+      shorthand: null,
+      type: String,
+      deprecated: false,
+      description: 'Filter by request ID',
+    },
+    {
+      name: 'expand',
+      shorthand: 'x',
+      type: Boolean,
+      deprecated: false,
+      description:
+        'Show full log message below each request line (default when output is not a TTY)',
+    },
+    {
+      name: 'branch',
+      shorthand: 'b',
+      type: String,
+      deprecated: false,
+      description:
+        'Filter by Git branch; with --follow, require a matching READY deployment',
+    },
+    {
+      name: 'no-branch',
+      shorthand: null,
+      type: Boolean,
+      deprecated: true,
+      description: 'Deprecated no-op; use --branch to filter by branch',
+    },
+  ],
+  examples: [
+    {
+      name: 'Display recent request logs for the linked project',
+      value: `${packageName} logs`,
+    },
+    {
+      name: 'Display request logs for a specific project',
+      value: `${packageName} logs --project my-app`,
+    },
+    {
+      name: 'Display request error logs from the last hour',
+      value: `${packageName} logs --level error --since 1h`,
+    },
+    {
+      name: 'Display request logs for a specific deployment',
+      value: `${packageName} logs dpl_xxxxx`,
+    },
+    {
+      name: 'Filter request logs by status code and output as JSON',
+      value: `${packageName} logs --status-code 500 --json`,
+    },
+    {
+      name: 'Search request logs by status and message',
+      value: `${packageName} logs --query 'status:500 error' --json | jq '.message'`,
+    },
+    {
+      name: 'Display request logs from production',
+      value: `${packageName} logs --environment production`,
+    },
+    {
+      name: 'Display request logs for a specific request',
+      value: `${packageName} logs --request-id req_xxxxx`,
+    },
+    {
+      name: 'Display request logs with full message details',
+      value: `${packageName} logs --expand`,
+    },
+    {
+      name: 'Display request logs for a specific branch',
+      value: `${packageName} logs --branch feature-x`,
+    },
+    {
+      name: 'Stream runtime logs for the active production deployment',
+      value: `${packageName} logs --follow`,
+    },
+    {
+      name: 'Stream runtime logs for your latest preview deployment',
+      value: `${packageName} logs --follow --environment preview`,
+    },
+    {
+      name: 'Stream runtime logs for a specific deployment',
+      value: `${packageName} logs dpl_xxxxx --follow`,
+    },
+  ],
+} as const;

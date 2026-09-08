@@ -1,68 +1,139 @@
 import chalk from 'chalk';
 import ms from 'ms';
 import { DomainNotFound } from '../../util/errors-ts';
-import { DNSRecord } from '../../types';
-import Client from '../../util/client';
+import type { DNSRecord } from '@vercel-internals/types';
+import type Client from '../../util/client';
 import formatTable from '../../util/format-table';
 import getDNSRecords, {
-  DomainRecordsItem,
+  type DomainRecordsItem,
 } from '../../util/dns/get-dns-records';
 import getDomainDNSRecords from '../../util/dns/get-domain-dns-records';
 import getScope from '../../util/get-scope';
+import { getPaginationOpts } from '../../util/get-pagination-opts';
 import stamp from '../../util/output/stamp';
 import getCommandFlags from '../../util/get-command-flags';
 import { getCommandName } from '../../util/pkg-name';
+import output from '../../output-manager';
+import { DnsLsTelemetryClient } from '../../util/telemetry/commands/dns/ls';
+import { listSubcommand } from './command';
+import { parseArguments } from '../../util/get-args';
+import { getFlagsSpecification } from '../../util/get-flags-specification';
+import { printError } from '../../util/error';
+import { validateLsArgs } from '../../util/validate-ls-args';
+import {
+  outputActionRequired,
+  outputAgentError,
+} from '../../util/agent-output';
+import {
+  AGENT_ACTION,
+  AGENT_REASON,
+  AGENT_STATUS,
+} from '../../util/agent-output-constants';
+import { getGlobalFlagsFromArgs } from '../../util/arg-common';
+import { getCommandNamePlain } from '../../util/pkg-name';
 
-type Options = {
-  '--next'?: number;
-};
-
-export default async function ls(
-  client: Client,
-  opts: Options,
-  args: string[]
-) {
-  const { output } = client;
-  const { '--next': nextTimestamp } = opts;
-  let contextName = null;
-
+export default async function ls(client: Client, argv: string[]) {
+  let parsedArgs;
+  const flagsSpecification = getFlagsSpecification(listSubcommand.options);
   try {
-    ({ contextName } = await getScope(client));
+    parsedArgs = parseArguments(argv, flagsSpecification);
   } catch (err) {
-    if (err.code === 'NOT_AUTHORIZED' || err.code === 'TEAM_DELETED') {
-      output.error(err.message);
-      return 1;
+    if (client.nonInteractive) {
+      outputAgentError(
+        client,
+        {
+          status: AGENT_STATUS.ERROR,
+          reason: AGENT_REASON.INVALID_ARGUMENTS,
+          message: err instanceof Error ? err.message : String(err),
+        },
+        1
+      );
     }
-
-    throw err;
+    printError(err);
+    return 1;
   }
+  const { args, flags: opts } = parsedArgs;
 
-  const [domainName] = args;
-  const lsStamp = stamp();
-
-  if (args.length > 1) {
-    output.error(
-      `Invalid number of arguments. Usage: ${chalk.cyan(
-        `${getCommandName('dns ls [domain]')}`
-      )}`
+  if (client.nonInteractive && args.length > 1) {
+    const flags = getGlobalFlagsFromArgs(client.argv.slice(2));
+    const cmd = getCommandNamePlain(
+      `dns ls <domain> ${flags.join(' ')}`.trim()
+    );
+    outputActionRequired(
+      client,
+      {
+        status: AGENT_STATUS.ACTION_REQUIRED,
+        reason: AGENT_REASON.MISSING_ARGUMENTS,
+        action: AGENT_ACTION.MISSING_ARGUMENTS,
+        message: `Invalid number of arguments. Run: ${cmd}`,
+        next: [
+          {
+            command: cmd,
+            when: 'to list DNS records (optional single domain)',
+          },
+        ],
+      },
+      1
     );
     return 1;
   }
 
-  if (typeof nextTimestamp !== 'undefined' && Number.isNaN(nextTimestamp)) {
-    output.error('Please provide a number for flag --next');
+  const validationResult = validateLsArgs({
+    commandName: 'dns ls <domain>',
+    args: args,
+    maxArgs: 1,
+    exitCode: 1,
+  });
+  if (validationResult !== 0) {
+    return validationResult;
+  }
+
+  const { telemetryEventStore } = client;
+  const { contextName } = await getScope(client);
+  const telemetry = new DnsLsTelemetryClient({
+    opts: {
+      store: telemetryEventStore,
+    },
+  });
+
+  const [domainName] = args;
+  const lsStamp = stamp();
+
+  telemetry.trackCliArgumentDomain(domainName);
+  telemetry.trackCliOptionLimit(opts['--limit']);
+  telemetry.trackCliOptionNext(opts['--next']);
+
+  let paginationOptions;
+
+  try {
+    paginationOptions = getPaginationOpts(opts);
+  } catch (err: unknown) {
+    output.prettyError(err);
     return 1;
   }
 
   if (domainName) {
     const data = await getDomainDNSRecords(
-      output,
       client,
       domainName,
-      nextTimestamp,
-      4
+      5,
+      ...paginationOptions
     );
     if (data instanceof DomainNotFound) {
+      if (client.nonInteractive) {
+        const flags = getGlobalFlagsFromArgs(client.argv.slice(2));
+        const cmd = getCommandNamePlain(`dns ls ${flags.join(' ')}`.trim());
+        outputAgentError(
+          client,
+          {
+            status: AGENT_STATUS.ERROR,
+            reason: AGENT_REASON.DOMAIN_NOT_FOUND,
+            message: `The domain ${domainName} can't be found under ${contextName}.`,
+            next: [{ command: cmd, when: 'to list available DNS records' }],
+          },
+          1
+        );
+      }
       output.error(
         `The domain ${domainName} can't be found under ${chalk.bold(
           contextName
@@ -78,9 +149,9 @@ export default async function ls(
         records.length > 0 ? 'Records' : 'No records'
       } found under ${chalk.bold(contextName)} ${chalk.gray(lsStamp())}`
     );
-    console.log(getDNSRecordsTable([{ domainName, records }]));
+    client.stdout.write(getDNSRecordsTable([{ domainName, records }]));
 
-    if (pagination && pagination.count === 20) {
+    if (pagination?.next) {
       const flags = getCommandFlags(opts, ['_', '--next']);
       output.log(
         `To display the next page run ${getCommandName(
@@ -93,10 +164,9 @@ export default async function ls(
   }
 
   const { records: dnsRecords, pagination } = await getDNSRecords(
-    output,
     client,
     contextName,
-    nextTimestamp
+    ...paginationOptions
   );
   const nRecords = dnsRecords.reduce((p, r) => r.records.length + p, 0);
   output.log(
@@ -104,8 +174,8 @@ export default async function ls(
       contextName
     )} ${chalk.gray(lsStamp())}`
   );
-  console.log(getDNSRecordsTable(dnsRecords));
-  if (pagination && pagination.count === 20) {
+  output.log(getDNSRecordsTable(dnsRecords));
+  if (pagination?.next) {
     const flags = getCommandFlags(opts, ['_', '--next']);
     output.log(
       `To display the next page run ${getCommandName(
